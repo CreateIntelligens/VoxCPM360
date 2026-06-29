@@ -1,0 +1,54 @@
+services:
+  app:
+    build: .
+    container_name: voxcpm_app
+    restart: unless-stopped
+    environment:
+      # Inject environment variables from .env
+      - VOXCPM_DEVICE=${VOXCPM_DEVICE:-auto}
+      - MODEL_ID=${MODEL_ID:-openbmb/VoxCPM2}
+      - VOXCPM_OPTIMIZE=${VOXCPM_OPTIMIZE:-false}
+      # GB10 (Grace-Blackwell) reports sm_121, but torch cu128 nvrtc only knows up
+      # to sm_120, so runtime JIT fusion (e.g. the @torch.jit.script snake op) fails
+      # with "invalid value for --gpu-architecture". Disable JIT so these run eager.
+      - PYTORCH_JIT=0
+    # Pre-download models first at startup, then start the Gradio app
+    command: bash -c "python scripts/download_models.py --model-id ${MODEL_ID:-openbmb/VoxCPM2} && python app.py --port 8000 --device ${VOXCPM_DEVICE:-auto} --model-id ${MODEL_ID:-openbmb/VoxCPM2}"
+    volumes:
+      # Persistent cache for downloaded model weights (highly recommended to save GBs of downloading)
+      - hf_cache:/root/.cache/huggingface
+      - modelscope_cache:/root/.cache/modelscope
+      # Optional: mount workspace directory for live edits (uncomment if developing)
+      - .:/app
+    
+    # --- GPU CONFIGURATION ---
+    # Enabled NVIDIA GPUs for container usage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  web:
+    image: nginx:alpine
+    container_name: voxcpm_nginx
+    restart: unless-stopped
+    ports:
+      # Map host's custom PORT to Nginx's container port PORT (dynamic)
+      - "${PORT:-8800}:${PORT:-8800}"
+    environment:
+      - PORT=${PORT:-8800}
+      # Restrict envsubst to ONLY replace PORT, preserving standard Nginx vars ($host, etc.)
+      - NGINX_ENVSUBST_FILTER=PORT
+    volumes:
+      - ./nginx.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      - app
+
+volumes:
+  hf_cache:
+    name: voxcpm_hf_cache
+  modelscope_cache:
+    name: voxcpm_modelscope_cache

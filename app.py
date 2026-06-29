@@ -12,6 +12,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import voxcpm
 from voxcpm.model.utils import resolve_runtime_device
+from nanovllm_voxcpm import VoxCPM
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -222,27 +224,44 @@ _APP_THEME = gr.themes.Soft(
 class VoxCPMDemo:
     def __init__(self, model_id: str = "openbmb/VoxCPM2", device: str = "auto") -> None:
         self.device = resolve_runtime_device(device, "cuda")
-        logger.info(f"Running VoxCPM on device: {self.device}")
-        self.optimize = self.device.startswith("cuda")
+        self.optimize = os.environ.get("VOXCPM_OPTIMIZE", "false").lower() == "true"
+        logger.info(f"Running VoxCPM on device: {self.device} (optimize={self.optimize})")
 
         self.asr_model_id = "iic/SenseVoiceSmall"
         self.asr_device = "cuda:0" if self.device.startswith("cuda") else "cpu"
         self.asr_model: Optional[AutoModel] = None
 
-        self.voxcpm_model: Optional[voxcpm.VoxCPM] = None
+        self.voxcpm_server = None
         self._model_id = model_id
+        self.denoiser = None
+        self.text_normalizer = None
+        self.zipenhancer_model_path = "iic/speech_zipenhancer_ans_multiloss_16k_base"
 
-    def get_or_load_voxcpm(self) -> voxcpm.VoxCPM:
-        if self.voxcpm_model is not None:
-            return self.voxcpm_model
-        logger.info(f"Loading model: {self._model_id}")
-        self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(
+    def get_or_load_voxcpm(self):
+        if self.voxcpm_server is not None:
+            return self.voxcpm_server
+        logger.info(f"Loading nano-vllm model: {self._model_id}")
+        devices = [0]
+        if "cuda" in self.device:
+            if ":" in self.device:
+                try:
+                    devices = [int(self.device.split(":")[-1])]
+                except ValueError:
+                    devices = [0]
+        
+        enforce_eager = not self.optimize
+        self.voxcpm_server = VoxCPM.from_pretrained(
             self._model_id,
-            optimize=self.optimize,
-            device=self.device,
+            inference_timesteps=10,
+            max_num_batched_tokens=8192,
+            max_num_seqs=16,
+            max_model_len=4096,
+            gpu_memory_utilization=0.85,
+            enforce_eager=enforce_eager,
+            devices=devices,
         )
-        logger.info("Model loaded successfully.")
-        return self.voxcpm_model
+        logger.info("nano-vllm model loaded successfully.")
+        return self.voxcpm_server
 
     def get_or_load_asr_model(self) -> AutoModel:
         if self.asr_model is not None:
@@ -269,30 +288,6 @@ class VoxCPMDemo:
         )
         return res[0]["text"].split("|>")[-1]
 
-    def _build_generate_kwargs(
-        self,
-        *,
-        final_text: str,
-        audio_path: Optional[str],
-        prompt_text_clean: Optional[str],
-        cfg_value_input: float,
-        do_normalize: bool,
-        denoise: bool,
-        inference_timesteps: int = 10,
-    ) -> dict:
-        generate_kwargs = dict(
-            text=final_text,
-            reference_wav_path=audio_path,
-            cfg_value=float(cfg_value_input),
-            inference_timesteps=inference_timesteps,
-            normalize=do_normalize,
-            denoise=denoise,
-        )
-        if prompt_text_clean and audio_path:
-            generate_kwargs["prompt_wav_path"] = audio_path
-            generate_kwargs["prompt_text"] = prompt_text_clean
-        return generate_kwargs
-
     def generate_tts_audio(
         self,
         text_input: str,
@@ -304,40 +299,103 @@ class VoxCPMDemo:
         denoise: bool = True,
         inference_timesteps: int = 10,
     ) -> Tuple[int, np.ndarray]:
-        current_model = self.get_or_load_voxcpm()
+        server = self.get_or_load_voxcpm()
 
         text = (text_input or "").strip()
         if len(text) == 0:
             raise ValueError("Please input text to synthesize.")
 
         control = (control_instruction or "").strip()
-        # Strip any parentheses (half-width/full-width) from control text to avoid
-        # breaking the "(control)text" prompt format expected by the model.
         control = re.sub(r"[()（）]", "", control).strip()
         final_text = f"({control}){text}" if control else text
 
-        audio_path = reference_wav_path_input if reference_wav_path_input else None
         prompt_text_clean = (prompt_text or "").strip() or None
 
-        if audio_path and prompt_text_clean:
+        if reference_wav_path_input and prompt_text_clean:
             logger.info(f"[Voice Cloning] prompt_wav + prompt_text + reference_wav")
-        elif audio_path:
+        elif reference_wav_path_input:
             logger.info(f"[Voice Control] reference_wav only")
         else:
             logger.info(f"[Voice Design] control: {control[:50] if control else 'None'}...")
 
-        logger.info(f"Generating audio for text: '{final_text[:80]}...'")
-        generate_kwargs = self._build_generate_kwargs(
-            final_text=final_text,
-            audio_path=audio_path,
-            prompt_text_clean=prompt_text_clean,
-            cfg_value_input=cfg_value_input,
-            do_normalize=do_normalize,
-            denoise=denoise,
-            inference_timesteps=inference_timesteps,
-        )
-        wav = current_model.generate(**generate_kwargs)
-        return (current_model.tts_model.sample_rate, wav)
+        # 1. Text Normalization
+        if do_normalize:
+            if self.text_normalizer is None:
+                logger.info("Loading TextNormalizer...")
+                from voxcpm.utils.text_normalize import TextNormalizer
+                self.text_normalizer = TextNormalizer()
+            final_text = self.text_normalizer.normalize(final_text)
+
+        # 2. Denoising reference audio
+        temp_files = []
+        actual_ref_path = reference_wav_path_input if reference_wav_path_input else None
+        try:
+            if denoise and actual_ref_path:
+                if self.denoiser is None:
+                    logger.info("Loading ZipEnhancer denoiser...")
+                    from voxcpm.zipenhancer import ZipEnhancer
+                    self.denoiser = ZipEnhancer(self.zipenhancer_model_path)
+                import tempfile
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    temp_files.append(tmp.name)
+                logger.info(f"Denoising reference audio {actual_ref_path} -> {temp_files[-1]}")
+                self.denoiser.enhance(actual_ref_path, output_path=temp_files[-1])
+                actual_ref_path = temp_files[-1]
+
+            # 3. Encode latents
+            ref_audio_latents = None
+            prompt_latents = None
+            if actual_ref_path:
+                with open(actual_ref_path, "rb") as f:
+                    wav_bytes = f.read()
+                logger.info(f"Encoding latents for reference audio: {len(wav_bytes)} bytes")
+                ext = os.path.splitext(actual_ref_path)[1].lstrip('.') or "wav"
+                encoded = server.encode_latents(wav_bytes, ext)
+                
+                if prompt_text_clean:
+                    prompt_latents = encoded
+                    ref_audio_latents = encoded
+                else:
+                    ref_audio_latents = encoded
+
+            # 4. Generate audio via Server Pool
+            logger.info(f"Generating audio with vLLM engine for text: '{final_text[:80]}...'")
+            buf = []
+            
+            generate_kwargs = {
+                "target_text": final_text,
+                "prompt_latents": prompt_latents,
+                "prompt_text": prompt_text_clean if prompt_text_clean else "",
+                "cfg_value": float(cfg_value_input),
+                "max_generate_length": 2000,
+                "temperature": 1.0,
+            }
+            
+            # Inspect signature to be safe & compatible with both VoxCPM versions
+            import inspect
+            sig = inspect.signature(server.generate)
+            if "ref_audio_latents" in sig.parameters:
+                generate_kwargs["ref_audio_latents"] = ref_audio_latents
+                
+            for chunk in server.generate(**generate_kwargs):
+                buf.append(chunk)
+
+            if not buf:
+                raise RuntimeError("Failed to generate audio (empty stream from backend)")
+            
+            wav = np.concatenate(buf, axis=0)
+
+            model_info = server.get_model_info()
+            sample_rate = int(model_info["sample_rate"])
+            return (sample_rate, wav)
+
+        finally:
+            for tmp_path in temp_files:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
 
 # ---------- UI ----------
@@ -510,6 +568,54 @@ def run_demo(
     device: str = "auto",
 ):
     demo = VoxCPMDemo(model_id=model_id, device=device)
+    
+    # Pre-preload and warm up models on startup to avoid delay on first user inference
+    logger.info("Pre-warming/Preloading models to device...")
+    try:
+        demo.get_or_load_voxcpm()
+        demo.get_or_load_asr_model()
+        logger.info("Models preloaded successfully!")
+    except Exception as e:
+        logger.warning(f"Failed to preload models during startup: {e}")
+
+    # Real warmup: run actual inference once so any JIT/torch.compile/nvrtc errors
+    # surface at startup (not on a user's first request) and the first user
+    # generation is fast. Covers both the no-reference path and the reference
+    # path (encode_latents -> VAE encoder), which exercise different kernels.
+    try:
+        import time as _t
+        print("[warmup] starting inference warmup (compiles torch.compile graphs)...", flush=True)
+        _t0 = _t.time()
+        # 1) Voice Design path: text only, no reference audio.
+        demo.generate_tts_audio(
+            text_input="Warmup.",
+            do_normalize=False,
+            denoise=False,
+            inference_timesteps=4,
+        )
+        print(f"[warmup] no-reference path done ({_t.time()-_t0:.1f}s)", flush=True)
+        # 2) Voice Control path: tiny dummy reference audio -> encode_latents/VAE.
+        import tempfile, soundfile as sf
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            warm_ref = tmp.name
+        try:
+            sf.write(warm_ref, np.zeros(16000, dtype=np.float32), 16000)
+            demo.generate_tts_audio(
+                text_input="Warmup.",
+                reference_wav_path_input=warm_ref,
+                do_normalize=False,
+                denoise=False,
+                inference_timesteps=4,
+            )
+        finally:
+            try:
+                os.remove(warm_ref)
+            except OSError:
+                pass
+        print(f"[warmup] complete; inference paths ready (total {_t.time()-_t0:.1f}s)", flush=True)
+    except Exception as e:
+        print(f"[warmup] FAILED (server will still start): {e!r}", flush=True)
+        
     interface = create_demo_interface(demo)
     interface.queue(max_size=10, default_concurrency_limit=1).launch(
         server_name=server_name,

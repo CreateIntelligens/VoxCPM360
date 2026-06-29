@@ -5,3 +5,8 @@ voxcpm.egg-info
 .DS_Store
 ./pretrained_models/
 app_local.py
+.env
+venv-nano/
+
+# local scratch / experimental clones
+scratch/
