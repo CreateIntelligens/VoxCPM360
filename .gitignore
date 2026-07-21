@@ -1,6 +1,7 @@
 launch.json
 .venv/
 __pycache__
+.pytest_cache/
 voxcpm.egg-info
 .DS_Store
 ./pretrained_models/
@@ -10,3 +11,7 @@ venv-nano/
 
 # local scratch / experimental clones
 scratch/
+
+# local training data and generated checkpoints
+/dataset/
+/checkpoints/

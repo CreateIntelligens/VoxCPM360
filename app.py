@@ -1,18 +1,25 @@
+import logging
 import os
 import re
 import sys
-import logging
-import numpy as np
-import gradio as gr
-from typing import Optional, Tuple
-from funasr import AutoModel
 from pathlib import Path
+from typing import Optional, Tuple
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import voxcpm
-from voxcpm.model.utils import resolve_runtime_device
+import gradio as gr
+import numpy as np
+from funasr import AutoModel
 from nanovllm_voxcpm import VoxCPM
+from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig
+
+import voxcpm
+from voxcpm.lora_registry import (
+    BASE_MODEL_KEY,
+    LoraRegistry,
+    build_nano_lora_config,
+)
+from voxcpm.model.utils import resolve_runtime_device
 
 
 logging.basicConfig(
@@ -117,6 +124,9 @@ _I18N_TRANSLATIONS = {
         "cfg_info": "Higher → closer to the prompt / reference; lower → more creative variation",
         "dit_steps_label": "LocDiT flow-matching steps",
         "dit_steps_info": "LocDiT flow-matching steps — more steps → maybe better audio quality, but slower",
+        "model_selector_label": "Inference model",
+        "model_selector_info": "Choose the base model or the latest checkpoint from a LoRA training run.",
+        "refresh_models_btn": "Rescan models",
         "usage_instructions": _USAGE_INSTRUCTIONS_EN,
         "examples_footer": _EXAMPLES_FOOTER_EN,
     },
@@ -140,6 +150,9 @@ _I18N_TRANSLATIONS = {
         "cfg_info": "数值越高 → 越贴合提示/参考音色；数值越低 → 生成风格更自由",
         "dit_steps_label": "LocDiT 流匹配迭代步数",
         "dit_steps_info": "LocDiT 流匹配生成迭代步数 — 步数越多 → 可能生成更好的音频质量，但速度变慢",
+        "model_selector_label": "推論模型",
+        "model_selector_info": "選擇基礎模型，或某次 LoRA 訓練的最新 checkpoint。",
+        "refresh_models_btn": "重新掃描",
         "usage_instructions": _USAGE_INSTRUCTIONS_ZH,
         "examples_footer": _EXAMPLES_FOOTER_ZH,
     },
@@ -225,11 +238,25 @@ class VoxCPMDemo:
     def __init__(self, model_id: str = "openbmb/VoxCPM2", device: str = "auto") -> None:
         self.device = resolve_runtime_device(device, "cuda")
         self.optimize = os.environ.get("VOXCPM_OPTIMIZE", "false").lower() == "true"
-        logger.info(f"Running VoxCPM on device: {self.device} (optimize={self.optimize})")
+        self.gpu_memory_utilization = float(
+            os.environ.get("VOXCPM_GPU_MEMORY_UTILIZATION", "0.35")
+        )
+        if not 0 < self.gpu_memory_utilization <= 1:
+            raise ValueError("VOXCPM_GPU_MEMORY_UTILIZATION must be in (0, 1]")
+        logger.info(
+            "Running VoxCPM on device: %s (optimize=%s, gpu_memory_utilization=%.2f)",
+            self.device,
+            self.optimize,
+            self.gpu_memory_utilization,
+        )
 
         self.asr_model_id = "iic/SenseVoiceSmall"
         self.asr_device = "cuda:0" if self.device.startswith("cuda") else "cpu"
         self.asr_model: Optional[AutoModel] = None
+
+        lora_root = Path(os.environ.get("VOXCPM_LORA_ROOT", "/app/checkpoints"))
+        self.lora_registry = LoraRegistry(lora_root)
+        logger.info("Discovered %d LoRA checkpoints.", len(self.lora_registry.checkpoints))
 
         self.voxcpm_server = None
         self._model_id = model_id
@@ -250,15 +277,19 @@ class VoxCPMDemo:
                     devices = [0]
         
         enforce_eager = not self.optimize
+        lora_config = LoRAConfig(
+            **build_nano_lora_config(self.lora_registry.checkpoints)
+        )
         self.voxcpm_server = VoxCPM.from_pretrained(
             self._model_id,
             inference_timesteps=10,
             max_num_batched_tokens=8192,
             max_num_seqs=16,
             max_model_len=4096,
-            gpu_memory_utilization=0.85,
+            gpu_memory_utilization=self.gpu_memory_utilization,
             enforce_eager=enforce_eager,
             devices=devices,
+            lora_config=lora_config,
         )
         logger.info("nano-vllm model loaded successfully.")
         return self.voxcpm_server
@@ -298,12 +329,15 @@ class VoxCPMDemo:
         do_normalize: bool = True,
         denoise: bool = True,
         inference_timesteps: int = 10,
+        model_selection: str = BASE_MODEL_KEY,
     ) -> Tuple[int, np.ndarray]:
         server = self.get_or_load_voxcpm()
 
         text = (text_input or "").strip()
         if len(text) == 0:
             raise ValueError("Please input text to synthesize.")
+
+        lora_name = self.lora_registry.ensure_registered(server, model_selection)
 
         control = (control_instruction or "").strip()
         control = re.sub(r"[()（）]", "", control).strip()
@@ -369,6 +403,7 @@ class VoxCPMDemo:
                 "cfg_value": float(cfg_value_input),
                 "max_generate_length": 2000,
                 "temperature": 1.0,
+                "lora_name": lora_name,
             }
             
             # Inspect signature to be safe & compatible with both VoxCPM versions
@@ -413,6 +448,7 @@ def create_demo_interface(demo: VoxCPMDemo):
         do_normalize: bool,
         denoise: bool,
         dit_steps: int,
+        model_selection: str,
     ):
         actual_prompt_text = prompt_text_value.strip() if use_prompt_text else ""
         actual_control = "" if use_prompt_text else control_instruction
@@ -425,8 +461,25 @@ def create_demo_interface(demo: VoxCPMDemo):
             do_normalize=do_normalize,
             denoise=denoise,
             inference_timesteps=int(dit_steps),
+            model_selection=model_selection,
         )
         return (sr, wav_np)
+
+    def _refresh_models(current_selection: str):
+        demo.lora_registry.refresh()
+        choices = demo.lora_registry.choices()
+        valid_selections = {value for _, value in choices}
+        if current_selection in valid_selections:
+            selection = current_selection
+        else:
+            selection = BASE_MODEL_KEY
+        return (
+            gr.update(
+                choices=choices,
+                value=selection,
+            ),
+            demo.lora_registry.describe(selection),
+        )
 
     def _on_toggle_instant(checked):
         """Instant UI toggle — no ASR, no blocking."""
@@ -464,6 +517,23 @@ def create_demo_interface(demo: VoxCPMDemo):
 
         with gr.Row():
             with gr.Column():
+                with gr.Row():
+                    model_selector = gr.Dropdown(
+                        choices=demo.lora_registry.choices(),
+                        value=BASE_MODEL_KEY,
+                        label=I18N("model_selector_label"),
+                        info=I18N("model_selector_info"),
+                        interactive=True,
+                        scale=4,
+                    )
+                    refresh_models = gr.Button(
+                        I18N("refresh_models_btn"),
+                        variant="secondary",
+                        scale=1,
+                    )
+                model_status = gr.Markdown(
+                    demo.lora_registry.describe(BASE_MODEL_KEY)
+                )
                 reference_wav = gr.Audio(
                     sources=["upload", "microphone"],
                     type="filepath",
@@ -530,6 +600,19 @@ def create_demo_interface(demo: VoxCPMDemo):
                 audio_output = gr.Audio(label=I18N("generated_audio_label"))
                 gr.Markdown(I18N("examples_footer"))
 
+        model_selector.change(
+            fn=demo.lora_registry.describe,
+            inputs=[model_selector],
+            outputs=[model_status],
+            show_progress=False,
+        )
+        refresh_models.click(
+            fn=_refresh_models,
+            inputs=[model_selector],
+            outputs=[model_selector, model_status],
+            show_progress="minimal",
+        )
+
         show_prompt_text.change(
             fn=_on_toggle_instant,
             inputs=[show_prompt_text],
@@ -552,6 +635,7 @@ def create_demo_interface(demo: VoxCPMDemo):
                 DoNormalizeText,
                 DoDenoisePromptAudio,
                 dit_steps,
+                model_selector,
             ],
             outputs=[audio_output],
             show_progress=True,

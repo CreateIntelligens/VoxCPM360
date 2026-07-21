@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from app import VoxCPMDemo
+
+
+class FakeRegistry:
+    def __init__(self):
+        self.selections = []
+
+    def ensure_registered(self, server, selection):
+        self.selections.append(selection)
+        return "trial-adapter"
+
+
+class FakeServer:
+    def __init__(self):
+        self.lora_names = []
+
+    def generate(
+        self,
+        target_text,
+        prompt_latents=None,
+        prompt_text="",
+        max_generate_length=2000,
+        temperature=1.0,
+        cfg_value=2.0,
+        ref_audio_latents=None,
+        lora_name=None,
+    ):
+        self.lora_names.append(lora_name)
+        yield np.zeros(16, dtype=np.float32)
+
+    def get_model_info(self):
+        return {"sample_rate": 16000}
+
+
+def test_generate_passes_selected_lora_to_nano_server():
+    server = FakeServer()
+    registry = FakeRegistry()
+    demo = VoxCPMDemo.__new__(VoxCPMDemo)
+    demo.voxcpm_server = server
+    demo.lora_registry = registry
+    demo.text_normalizer = None
+    demo.denoiser = None
+
+    sample_rate, audio = demo.generate_tts_audio(
+        text_input="測試",
+        do_normalize=False,
+        denoise=False,
+        model_selection="trial_lora_20epochs",
+    )
+
+    assert sample_rate == 16000
+    assert audio.shape == (16,)
+    assert registry.selections == ["trial_lora_20epochs"]
+    assert server.lora_names == ["trial-adapter"]
+
+
+def test_defaults_to_guarded_gpu_memory_utilization(monkeypatch, tmp_path):
+    monkeypatch.delenv("VOXCPM_GPU_MEMORY_UTILIZATION", raising=False)
+    monkeypatch.setenv("VOXCPM_LORA_ROOT", str(tmp_path))
+
+    demo = VoxCPMDemo(device="cpu")
+
+    assert demo.gpu_memory_utilization == 0.35
+
+
+def test_rejects_invalid_gpu_memory_utilization(monkeypatch, tmp_path):
+    monkeypatch.setenv("VOXCPM_GPU_MEMORY_UTILIZATION", "1.1")
+    monkeypatch.setenv("VOXCPM_LORA_ROOT", str(tmp_path))
+
+    with pytest.raises(ValueError, match="must be in"):
+        VoxCPMDemo(device="cpu")

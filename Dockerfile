@@ -70,6 +70,18 @@ FROM base AS runner
 # Copy the pre-compiled virtual environment containing python packages from builder
 COPY --from=builder /opt/venv /opt/venv
 
+# Run bind-mounted workspace processes as the host user so generated files remain editable.
+ARG APP_UID=1000
+ARG APP_GID=1000
+RUN groupadd --gid "${APP_GID}" voxcpm \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /bin/bash voxcpm \
+    && mkdir -p /home/voxcpm/.cache/huggingface /home/voxcpm/.cache/modelscope \
+    && chown -R "${APP_UID}:${APP_GID}" /home/voxcpm
+
+ENV HOME=/home/voxcpm
+
+USER voxcpm
+
 # Ensure the app starts by default on port 8000
 EXPOSE 8000
 

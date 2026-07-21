@@ -1,6 +1,18 @@
+x-memory-guardrails: &memory-guardrails
+  mem_limit: 64g
+  memswap_limit: 64g
+  oom_score_adj: 500
+
 services:
   app:
-    build: .
+    <<: *memory-guardrails
+    build:
+      context: .
+      args:
+        APP_UID: ${HOST_UID:-1000}
+        APP_GID: ${HOST_GID:-1000}
+    image: voxcpm360-app
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     container_name: voxcpm_app
     restart: unless-stopped
     environment:
@@ -8,6 +20,7 @@ services:
       - VOXCPM_DEVICE=${VOXCPM_DEVICE:-auto}
       - MODEL_ID=${MODEL_ID:-openbmb/VoxCPM2}
       - VOXCPM_OPTIMIZE=${VOXCPM_OPTIMIZE:-false}
+      - VOXCPM_GPU_MEMORY_UTILIZATION=${VOXCPM_GPU_MEMORY_UTILIZATION:-0.35}
       # GB10 (Grace-Blackwell) reports sm_121, but torch cu128 nvrtc only knows up
       # to sm_120, so runtime JIT fusion (e.g. the @torch.jit.script snake op) fails
       # with "invalid value for --gpu-architecture". Disable JIT so these run eager.
@@ -16,13 +29,43 @@ services:
     command: bash -c "python scripts/download_models.py --model-id ${MODEL_ID:-openbmb/VoxCPM2} && python app.py --port 8000 --device ${VOXCPM_DEVICE:-auto} --model-id ${MODEL_ID:-openbmb/VoxCPM2}"
     volumes:
       # Persistent cache for downloaded model weights (highly recommended to save GBs of downloading)
-      - hf_cache:/root/.cache/huggingface
-      - modelscope_cache:/root/.cache/modelscope
+      - hf_cache:/home/voxcpm/.cache/huggingface
+      - modelscope_cache:/home/voxcpm/.cache/modelscope
       # Optional: mount workspace directory for live edits (uncomment if developing)
       - .:/app
     
     # --- GPU CONFIGURATION ---
     # Enabled NVIDIA GPUs for container usage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  train:
+    <<: *memory-guardrails
+    image: voxcpm360-app
+    profiles: [training]
+    restart: "no"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    init: true
+    stop_grace_period: 30s
+    working_dir: /app
+    environment:
+      - PYTORCH_JIT=0
+      - TOKENIZERS_PARALLELISM=false
+    command:
+      - python
+      - scripts/train_voxcpm_finetune.py
+      - --config_path
+      - ${TRAIN_CONFIG_PATH:-conf/voxcpm_v2/trial_lora_20epochs.yaml}
+    volumes:
+      - hf_cache:/home/voxcpm/.cache/huggingface
+      - modelscope_cache:/home/voxcpm/.cache/modelscope
+      - .:/app
+      - /mnt/nas:/mnt/nas:ro
     deploy:
       resources:
         reservations:
