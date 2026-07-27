@@ -38,12 +38,14 @@ RUN python3.10 -m venv /opt/venv
 # Copy dependency definition files
 COPY pyproject.toml uv.lock ./
 
-# Set compile flags for compatibility with Blackwell GPU architecture using CUDA 12.8
-# Only build for the architectures actually targeted (sm_120 for GB10/Blackwell).
-# Each extra arch multiplies the number of compile units, RAM and build time.
+# Target CUDA compute capabilities are configurable at build time so the same
+# Dockerfile works on Ampere (8.6), Hopper (9.0) and Blackwell (12.0) hosts.
+# Pass --build-arg TORCH_ARCH_LIST=12.0 to build for a single architecture only
+# (faster, smaller image) when the target GPU is known ahead of time.
+ARG TORCH_ARCH_LIST="8.6;9.0;12.0"
 # MAX_JOBS caps parallel nvcc jobs so flash-attention compilation does not exhaust RAM (OOM).
-ENV TORCH_CUDA_ARCH_LIST="12.0" \
-    FLASH_ATTN_CUDA_ARCHS="12.0" \
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_ARCH_LIST}" \
+    FLASH_ATTN_CUDA_ARCHS="${TORCH_ARCH_LIST}" \
     FLASH_ATTENTION_FORCE_BUILD=TRUE \
     NVCC_THREADS=1 \
     MAX_JOBS=2
@@ -54,7 +56,6 @@ RUN . /opt/venv/bin/activate && \
     python3 -c "import torch.utils.cpp_extension as c; p = c.__file__; content = open(p).read().replace('def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:', 'def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:\n    return'); open(p, 'w').write(content)" && \
     git clone --branch v2.6.3 --single-branch https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
     sed -i 's/dprops->major == 9 \&\& dprops->minor == 0/(dprops->major == 9 \&\& dprops->minor == 0) || dprops->major >= 12/g' /tmp/flash-attention/csrc/flash_attn/flash_api.cpp && \
-    python3 -c 'p = "/tmp/flash-attention/setup.py"; c = open(p).read().replace("arch=compute_80,code=sm_80", "arch=compute_120,code=sm_120").replace("arch=compute_90,code=sm_90", "arch=compute_120,code=sm_120"); open(p, "w").write(c)' && \
     cd /tmp/flash-attention && \
     uv pip install --no-build-isolation . && \
     cd /app && \
