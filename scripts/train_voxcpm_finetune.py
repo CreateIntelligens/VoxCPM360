@@ -272,6 +272,16 @@ def train(
             return next(train_iter)
 
     with tracker.live():
+        best_val_loss = float("inf")
+        _best_meta = save_dir / "best" / "best_metric.json"
+        if _best_meta.is_file():
+            try:
+                best_val_loss = float(json.loads(_best_meta.read_text())["val_loss"])
+                if accelerator.rank == 0:
+                    tracker.print(f"[best] 沿用既有紀錄 val {best_val_loss:.6f}")
+            except Exception:
+                pass
+
         for step in range(start_step, num_iters):
             # update resume step so signal handler can save current progress
             resume["step"] = step
@@ -335,7 +345,7 @@ def train(
                 tracker.log_metrics(loss_values, split="train")
 
             if val_loader is not None and (step % valid_interval == 0 or step == num_iters - 1):
-                validate(
+                _val_loss = validate(
                     model,
                     val_loader,
                     batch_processor,
@@ -352,6 +362,27 @@ def train(
                     tokenizer=tokenizer,
                     valid_interval=valid_interval,
                 )
+
+                # 追蹤 val 最佳。訓練無 early stopping，且過擬合後 `latest`
+                # 會明顯劣於谷底，故一發現新低就另存一份到 best/，避免
+                # 谷底落在兩個 save_interval 之間而永遠取不到。
+                if (
+                    _val_loss is not None
+                    and _val_loss < best_val_loss
+                    and accelerator.rank == 0
+                ):
+                    best_val_loss = _val_loss
+                    save_checkpoint(
+                        model, optimizer, scheduler, save_dir, step,
+                        pretrained_path, hf_model_id, distribute,
+                        tag="best",
+                    )
+                    (save_dir / "best" / "best_metric.json").write_text(
+                        json.dumps({"step": step, "val_loss": _val_loss}, indent=2)
+                    )
+                    tracker.print(
+                        f"[best] step {step}: val {_val_loss:.6f} -> {save_dir / 'best'}"
+                    )
 
             if (step % save_interval == 0 or step == num_iters - 1) and accelerator.rank == 0:
                 save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute)
@@ -428,6 +459,9 @@ def validate(
             val_metrics[key] = mean_sub_loss.item()
 
         tracker.log_metrics(val_metrics, split="val")
+        _val_total = val_metrics["loss/total"]
+    else:
+        _val_total = None
 
     # Generate sample audio for TensorBoard display
     if writer is not None and val_ds is not None and audio_vae is not None and accelerator.rank == 0:
@@ -467,6 +501,7 @@ def validate(
             tracker.print(f"[Warning] Skip audio generation: missing {', '.join(missing)}")
 
     model.train()
+    return _val_total
 
 
 def compute_mel_spectrogram(audio_np, sample_rate, n_mels=128):
@@ -751,6 +786,7 @@ def save_checkpoint(
     pretrained_path: str = None,
     hf_model_id: str = "",
     distribute: bool = False,
+    tag: str = None,
 ):
     """
     Save checkpoint with different strategies for full finetune vs LoRA:
@@ -760,7 +796,7 @@ def save_checkpoint(
     import shutil
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"step_{step:07d}"
+    tag = tag or f"step_{step:07d}"
     folder = save_dir / tag
     folder.mkdir(parents=True, exist_ok=True)
 

@@ -1,0 +1,29 @@
+pretrained_path: /mnt/home/csl426-aicr-ae5f63/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/bffb3df5a29440629464e5e839f4d214c8714c3d
+
+# 全參數微調 (Full Fine-Tuning) 對照組 2：純 naer 資料集
+train_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/naer/manifests/voxcpm2_abs/train.jsonl
+val_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/naer/manifests/voxcpm2_abs/val_seen.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+
+batch_size: 4
+grad_accum_steps: 8
+num_workers: 8
+max_batch_tokens: 16384
+
+num_iters: 4000
+max_steps: 4000
+log_interval: 50
+valid_interval: 250
+save_interval: 250
+
+learning_rate: 0.00001
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+
+save_path: /app/checkpoints/full_ft_naer_dense
+tensorboard: /app/checkpoints/full_ft_naer_dense/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0

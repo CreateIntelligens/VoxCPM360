@@ -1,0 +1,40 @@
+pretrained_path: /mnt/home/csl426-aicr-ae5f63/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/bffb3df5a29440629464e5e839f4d214c8714c3d
+
+# 全參數微調：密集儲存版
+#
+# 動機：前三組全參微調的最佳 val 都落在 step 1,500~4,000，之後單調過擬合到
+# 7,000。原設定 valid_interval 500 / save_interval 1000，導致一半的驗證點
+# 沒有對應 checkpoint —— naer 最佳點在 step 1,500，實際只存得到 1,000 與
+# 2,000，谷底取不到。
+#
+# 本設定讓兩者對齊為 250：每個 val 數字都有可取的 checkpoint。
+# max_steps 由 7,000 縮到 5,000，因為 4,000 之後三組都已明確過擬合，
+# 且 LR 排程綁定 max_steps，縮短可讓 cosine 曲線更貼合有效訓練區間。
+#
+# 磁碟：5,000 / 250 = 20 個 x 26 GB ~= 520 GB（p06 尚餘 244 TB）
+train_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/train.jsonl
+val_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/val_seen.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+
+batch_size: 4
+grad_accum_steps: 8
+num_workers: 8
+max_batch_tokens: 8192
+
+num_iters: 5000
+max_steps: 5000
+log_interval: 50
+valid_interval: 250
+save_interval: 250
+
+learning_rate: 0.00001
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+
+save_path: /app/checkpoints/full_ft_tai8_dense
+tensorboard: /app/checkpoints/full_ft_tai8_dense/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
