@@ -1,0 +1,37 @@
+# C：混合資料 + 縮短排程
+#
+# mixed（28.8 萬句）最佳 0.9547 @ step 4,000，是三組資料量最大者。
+# 在與 A 相同的縮短排程下重跑，檢驗混合資料是否真有優勢。
+# 注意：val 集與 A 不同，兩者數字不可直接比較，需用 eval_ckpt.py 對齊。
+#
+# 共同基礎：full_ft_tai8.yaml（batch 4 x grad_accum 8 = 有效 128）
+# valid_interval 與 save_interval 對齊 250，配合 best checkpoint 追蹤，
+# 谷底不會落在兩個 save_interval 之間而取不到。
+pretrained_path: /mnt/home/csl426-aicr-ae5f63/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/bffb3df5a29440629464e5e839f4d214c8714c3d
+
+train_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/mixed/manifests/tai8_naer/train.jsonl
+val_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/mixed/manifests/tai8_naer/val_seen.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+
+batch_size: 4
+grad_accum_steps: 8
+num_workers: 8
+max_batch_tokens: 16384
+
+num_iters: 5000
+max_steps: 5000
+log_interval: 50
+valid_interval: 250
+save_interval: 250
+
+learning_rate: 0.00001
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+
+save_path: /app/checkpoints/ft_mixed_C_dense
+tensorboard: /app/checkpoints/ft_mixed_C_dense/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
