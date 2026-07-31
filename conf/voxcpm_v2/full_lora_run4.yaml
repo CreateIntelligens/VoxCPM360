@@ -1,0 +1,48 @@
+pretrained_path: /mnt/home/csl426-aicr-ae5f63/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/bffb3df5a29440629464e5e839f4d214c8714c3d
+
+# 回到純 tai8：run3 已驗證混入 22.9% naer 對 tai8 無助益
+# （純 tai8 驗證集上 1.1122 vs run2 的 1.1098，全距僅 0.0034）
+train_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/train.jsonl
+val_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/val_seen.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+
+# 與 run2 完全相同，以隔離 LoRA rank 這個唯一變因
+batch_size: 16
+grad_accum_steps: 2
+num_workers: 8
+
+# max_sample_len = 8192 // 16 = 512；純 tai8 p99=222、max=630，僅濾掉 4／222383 筆
+max_batch_tokens: 8192
+
+# 222383 ÷ 128 ≈ 1738 步/epoch；7000 步 ≈ 4.03 epoch
+# run1~run3 的 val 都在 epoch 2~3 走平，跑到 epoch 4 已足夠涵蓋轉折點。
+# ⚠️ 不可設更短再續訓：LR 排程把 max_steps 烘進 cosine 曲線，
+# 續訓會還原 scheduler.pth 使 LR≈0 空轉（見 RUNS.md）。
+num_iters: 7000
+max_steps: 7000
+log_interval: 50
+valid_interval: 500
+save_interval: 500
+
+learning_rate: 0.00005
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+
+save_path: /app/checkpoints/full_lora_run4
+tensorboard: /app/checkpoints/full_lora_run4/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+
+# ★ 本輪唯一變因：LoRA rank 32 → 64（alpha 同步，維持 alpha/r = 1）
+# 假說：run1→run2 放大 batch 16 倍、run2→run3 加 30% 資料，兩者皆無改善，
+# 且 loss/diff 三個 checkpoint 都卡在 0.995±0.002，形態指向容量受限而非資料不足。
+lora:
+  enable_lm: true
+  enable_dit: true
+  enable_proj: false
+  r: 64
+  alpha: 64
+  dropout: 0.0

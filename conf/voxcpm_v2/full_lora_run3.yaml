@@ -1,0 +1,46 @@
+pretrained_path: /mnt/home/csl426-aicr-ae5f63/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/bffb3df5a29440629464e5e839f4d214c8714c3d
+
+# 資料已偏離基準：tai8 222,383 + naer 66,104 = 288,487 句（naer 佔 22.9%）
+# naer = TAT-MOE 台語朗讀（16k mono，已驗證）；tai8 = 台八戲劇對白
+# dataset_id 保留來源：tai8=1、naer=0
+train_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/mixed/manifests/tai8_naer/train.jsonl
+val_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/mixed/manifests/tai8_naer/val_seen.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+
+# 與 run2 相同（有效 batch 128），只動資料這一個變因以便對照
+batch_size: 16
+grad_accum_steps: 2
+num_workers: 8
+
+# ⚠️ 必須從 run2 的 8192 調高：naer 句子長 3.7 倍，混合後長度分布右移
+# （p90 175→342、p99 222→467、max 630→784）
+# max_sample_len = 16384 // 16 = 1024 → 零丟棄
+# 若沿用 8192 則 msl=512，會靜默丟棄 973 筆
+max_batch_tokens: 16384
+
+# 288,487 樣本 ÷ 有效 batch 128 ≈ 2254 步/epoch；10 epoch ≈ 22540 步
+# 取 10 epoch 而非 20：run2 在 epoch 3.5 即走平，後半段無改善
+num_iters: 22600
+max_steps: 22600
+log_interval: 50
+valid_interval: 500
+save_interval: 1000
+
+learning_rate: 0.00005
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+
+save_path: /app/checkpoints/full_lora_run3
+tensorboard: /app/checkpoints/full_lora_run3/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+lora:
+  enable_lm: true
+  enable_dit: true
+  enable_proj: false
+  r: 32
+  alpha: 32
+  dropout: 0.0

@@ -1,0 +1,43 @@
+pretrained_path: /mnt/home/csl426-aicr-ae5f63/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/bffb3df5a29440629464e5e839f4d214c8714c3d
+train_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/train.jsonl
+val_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/val_seen.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+
+# 有效 batch = batch_size × grad_accum_steps × world_size = 16 × 2 × 4 = 128
+# （run1 為 1×2×4 = 8，梯度雜訊過大導致不收斂）
+batch_size: 16
+grad_accum_steps: 2
+num_workers: 8
+
+# max_sample_len = max_batch_tokens // batch_size = 8192 // 16 = 512
+# 實測 train.jsonl 長度分布 p99=222、max=630，cap 512 只濾掉 4／222383 筆。
+# 注意：調大 batch_size 時必須同步調大 max_batch_tokens，否則會靜默丟棄長樣本。
+max_batch_tokens: 8192
+
+# 222383 樣本 ÷ 有效 batch 128 ≈ 1738 步/epoch；20 epoch ≈ 34760 步
+# 刻意跑長：LR 排程綁定 max_steps，事後從 34 個 checkpoint 挑收斂點即可
+# （續訓會沿用舊 cosine 曲線、LR 已衰減到近 0，故不採「先短再延長」）
+num_iters: 34800
+max_steps: 34800
+log_interval: 50
+valid_interval: 500
+save_interval: 1000
+
+learning_rate: 0.00005
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+
+save_path: /app/checkpoints/full_lora_run2
+tensorboard: /app/checkpoints/full_lora_run2/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+lora:
+  enable_lm: true
+  enable_dit: true
+  enable_proj: false
+  r: 32
+  alpha: 32
+  dropout: 0.0
