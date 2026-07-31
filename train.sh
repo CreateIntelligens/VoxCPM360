@@ -56,7 +56,8 @@ if [[ "$runner" == docker ]]; then
 
     echo "訓練設定：$config_path"
     echo "容器統一記憶體上限：64 GiB（不允許額外 swap）"
-    TRAIN_CONFIG_PATH="$config_path" docker compose --profile training up         --no-deps --no-build --abort-on-container-exit --exit-code-from train train
+    TRAIN_CONFIG_PATH="$config_path" docker compose --profile training up \
+        --no-deps --no-build --abort-on-container-exit --exit-code-from train train
     exit $?
 fi
 
@@ -88,7 +89,9 @@ if [[ "$nproc_gpu" -gt 1 ]]; then
     # 的 rendezvous port 29500 是固定的，第二個作業會 EADDRINUSE 直接崩。
     # 用 job id 推導 port，確保不同作業必然錯開。
     rdzv_port=$(( 29500 + ${SLURM_JOB_ID:-0} % 1000 ))
-    exec torchrun --nproc_per_node="$nproc_gpu"         --rdzv-backend=c10d --rdzv-endpoint="127.0.0.1:$rdzv_port"         scripts/train_voxcpm_finetune.py --config_path "$config_path"
+    exec torchrun --nproc_per_node="$nproc_gpu" \
+        --rdzv-backend=c10d --rdzv-endpoint="127.0.0.1:$rdzv_port" \
+        scripts/train_voxcpm_finetune.py --config_path "$config_path"
 else
     exec python -u scripts/train_voxcpm_finetune.py --config_path "$config_path"
 fi
