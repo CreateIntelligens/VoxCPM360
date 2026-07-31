@@ -15,3 +15,24 @@ scratch/
 # local training data and generated checkpoints
 /dataset/
 /checkpoints/
+
+# ---- Taipei-1 訓練環境（本 fork 新增）----
+# 訓練日誌為 append-only 純文字，diff 無意義且會膨脹 repo。
+# 結論萃取至 docs/RUNS.md，原始 log 備份到本機 runs/*/logs/。
+*.log
+slurm-*.out
+gpu_usage-*.log
+
+# 一次性／暫存腳本（見 CLAUDE.md 4.2）
+.scripts_tmp/
+
+# TensorBoard 事件檔（二進位）
+events.out.tfevents.*
+
+# AI agent 工作流設定（專案專屬 skill）。
+# 生效的是本機端 .claude/skills/ 那份；此處三份為 md5 相同的備份，
+# 叢集上無 agent 執行，不會被讀取。內容含大量本機 Windows 絕對路徑，
+# 推至 upstream fork 對其他人無意義，故不進版控。
+.claude/
+.codex/
+.gemini/
