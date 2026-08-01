@@ -5,18 +5,92 @@ Taipei-1 · `p06` · 4× H100（torchrun/NCCL）· 模型 `openbmb/VoxCPM2` @ `b
 
 ---
 
-## 現況（2026-07-31 15:20）
+## 現況（2026-08-01 13:30）
 
-| | |
-|---|---|
-| **正在跑** | `full_ft_mixed` · Slurm job `176451` · 節點 `cnode2-021` |
-| **進度** | step 1,500 / 7,000 (21.4%) · val 0.9626 且仍在降 |
-| **已完成** | run4 (`176430`) · `full_ft_tai8` (`176449`) · `full_ft_naer` (`176450`) |
-| **跑完要做** | ① 跑 `eval_ckpt.py` 評測 ② `bash ~/scripts/fix_perms.sh` ③ 取回本機 |
+### 一句話
 
-> ⚠️ **全參微調的最佳點極早**：naer 在 step 1,500 見頂 (0.9190)，之後一路過擬合到
-> 7,000 步的 0.9879。`save_interval: 1000` 對這種曲線**太稀疏**，真正最佳點可能落在
-> 1,000～2,000 之間而抓不到。下輪建議改 250～500。
+VoxCPM2 全參微調已可用（最佳 `full_ft_tai8_step3000`，val 1.0954，已部署 GB10）；
+目前在跑 **epoch 計量的 6 組 VoxCPM2 對照** 與 **4 組 BlueMagpie/Barbet 換腦實驗**。
+
+### 執行中與排隊（Slurm，`p06` · `cnode2-021`）
+
+| Job | 設定 | 說明 |
+|---|---|---|
+| 176753 | `e_tai8_base` | 🏃 基準，3 epoch |
+| 176756 | `e_tai8_bs256` | 🏃 有效 batch 256 |
+| 176786 | `e_tai8_lr2e5` | ⏳ LR ×2（曾因 YAML bug 失敗，已修並重送）|
+| 176787 | `e_tai8_lr5e6` | ⏳ LR ÷2（同上）|
+| 176757 | `e_mixed_base` | ⏳ 混合資料 |
+| 176758 | `e_naer_base` | ⏳ naer 資料 |
+| 176778 | `bm_bridge_first` | ⏳ **首次跑 BlueMagpie**，只訓 bridge，1 epoch |
+| 176779 | `bm_tslm_base` | ⏳ 解凍 bridge+Barbet+spk_proj，聲學凍結 |
+| 176780 | `bm_tslm_lr5e5` | ⏳ 同上，LR 5e-5 |
+| 176781 | `bm_full` | ⏳ 除 AudioVAE 全解凍 |
+
+> ⚠️ **BlueMagpie 四組是第一次跑，尚未驗證可行**。`bm_bridge_first` 刻意排最前面
+> （參數最少、1 epoch），它若失敗其餘三組必然同樣失敗。
+
+### 已部署到 GB10（`http://10.9.0.37:8800/`）
+
+`models/native/` 放 LoRA、`checkpoints/` 放全參模型，按「重新掃描」即現身。
+
+| 模型 | 最佳 val | val 集 |
+|---|---|---|
+| `full_ft_tai8_step3000` | 1.0954 | tai8 |
+| `full_ft_mixed_step4000` | 0.9547 | mixed |
+| `full_ft_naer_step1000` | 0.9347※ | naer |
+| `lora-run1/2/3/4` | 1.1129 / 1.1098 / 1.0957 / 1.1143 | tai8 |
+| `tai8-barbet-merge-v0` | — | 會出聲但**不講台語** |
+
+※ naer 真正最佳在 step 1,500（0.9190），但 `save_interval: 1000` 沒存到。
+
+---
+
+## 今天學到的四件事（新 session 必讀）
+
+### 1. val loss 只能同 val 集內比較
+
+各輪用各自的 `val_seen.jsonl`。naer 的 0.93 看似勝過 tai8 的 1.09，
+但那只反映朗讀語料好擬合，**不代表台語品質更好**。跨組比較必須用
+`eval_ckpt.py` 跑同一份測試集。
+
+### 2. 改用 epoch 計量後，過擬合點的規律才浮現
+
+step 數跨資料集沒有可比性。換算後三輪的最佳點全落在 **epoch 1.7~2.5**：
+
+| 輪次 | 總 epoch | 最佳點 |
+|---|---|---|
+| tai8 | 4.03 | epoch 1.73（step 3,000）|
+| naer | 11.81 | epoch 2.53（step 1,500）|
+| mixed | 4.03 | epoch 2.30（step 4,000）|
+
+naer 看似「見頂特別早」只是資料量小、同樣步數跑了近 3 倍 epoch。
+新設定一律 `num_epochs: 3.0`，超過必然過擬合。
+
+### 3. Barbet 換腦：merge 可行但台語不會轉移
+
+`tai8-barbet-merge-v0` 由 `merge_voxcpm_acoustic.py` 拼接而成（**非訓練產物**），
+把 full_ft_tai8 的聲學 323 個 tensor 換進 BlueMagpie 骨架，保留 410 個。
+實測**會出聲但完全不講台語**。
+
+逐 tensor 比對確認原因：全參微調動了 577 個 tensor 的**全部**，其中
+**254 個是 `base_lm.*`（MiniCPM4 文字腦）**，而那些在架構上無法搬進 Barbet
+（1,536 hidden、28 層混合 Mamba2，形狀對不上）。**台語發音知識在文字腦，
+merge 只搬得動聲學。**
+
+tokenizer 實測：Barbet 少用 25% token，`恁`／`佗` 等台語專用字能整字編碼
+（VoxCPM2 要拆 3 個 byte fallback）。**但 tai8 訓練文本全是華語漢字**
+（「你為什麼不說實話」而非「你是按怎毋講實話」），優勢發揮不出來。
+
+### 4. YAML 科學記號的地雷
+
+`learning_rate: 2e-05` 會被 YAML 1.1 解析成**字串**（規範要求帶小數點與正負號，
+如 `2.0e-05`），一路傳到 AdamW 才炸在
+`TypeError: '<=' not supported between instances of 'float' and 'str'`，
+且已浪費 20 分鐘 GPU（176754／176755 即因此 FAILED）。
+
+已在 `train()` 進入點加防呆轉型。**寫設定時一律用 `0.00002` 這種十進位寫法。**
+
 
 ---
 

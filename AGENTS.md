@@ -199,7 +199,7 @@ find <路徑> -name "*.sh" ! -perm -g=x -print | head       # 腳本 group 不�
   改動一律在叢集端進行後同步下來，**改完即同步**。
 - **本機 `scripts/fetch_run.sh` / `scripts/fetch_all_ckpt.sh`** 在本機執行，訓練後取回 log／權重／TensorBoard。支援簡寫名稱（如 `run3` / `3` 自動擴充為 `full_lora_run3`）與 `--with-pth` 強制下載續訓 `.pth` 檔。
 
-### 7.2 訓練設定的三個地雷
+### 7.2 訓練設定的地雷
 1. **`max_sample_len = max_batch_tokens // batch_size`** —— 兩者是除法關係。
    調大 `batch_size` 不同步調大 `max_batch_tokens` 會**靜默丟棄**超長樣本
    （`batch_size: 32` + `4096` 只剩 32.79% 資料）。
@@ -208,6 +208,41 @@ find <路徑> -name "*.sh" ! -perm -g=x -print | head       # 腳本 group 不�
 3. **LR 排程綁定 `max_steps`** —— `get_cosine_schedule_with_warmup` 把 `max_steps`
    烘進曲線，且續訓會還原 `scheduler.pth`。**不可「先跑短再加大 max_steps 續訓」**
    （等於 LR≈0 空轉）；要跑更長只能重跑。
+
+4. **YAML 科學記號會被讀成字串** —— `learning_rate: 2e-05` 依 YAML 1.1
+   規範必須帶小數點與正負號（`2.0e-05`）才算數字，否則解析為**字串**，
+   一路傳到 AdamW 才炸在 `TypeError: '<=' not supported between instances
+   of 'float' and 'str'`，且已浪費模型載入與 warmup 的時間。
+   **一律用 `0.00002` 這種十進位寫法。** `train()` 進入點已加防呆轉型。
+
+5. **改用 epoch 計量，不要用 step** —— step 數跨資料集沒有可比性：
+   tai8 跑 7,000 步是 4.03 epoch，naer 同樣 7,000 步卻是 11.81 epoch。
+   換算後三輪全參微調的最佳點全落在 **epoch 1.7~2.5**，規律才浮現。
+   設定用 `num_epochs` / `valid_per_epoch` / `save_per_epoch`，
+   腳本於資料集載入後換算並印出對照。
+
+6. **`best/` 已自動追蹤** —— 每次驗證後比對 val loss，一有新低就另存
+   `best/` 與 `best_metric.json`（記 step 與 val）。不必再人工從 log 挑，
+   谷底也不會落在兩個 `save_interval` 之間而漏掉。
+
+### 7.2.1 Barbet／BlueMagpie 換腦的結論
+
+`tai8-barbet-merge-v0` 由 `merge_voxcpm_acoustic.py` **拼接**而成（非訓練產物）：
+BlueMagpie 骨架保留 410 個 tensor（Barbet + 已訓練的 bridge），
+聲學 323 個換成 `full_ft_tai8_step3000` 的權重。
+
+**實測會出聲但完全不講台語。** 逐 tensor 比對確認原因：全參微調動了
+577 個 tensor 的**全部**，其中 **254 個是 `base_lm.*`（MiniCPM4 文字腦）**，
+而那些**在架構上無法搬進 Barbet**（1,536 hidden、28 層混合 Mamba2，形狀對不上）。
+**台語發音知識在文字腦，merge 只搬得動聲學。**
+
+tokenizer 實測：Barbet 少用 25% token，`恁`／`佗` 等台語專用字能整字編碼
+（VoxCPM2 要拆 3 個 byte fallback）。**但 tai8 訓練文本全是華語漢字**
+（「你為什麼不說實話」而非「你是按怎毋講實話」），這個優勢發揮不出來。
+
+要用 Barbet 必須訓練（`bm_*` 四組設定）。`bluemagpie` 與 `barbet` 是純 Python
+套件但未裝進容器，且**運算節點無對外網路**無法 pip install，
+故放在 `/app/vendor` 由 `train.sh` 以 `PYTHONPATH` 載入。
 
 ### 7.3 多卡啟動
 `train.sh` 已支援 GPU 數自動偵測（多卡 `torchrun`／單卡 `python`）。

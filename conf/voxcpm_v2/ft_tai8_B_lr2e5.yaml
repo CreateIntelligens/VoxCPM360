@@ -24,7 +24,7 @@ log_interval: 50
 valid_interval: 250
 save_interval: 250
 
-learning_rate: 2e-05
+learning_rate: 0.00002
 weight_decay: 0.01
 warmup_steps: 500
 max_grad_norm: 1.0

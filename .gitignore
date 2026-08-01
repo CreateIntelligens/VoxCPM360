@@ -36,3 +36,8 @@ events.out.tfevents.*
 .claude/
 .codex/
 .gemini/
+
+# 第三方套件原始碼，為繞過容器無對外網路而暫放（見 AGENTS.md 7.2.1）。
+# 上游為 OpenFormosa/BlueMagpie-TTS 與 OpenFormosa/Barbet，不納入本 repo。
+/vendor/
+/models/barbet/*/

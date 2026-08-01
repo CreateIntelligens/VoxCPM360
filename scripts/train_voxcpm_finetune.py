@@ -94,6 +94,16 @@ def train(
     if accelerator.rank == 0:
         save_dir.mkdir(parents=True, exist_ok=True)
         tb_dir.mkdir(parents=True, exist_ok=True)
+    # YAML 1.1 的科學記號若未帶小數點（2e-5 而非 2.0e-5）會被解析為字串，
+    # 一路傳到 AdamW 才炸，且已浪費模型載入與 warmup 的時間。此處先轉型。
+    learning_rate = float(learning_rate)
+    weight_decay = float(weight_decay)
+    max_grad_norm = float(max_grad_norm)
+    num_epochs = float(num_epochs)
+    for _n, _v in (("learning_rate", learning_rate), ("weight_decay", weight_decay)):
+        if not 0.0 <= _v:
+            raise ValueError(f"{_n} 必須為非負數，取得 {_v!r}")
+
     accelerator.barrier()  # Wait for directory creation
 
     writer = SummaryWriter(log_dir=str(tb_dir)) if accelerator.rank == 0 else None
