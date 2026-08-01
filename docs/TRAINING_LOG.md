@@ -5,44 +5,72 @@ Taipei-1 · `p06` · 4× H100（torchrun/NCCL）· 模型 `openbmb/VoxCPM2` @ `b
 
 ---
 
-## 現況（2026-08-01 13:30）
+## 現況（2026-08-01 17:00）
 
 ### 一句話
 
-VoxCPM2 全參微調已可用（最佳 `full_ft_tai8_step3000`，val 1.0954，已部署 GB10）；
-目前在跑 **epoch 計量的 6 組 VoxCPM2 對照** 與 **4 組 BlueMagpie/Barbet 換腦實驗**。
+`full_ft_tai8_step3000`（val 1.0954）仍是 tai8 上最佳並已部署 GB10；
+epoch 對照組跑完兩輪**未能超越**，縮短排程的假說暫不成立。
+BlueMagpie 四組尚未輪到，**首次執行、可行性未驗證**。
 
-### 執行中與排隊（Slurm，`p06` · `cnode2-021`）
+### 作業狀態
 
-| Job | 設定 | 說明 |
-|---|---|---|
-| 176753 | `e_tai8_base` | 🏃 基準，3 epoch |
-| 176756 | `e_tai8_bs256` | 🏃 有效 batch 256 |
-| 176786 | `e_tai8_lr2e5` | ⏳ LR ×2（曾因 YAML bug 失敗，已修並重送）|
-| 176787 | `e_tai8_lr5e6` | ⏳ LR ÷2（同上）|
-| 176757 | `e_mixed_base` | ⏳ 混合資料 |
-| 176758 | `e_naer_base` | ⏳ naer 資料 |
-| 176778 | `bm_bridge_first` | ⏳ **首次跑 BlueMagpie**，只訓 bridge，1 epoch |
-| 176779 | `bm_tslm_base` | ⏳ 解凍 bridge+Barbet+spk_proj，聲學凍結 |
-| 176780 | `bm_tslm_lr5e5` | ⏳ 同上，LR 5e-5 |
-| 176781 | `bm_full` | ⏳ 除 AudioVAE 全解凍 |
+| Job | 設定 | 狀態 | 最佳 val | 最佳 epoch |
+|---|---|---|---|---|
+| 176753 | `e_tai8_base` | ✅ 3h07m | 1.0965 | 1.62 |
+| 176756 | `e_tai8_bs256` | ✅ 2h49m | 1.0980 | 1.62 |
+| 176757 | `e_mixed_base` | 🏃 1h52m | 0.9651※ | — |
+| 176758 | `e_naer_base` | 🏃 1h32m | 0.9298※ | — |
+| 176786 | `e_tai8_lr2e5` | ⏳ 排隊 | — | 重送（YAML bug）|
+| 176787 | `e_tai8_lr5e6` | ⏳ 排隊 | — | 重送（YAML bug）|
+| 176778 | `bm_bridge_first` | ⏳ 排隊 | — | **首次跑 BlueMagpie** |
+| 176779 | `bm_tslm_base` | ⏳ 排隊 | — | — |
+| 176780 | `bm_tslm_lr5e5` | ⏳ 排隊 | — | — |
+| 176781 | `bm_full` | ⏳ 排隊 | — | — |
 
-> ⚠️ **BlueMagpie 四組是第一次跑，尚未驗證可行**。`bm_bridge_first` 刻意排最前面
-> （參數最少、1 epoch），它若失敗其餘三組必然同樣失敗。
+※ **不同 val 集，不可與 tai8 的數字比較**（見下方地雷）。
+176754／176755 曾因 YAML 科學記號被解析成字串而 FAILED，已修並重送為 176786／176787。
 
-### 已部署到 GB10（`http://10.9.0.37:8800/`）
+### 已取得的結論
+
+**縮短 max_steps 沒有幫助。** e_tai8_base 1.0965 對原本 full_ft_tai8 的 1.0954，
+差 0.001 落在噪音內（已確認的等價區間 0.005）。「讓 LR cosine 曲線貼合有效區間
+可拿到更低谷底」的假說**不成立**，最多算持平。
+
+**有效 batch 加倍也沒有幫助。** e_tai8_bs256 為 1.0980，同樣在噪音內。
+
+**最穩定的規律是過擬合點的位置。** 五輪全參微調的最佳點：
+
+| 輪次 | 最佳 epoch |
+|---|---|
+| full_ft_tai8 | 1.73 |
+| full_ft_mixed | 2.30 |
+| full_ft_naer | 2.53 |
+| e_tai8_base | 1.62 |
+| e_tai8_bs256 | 1.62 |
+
+**全部落在 epoch 1.6~2.5**，不受 batch size、max_steps 影響。這比任何超參都穩定，
+也是目前最可靠的訓練長度依據。
+
+### 已部署 GB10（`http://10.9.0.37:8800/`）
 
 `models/native/` 放 LoRA、`checkpoints/` 放全參模型，按「重新掃描」即現身。
+取回指令：`bash scripts/fetch_best.sh <ckpt 目錄名> ...`
 
 | 模型 | 最佳 val | val 集 |
 |---|---|---|
 | `full_ft_tai8_step3000` | 1.0954 | tai8 |
+| `e_tai8_base` | 1.0965 | tai8（今日新增）|
+| `lora-run3-step17000` | 1.0957 | tai8 |
+| `lora-run1/2/4` | 1.1129 / 1.1098 / 1.1143 | tai8 |
 | `full_ft_mixed_step4000` | 0.9547 | mixed |
-| `full_ft_naer_step1000` | 0.9347※ | naer |
-| `lora-run1/2/3/4` | 1.1129 / 1.1098 / 1.0957 / 1.1143 | tai8 |
+| `full_ft_naer_step1000` | 0.9347 | naer |
 | `tai8-barbet-merge-v0` | — | 會出聲但**不講台語** |
 
-※ naer 真正最佳在 step 1,500（0.9190），但 `save_interval: 1000` 沒存到。
+> 💡 **最值得實聽的對照**：`full_ft_tai8_step3000`（1.0954，9.2 GB）與
+> `lora-run3-step17000`（1.0957，72 MB）val 只差 0.0003，遠小於噪音。
+> 若聽起來也無差別，**LoRA 才是實用選擇**——檔案小 128 倍且可熱切換。
+
 
 ---
 

@@ -6,6 +6,32 @@
 
 ## 版本沿革
 
+### epoch 對照組 — 2026-08-01
+
+首度以 epoch 計量。step 跨資料集沒有可比性（tai8 的 7,000 步是 4.03 epoch，
+naer 同樣步數卻是 11.81 epoch），改用 num_epochs / valid_per_epoch /
+save_per_epoch，於資料集載入後換算並印出對照。
+
+六組固定 3 epoch、每 epoch 驗證與存檔 8 次，搭配自動 best 追蹤。
+
+- **e_tai8_base**（job 176753，3h07m）：基準。最佳 **1.0965 @ epoch 1.62**
+- **e_tai8_bs256**（job 176756，2h49m）：grad_accum 8→16（有效 batch 256），
+  LR 同步調至 1.4e-5。最佳 **1.0980 @ epoch 1.62**
+- e_tai8_lr2e5／e_tai8_lr5e6：LR 雙向對照，因 YAML 科學記號 bug FAILED，
+  已修正並重送為 176786／176787
+- e_mixed_base（176757）／e_naer_base（176758）：執行中
+
+> 📍 **結論：縮短 max_steps 與加大 batch 都沒有幫助。**
+> e_tai8_base 的 1.0965 對原 full_ft_tai8 的 1.0954 差 0.001，
+> e_tai8_bs256 的 1.0980 差 0.0026，均落在已確認的等價噪音（0.005）內。
+> 「讓 LR cosine 曲線貼合有效區間可拿到更低谷底」的假說**不成立**。
+>
+> **真正穩定的是過擬合點位置**：五輪全參微調的最佳點分別落在 epoch
+> 1.73／2.30／2.53／1.62／1.62，全部在 **1.6~2.5** 區間，不受 batch size
+> 或 max_steps 影響。這比任何超參都可靠，應作為訓練長度的依據。
+
+
+
 新版在上，僅記與前一版的差異。
 
 ### 全參數微調 (Full Fine-Tuning) 三對照組 — 2026-07-31
