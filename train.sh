@@ -61,6 +61,10 @@ if [[ "$runner" == docker ]]; then
     exit $?
 fi
 
+# BlueMagpie/Barbet 為純 Python 套件，未裝進容器（運算節點無對外網路，
+# barbet 需自 GitHub 取得），改由共享目錄以 PYTHONPATH 載入。
+# 對 VoxCPM2 訓練無副作用。
+export PYTHONPATH="/app/vendor:${PYTHONPATH:-}"
 export PYTORCH_JIT=0
 export TOKENIZERS_PARALLELISM=false
 

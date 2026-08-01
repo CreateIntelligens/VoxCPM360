@@ -1,0 +1,39 @@
+# BM4 full stage
+#
+# 除 AudioVAE 外全部解凍，包含聲學堆疊。
+# 上限最高但可能破壞 merge 帶入的台語聲學，與 BM1 對照
+# 可看出凍結聲學是保護還是限制。
+#
+# 起點 tai8-barbet-merge-v0 已含台語聲學權重（merge 而非訓練所得），
+# stage=full 決定哪些模組解凍。資料沿用 tai8，書寫形式未改（華語漢字），
+# 正是要實測不改資料能否讓 Barbet 學會台語發音。
+pretrained_path: /app/models/barbet/tai8-barbet-merge-v0
+
+train_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/train.jsonl
+val_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/val_seen.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+
+batch_size: 4
+grad_accum_steps: 8
+num_workers: 8
+max_batch_tokens: 8192
+
+log_interval: 50
+
+learning_rate: 5e-06
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+
+save_path: /app/checkpoints/bm_full
+tensorboard: /app/checkpoints/bm_full/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+
+num_epochs: 3.0
+valid_per_epoch: 8
+save_per_epoch: 8
+
+bluemagpie_stage: full
