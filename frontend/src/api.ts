@@ -26,6 +26,7 @@ export async function synthesize(
   body.set("text", request.text);
   body.set("control_instruction", request.controlInstruction);
   body.set("prompt_text", request.promptText);
+  body.set("reference_preset_id", request.referencePresetId);
   body.set("speaker_id", request.speakerId);
   body.set("cfg_value", String(request.cfgValue));
   body.set("inference_timesteps", String(request.inferenceTimesteps));

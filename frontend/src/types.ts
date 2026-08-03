@@ -34,8 +34,16 @@ export interface Engine {
   models: ModelVersion[];
 }
 
+export interface ReferenceAudioPreset {
+  id: string;
+  label: string;
+  description: string;
+}
+
 export interface Catalog {
   engines: Engine[];
+  reference_presets: ReferenceAudioPreset[];
+  default_reference_preset_id: string;
 }
 
 export interface SynthesisRequest {
@@ -44,6 +52,7 @@ export interface SynthesisRequest {
   text: string;
   controlInstruction: string;
   promptText: string;
+  referencePresetId: string;
   speakerId: string;
   cfgValue: number;
   inferenceTimesteps: number;

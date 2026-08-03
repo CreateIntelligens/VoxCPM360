@@ -38,7 +38,11 @@ function createHistoryId(): string {
 }
 
 function App() {
-  const [catalog, setCatalog] = useState<Catalog>({ engines: [] });
+  const [catalog, setCatalog] = useState<Catalog>({
+    engines: [],
+    reference_presets: [],
+    default_reference_preset_id: "",
+  });
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState("");
   const [engineId, setEngineId] = useState("");
@@ -48,6 +52,7 @@ function App() {
   const [controlInstruction, setControlInstruction] = useState("");
   const [promptText, setPromptText] = useState("");
   const [referenceAudio, setReferenceAudio] = useState<File>();
+  const [referencePresetId, setReferencePresetId] = useState("");
   const [cfgValue, setCfgValue] = useState(2);
   const [steps, setSteps] = useState(10);
   const [normalize, setNormalize] = useState(false);
@@ -69,6 +74,21 @@ function App() {
     [selectedEngine, modelId],
   );
   const speakers = selectedModel?.speakers || [];
+  const selectedReferencePreset = useMemo(
+    () =>
+      catalog.reference_presets.find(
+        (item) => item.id === referencePresetId,
+      ),
+    [catalog.reference_presets, referencePresetId],
+  );
+  let referencePresetState = "success";
+  if (catalogLoading) {
+    referencePresetState = "loading";
+  } else if (catalog.reference_presets.length === 0) {
+    referencePresetState = "error";
+  } else if (referenceAudio) {
+    referencePresetState = "custom";
+  }
 
   const loadCatalog = async () => {
     setCatalogLoading(true);
@@ -86,6 +106,15 @@ function App() {
         nextEngine?.models.find((model) => model.online !== false) ||
         nextEngine?.models[0];
       setModelId(nextModel?.id || "");
+      setReferencePresetId((currentId) => {
+        const nextPreset =
+          next.reference_presets.find((item) => item.id === currentId) ||
+          next.reference_presets.find(
+            (item) => item.id === next.default_reference_preset_id,
+          ) ||
+          next.reference_presets[0];
+        return nextPreset?.id || "";
+      });
     } catch (error) {
       setCatalogError(
         error instanceof Error ? error.message : "無法取得模型清單",
@@ -156,6 +185,7 @@ function App() {
         text: targetText,
         controlInstruction,
         promptText,
+        referencePresetId,
         speakerId,
         cfgValue,
         inferenceTimesteps: steps,
@@ -424,48 +454,96 @@ function App() {
 
             {selectedEngine?.capabilities.reference_audio && (
               <div className="upload-section">
-                <span className="field-label">參考聲音</span>
-                {!referenceAudio ? (
-                  <button
-                    type="button"
-                    className="upload-zone"
-                    onClick={() => fileInputRef.current?.click()}
+                <label className="reference-preset-field">
+                  <span className="field-label">內建參考聲音</span>
+                  <div
+                    className="select-wrap reference-preset-select"
+                    data-state={referencePresetState}
                   >
-                    <span className="upload-icon">
-                      <Upload size={21} />
-                    </span>
-                    <span>
-                      <strong>上傳或拖入參考音檔</strong>
-                      <small>WAV、MP3、M4A，建議 3 秒以上乾淨語音</small>
-                    </span>
-                  </button>
-                ) : (
-                  <div className="file-chip">
-                    <FileAudio size={20} />
-                    <span>
-                      <strong>{referenceAudio.name}</strong>
-                      <small>
-                        {(referenceAudio.size / 1024 / 1024).toFixed(2)} MB
-                      </small>
-                    </span>
+                    <select
+                      value={referencePresetId}
+                      onChange={(event) =>
+                        setReferencePresetId(event.target.value)
+                      }
+                      disabled={
+                        catalogLoading ||
+                        Boolean(referenceAudio) ||
+                        catalog.reference_presets.length === 0
+                      }
+                      aria-busy={catalogLoading}
+                      aria-invalid={
+                        !catalogLoading && catalog.reference_presets.length === 0
+                      }
+                      aria-describedby="reference-preset-help"
+                    >
+                      {catalog.reference_presets.length === 0 && (
+                        <option value="">沒有可用的內建聲音</option>
+                      )}
+                      {catalog.reference_presets.map((preset) => (
+                        <option key={preset.id} value={preset.id}>
+                          {preset.label}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronDown size={17} />
+                  </div>
+                  <small
+                    id="reference-preset-help"
+                    className="reference-helper"
+                    data-state={referenceAudio ? "custom" : "preset"}
+                  >
+                    {referenceAudio
+                      ? "已使用自訂上傳音檔；移除後會恢復內建選擇"
+                      : selectedReferencePreset?.description ||
+                        "未上傳音檔時會使用此內建聲音"}
+                  </small>
+                </label>
+                <div className="reference-upload-field">
+                  <span className="upload-alternative-label">
+                    或上傳自訂參考音訊
+                  </span>
+                  {!referenceAudio ? (
                     <button
                       type="button"
-                      onClick={clearReference}
-                      title="移除參考音檔"
+                      className="upload-zone"
+                      onClick={() => fileInputRef.current?.click()}
                     >
-                      <X size={17} />
+                      <span className="upload-icon">
+                        <Upload size={21} />
+                      </span>
+                      <span>
+                        <strong>上傳或拖入參考音檔</strong>
+                        <small>WAV、MP3、M4A，建議 3 秒以上乾淨語音</small>
+                      </span>
                     </button>
-                  </div>
-                )}
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="audio/*"
-                  hidden
-                  onChange={(event) =>
-                    setReferenceAudio(event.target.files?.[0])
-                  }
-                />
+                  ) : (
+                    <div className="file-chip">
+                      <FileAudio size={20} />
+                      <span>
+                        <strong>{referenceAudio.name}</strong>
+                        <small>
+                          {(referenceAudio.size / 1024 / 1024).toFixed(2)} MB
+                        </small>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={clearReference}
+                        title="移除參考音檔"
+                      >
+                        <X size={17} />
+                      </button>
+                    </div>
+                  )}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="audio/*"
+                    hidden
+                    onChange={(event) =>
+                      setReferenceAudio(event.target.files?.[0])
+                    }
+                  />
+                </div>
               </div>
             )}
 

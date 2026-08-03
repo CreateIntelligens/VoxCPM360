@@ -26,6 +26,11 @@
   box-sizing: border-box;
 }
 
+html,
+body {
+  overflow-x: clip;
+}
+
 body {
   margin: 0;
   min-width: 320px;
@@ -506,10 +511,78 @@ select:focus {
 
 .upload-section {
   margin-top: 18px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
 }
 
-.upload-section > .field-label {
+.reference-preset-field,
+.reference-upload-field {
+  min-width: 0;
+}
+
+.reference-preset-field > .field-label {
   margin-top: 0;
+}
+
+.reference-preset-select select {
+  min-height: 2.75rem;
+  outline: 0.125rem solid transparent;
+  outline-offset: 0.125rem;
+  padding-right: 2.5rem;
+}
+
+.reference-preset-select > svg {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.reference-preset-select select:focus-visible {
+  outline: 0.125rem solid var(--accent);
+  outline-offset: 0.125rem;
+}
+
+.reference-preset-select select:active:not(:disabled) {
+  background: var(--panel-soft);
+}
+
+.reference-preset-select select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.reference-preset-select[data-state="error"] select {
+  border-color: var(--danger);
+}
+
+.reference-helper {
+  display: block;
+  min-height: 1lh;
+  margin: 0.375rem 0 0;
+  color: var(--muted);
+  font-size: 0.625rem;
+  line-height: 1.5;
+}
+
+.reference-helper[data-state="custom"] {
+  color: var(--green);
+}
+
+.upload-alternative-label {
+  display: block;
+  margin-bottom: 0.5rem;
+  color: var(--muted-bright);
+  font-size: 0.625rem;
+  font-weight: 700;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+@media (hover: hover) {
+  .reference-preset-select select:not(:disabled):hover {
+    background: var(--panel-soft);
+  }
 }
 
 .upload-zone {
@@ -1072,6 +1145,7 @@ footer {
   }
 
   .form-row,
+  .upload-section,
   .advanced-panel {
     grid-template-columns: 1fr;
   }
