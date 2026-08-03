@@ -129,12 +129,43 @@ def train(
             print("Detected architecture: bluemagpie -> BlueMagpieModel", file=sys.stderr)
         base_model = BlueMagpieModel.from_local(pretrained_path, training=True)
         set_training_stage(base_model, bluemagpie_stage)
-        tokenizer = base_model.tokenizer
-        if tokenizer is None:
+        # 資料沒有 speaker centroid（forward 的 speaker_centroids 不傳），
+        # 該模組拿不到梯度會讓 DDP 的 reduction 失敗，故明確凍結。
+        # 這些模組不參與訓練用的 forward（speaker 路徑需 speaker_centroids，
+        # duration_head 與 stop_context 屬推論期功能），解凍它們會讓 DDP 的
+        # reduction 因未使用參數而失敗。
+        _unused_prefixes = (
+            "speaker_projector.",
+            "duration_head.",
+            "stop_context_proj.",
+        )
+        _unused_names = ("stop_context_gate", "spk_vox_gate", "spk_dit_gate")
+        _spk_frozen = 0
+        for _n, _p in base_model.named_parameters():
+            if not _p.requires_grad:
+                continue
+            if _n.startswith(_unused_prefixes) or _n in _unused_names:
+                _p.requires_grad = False
+                _spk_frozen += 1
+        # 屬性名與 VoxCPM2 相同，但這裡是 HF tokenizer：直接呼叫會得到
+        # BatchEncoding 而非 id list，需取 .encode()（見 model.py _tokenize）。
+        _hf_tok = base_model.text_tokenizer
+        if _hf_tok is None:
             raise ValueError(f"{pretrained_path} 缺少 tokenizer，無法訓練")
+        if hasattr(_hf_tok, "encode"):
+            def tokenizer(text, _t=_hf_tok):
+                return _t.encode(text, add_special_tokens=False)
+        else:
+            tokenizer = _hf_tok
         if accelerator.rank == 0:
             _train_n = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
             _all_n = sum(p.numel() for p in base_model.parameters())
+            if _spk_frozen:
+                print(
+                    f"[bluemagpie] 凍結 {_spk_frozen} 個未參與 forward 的參數"
+                    "（speaker／duration／stop_context 路徑，DDP 會因此失敗）",
+                    file=sys.stderr,
+                )
             print(
                 f"[bluemagpie] stage={bluemagpie_stage} "
                 f"trainable={_train_n/1e6:.1f}M / {_all_n/1e6:.1f}M "
@@ -777,7 +808,8 @@ def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
         return 0
 
     unwrapped = model.module if hasattr(model, "module") else model
-    lora_cfg = unwrapped.lora_config
+    # BlueMagpieModel 沒有 lora_config（不支援 LoRA），取 None 走全參路徑。
+    lora_cfg = getattr(unwrapped, "lora_config", None)
 
     # Load model weights
     if lora_cfg is not None:
@@ -877,7 +909,8 @@ def save_checkpoint(
 
     unwrapped = model.module if hasattr(model, "module") else model
     full_state = unwrapped.state_dict()
-    lora_cfg = unwrapped.lora_config
+    # BlueMagpieModel 沒有 lora_config（不支援 LoRA），取 None 走全參路徑。
+    lora_cfg = getattr(unwrapped, "lora_config", None)
 
     if lora_cfg is not None:
         # LoRA finetune: save only lora_A/lora_B weights

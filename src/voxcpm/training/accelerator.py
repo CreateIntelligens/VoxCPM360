@@ -22,12 +22,25 @@ class Accelerator:
 
     def __init__(self, amp: bool = False, seed: int = 42):
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+        # 必須在 init_process_group 之前綁定，否則 NCCL 會 "Guessing device ID
+        # based on global rank"，導致每個 rank 都在 GPU 0 多開一份 context
+        # （實測四卡時 rank 1~3 各佔 GPU 0 的 8.36 GB，可用容量少掉 25 GB）。
+        if torch.cuda.is_available():
+            torch.cuda.set_device(self.local_rank)
 
         if self.world_size > 1 and not dist.is_initialized():
-            dist.init_process_group("nccl", init_method="env://")
+            if torch.cuda.is_available():
+                dist.init_process_group(
+                    "nccl",
+                    init_method="env://",
+                    device_id=torch.device(f"cuda:{self.local_rank}"),
+                )
+            else:
+                dist.init_process_group("nccl", init_method="env://")
 
         self.rank = dist.get_rank() if dist.is_initialized() else 0
-        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.amp = amp
 
         # Set random seed to ensure model initialization consistency
