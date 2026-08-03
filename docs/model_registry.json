@@ -1,0 +1,146 @@
+{
+  "_comment": "VoxCPM360 已訓練模型清單。val_loss 只能在同一個 val_set 內比較。",
+  "_naming": "<訓練法>-<資料>-<關鍵超參>-e<最佳epoch>-<MMDD>",
+  "_val_sets": {
+    "tai8": "11,473 句，台語劇集對白",
+    "naer": "14,832 句，純朗讀語音",
+    "mixed": "26,200 句，前兩者聯集（56% 來自 naer，故數值偏低）"
+  },
+  "models": [
+    {
+      "name": "ft-tai8-lr2e5-e1.6-0801",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.0935, "best_epoch": 1.62, "best_step": 2821,
+      "lr": "2e-5", "effective_batch": 128, "size_gb": 8.9,
+      "note": "VoxCPM2 最佳"
+    },
+    {
+      "name": "bm-tslm-tai8-lr5e5-e1.9-0803",
+      "method": "bluemagpie-tslm", "arch": "BlueMagpie (Barbet TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.0935, "best_epoch": 1.87, "best_step": 3255,
+      "lr": "5e-5", "effective_batch": 128, "size_gb": 8.1,
+      "note": "Barbet 換腦，與 VoxCPM2 最佳打平"
+    },
+    {
+      "name": "ft-tai8-lr5e6-e1.6-0801",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.0944, "best_epoch": 1.62, "best_step": 2821,
+      "lr": "5e-6", "effective_batch": 128, "size_gb": 8.9,
+      "note": "LR 減半，與加倍同樣略勝基準，顯示 1e-5 附近為平坦區"
+    },
+    {
+      "name": "ft-mixed-lr1e5-e2.0-0803",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "mixed", "val_set": "tai8",
+      "val_loss": 1.0951, "best_epoch": 2.0, "best_step": 4496,
+      "lr": "1e-5", "effective_batch": 128, "size_gb": 8.9,
+      "note": "混合資料但以 tai8 評估 —— 證實加 naer 對 tai8 無幫助"
+    },
+    {
+      "name": "ft-tai8-lr1e5-e1.7-0731",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.0954, "best_epoch": 1.73, "best_step": 3000,
+      "lr": "1e-5", "effective_batch": 128, "size_gb": 8.9,
+      "note": "首個可用的全參微調模型"
+    },
+    {
+      "name": "lora-r32-mixed-e7.6-0731",
+      "method": "lora", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "mixed", "val_set": "tai8",
+      "val_loss": 1.0957, "best_epoch": 7.56, "best_step": 17000,
+      "lr": "5e-5", "lora_r": 32, "effective_batch": 128, "size_gb": 0.072,
+      "note": "僅 72 MB 卻與全參僅差 0.002"
+    },
+    {
+      "name": "ft-tai8-lr1e5-e1.6-0801",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.0965, "best_epoch": 1.62, "best_step": 2821,
+      "lr": "1e-5", "effective_batch": 128, "size_gb": 8.9,
+      "note": "epoch 計量基準組"
+    },
+    {
+      "name": "ft-tai8-bs256-e1.6-0801",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.0980, "best_epoch": 1.62, "best_step": 1404,
+      "lr": "1.4e-5", "effective_batch": 256, "size_gb": 8.9,
+      "note": "有效 batch 加倍，無改善"
+    },
+    {
+      "name": "lora-r32-tai8-e3.5-0730",
+      "method": "lora", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.1098, "best_epoch": 3.45, "best_step": 6000,
+      "lr": "5e-5", "lora_r": 32, "effective_batch": 128, "size_gb": 0.072
+    },
+    {
+      "name": "lora-r32-tai8-e1.7-0730",
+      "method": "lora", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.1129, "best_epoch": 1.73, "best_step": 48000,
+      "lr": "5e-5", "lora_r": 32, "effective_batch": 8, "size_gb": 0.072,
+      "note": "有效 batch 過小，未收斂"
+    },
+    {
+      "name": "lora-r64-tai8-e4.0-0731",
+      "method": "lora", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.1143, "best_epoch": 4.03, "best_step": 6999,
+      "lr": "5e-5", "lora_r": 64, "effective_batch": 128, "size_gb": 0.145,
+      "note": "擴容量假說證偽 —— r=64 未突破 r=32 的水準"
+    },
+    {
+      "name": "bm-tslm-tai8-lr1e5-e1.6-0803",
+      "method": "bluemagpie-tslm", "arch": "BlueMagpie (Barbet TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.1035, "best_epoch": 1.62, "best_step": 2821,
+      "lr": "1e-5", "effective_batch": 128, "size_gb": 8.1,
+      "note": "LR 1e-5 明顯遜於 5e-5（差 0.010，超出噪音）"
+    },
+    {
+      "name": "bm-bridge-tai8-e0.9-0802",
+      "method": "bluemagpie-bridge", "arch": "BlueMagpie (Barbet TSLM)",
+      "train_data": "tai8", "val_set": "tai8",
+      "val_loss": 1.1350, "best_epoch": 0.87, "best_step": 1519,
+      "lr": "1e-4", "effective_batch": 128, "size_gb": 8.1,
+      "note": "只訓 bridge（29.9M / 2030.8M = 1.5% 參數）"
+    },
+    {
+      "name": "ft-naer-lr1e5-e1.5-0801",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "naer", "val_set": "naer",
+      "val_loss": 0.9298, "best_epoch": 1.51, "best_step": 832,
+      "lr": "1e-5", "effective_batch": 128, "size_gb": 8.9,
+      "note": "不同 val 集，不可與 tai8 各輪比較"
+    },
+    {
+      "name": "ft-mixed-lr1e5-e2.3-0731",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "mixed", "val_set": "mixed",
+      "val_loss": 0.9550, "best_epoch": 2.30, "best_step": 4000,
+      "lr": "1e-5", "effective_batch": 128, "size_gb": 8.9,
+      "note": "不同 val 集，數值偏低是因 56% 來自好擬合的 naer"
+    },
+    {
+      "name": "ft-mixed-lr1e5-e1.6-0801",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "mixed", "val_set": "mixed",
+      "val_loss": 0.9550, "best_epoch": 1.56, "best_step": 4496,
+      "lr": "1e-5", "effective_batch": 128, "size_gb": 8.9,
+      "note": "不同 val 集"
+    },
+    {
+      "name": "ft-naer-lr1e5-e1.7-0731",
+      "method": "full-finetune", "arch": "VoxCPM2 (MiniCPM4 TSLM)",
+      "train_data": "naer", "val_set": "naer",
+      "val_loss": 0.9347, "best_epoch": 1.69, "best_step": 1000,
+      "lr": "1e-5", "effective_batch": 128, "size_gb": 8.9,
+      "note": "真正最佳在 step 1500（0.9190）但未存到"
+    }
+  ]
+}
