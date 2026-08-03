@@ -3,81 +3,55 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
-import json
 import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import requests
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from app import VoxCPMDemo, create_demo_interface
+from voxcpm.barbet_registry import BarbetModelRegistry
+from voxcpm.barbet_runtime import BarbetRuntime
 from voxcpm.full_model_registry import FULL_MODEL_PREFIX, FullModelRegistry
 from voxcpm.lora_registry import BASE_MODEL_KEY
 
 logger = logging.getLogger(__name__)
-REMOTE_MODEL_SEPARATOR = "::"
-
-
-@dataclass(frozen=True)
-class RemoteModel:
-    id: str
-    label: str
-    base_url: str
-    description: str = ""
-
-
-def load_remote_models() -> tuple[RemoteModel, ...]:
-    raw = os.environ.get("BLUEMAGPIE_MODELS_JSON", "").strip()
-    if raw:
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"BLUEMAGPIE_MODELS_JSON is invalid JSON: {exc}") from exc
-        if not isinstance(payload, list):
-            raise ValueError("BLUEMAGPIE_MODELS_JSON must be a JSON array")
-
-        models: list[RemoteModel] = []
-        for item in payload:
-            if not isinstance(item, dict):
-                raise ValueError("Each BlueMagpie model entry must be an object")
-            models.append(
-                RemoteModel(
-                    id=str(item["id"]),
-                    label=str(item.get("label") or item["id"]),
-                    base_url=str(item["base_url"]).rstrip("/"),
-                    description=str(item.get("description") or ""),
-                )
-            )
-        return tuple(models)
-
-    base_url = os.environ.get("BLUEMAGPIE_URL", "").strip()
-    if not base_url:
-        return ()
-    return (
-        RemoteModel(
-            id="bluemagpie-base",
-            label="BlueMagpie（Barbet）",
-            base_url=base_url.rstrip("/"),
-            description="Barbet TSLM + VoxCPM2 acoustic stack",
-        ),
-    )
+_REFERENCE_AUDIO_DIR = Path(__file__).resolve().parent / "assets" / "default_reference"
+_REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
+    {
+        "id": "middle-aged-female",
+        "label": "中年女聲",
+        "filename": "tai8_drama1_005.wav",
+        "description": "tai8 台語劇集片段，約 5.2 秒",
+    },
+    {
+        "id": "middle-aged-male",
+        "label": "中年男聲",
+        "filename": "tai8_female_drama1_002.wav",
+        "description": "tai8 台語劇集片段，約 2.7 秒",
+    },
+    {
+        "id": "hayley-happy-opening",
+        "label": "Hayley 開心說開場白",
+        "filename": "hayley_happy_opening.mp3",
+        "description": "Hayley 開心語氣開場白，約 12.9 秒",
+    },
+)
+_DEFAULT_REFERENCE_PRESET_ID = "middle-aged-female"
 
 
 class TTSGateway:
     def __init__(
         self,
         demo: VoxCPMDemo,
-        remote_models: tuple[RemoteModel, ...] | None = None,
-        request_timeout: float = 900.0,
+        barbet_runtime: BarbetRuntime | None = None,
     ) -> None:
         self.demo = demo
         self._base_demo = demo
@@ -89,14 +63,23 @@ class TTSGateway:
             "/app/models/native:/app/checkpoints",
         )
         self.full_model_registry = FullModelRegistry(
-            Path(value)
-            for value in full_roots_setting.split(os.pathsep)
-            if value.strip()
+            Path(value) for value in full_roots_setting.split(os.pathsep) if value.strip()
         )
-        self.remote_models = remote_models if remote_models is not None else load_remote_models()
-        self.request_timeout = request_timeout
+        if barbet_runtime is None:
+            barbet_roots_setting = os.environ.get(
+                "VOXCPM_BARBET_MODEL_ROOTS",
+                "/app/models/barbet",
+            )
+            barbet_registry = BarbetModelRegistry(
+                Path(value) for value in barbet_roots_setting.split(os.pathsep) if value.strip()
+            )
+            barbet_runtime = BarbetRuntime(
+                barbet_registry,
+                device=os.environ.get("VOXCPM_DEVICE", "auto"),
+            )
+        self.barbet_runtime = barbet_runtime
         self._native_lock = asyncio.Lock()
-        self._remote_locks = {model.id: asyncio.Lock() for model in self.remote_models}
+        self._barbet_lock = asyncio.Lock()
 
     def _native_models(self) -> list[dict[str, Any]]:
         self.demo.lora_registry.refresh()
@@ -167,107 +150,25 @@ class TTSGateway:
         stop = getattr(self._native_demo, "stop_voxcpm", None)
         if callable(stop):
             stop()
+        self.barbet_runtime.close()
 
-    def _remote_health(self, model: RemoteModel) -> tuple[bool, dict[str, Any]]:
-        try:
-            response = requests.get(
-                f"{model.base_url}/health",
-                timeout=min(self.request_timeout, 5.0),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            return payload.get("status") == "ok", payload
-        except (requests.RequestException, ValueError):
-            return False, {}
-
-    def _remote_speakers(self, model: RemoteModel) -> list[dict[str, Any]]:
-        try:
-            response = requests.get(
-                f"{model.base_url}/api/speakers",
-                timeout=min(self.request_timeout, 5.0),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            speakers = payload.get("speakers", [])
-            return speakers if isinstance(speakers, list) else []
-        except (requests.RequestException, ValueError):
-            return []
-
-    def _remote_versions(
-        self,
-        backend: RemoteModel,
-        *,
-        online: bool,
-        health: dict[str, Any],
-        speakers: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        versions: list[dict[str, Any]] = []
-        if online:
-            try:
-                response = requests.get(
-                    f"{backend.base_url}/api/models",
-                    timeout=min(self.request_timeout, 5.0),
-                )
-                if response.status_code != 404:
-                    response.raise_for_status()
-                    payload = response.json()
-                    discovered = payload.get("models", [])
-                    if isinstance(discovered, list):
-                        versions = [
-                            item for item in discovered if isinstance(item, dict)
-                        ]
-            except (requests.RequestException, ValueError):
-                versions = []
-
-        if not versions:
-            return [
-                {
-                    "id": backend.id,
-                    "label": backend.label,
-                    "kind": "checkpoint",
-                    "description": (
-                        backend.description if online else "BlueMagpie 後端目前離線"
-                    ),
-                    "online": online,
-                    "gpu": health.get("gpu"),
-                    "speakers": speakers if online else [],
-                }
-            ]
-
-        entries = []
-        for version in versions:
-            if not version.get("id"):
-                continue
-            remote_id = str(version["id"])
-            entries.append(
-                {
-                    "id": f"{backend.id}{REMOTE_MODEL_SEPARATOR}{remote_id}",
-                    "label": str(version.get("label") or remote_id),
-                    "kind": "checkpoint",
-                    "description": str(
-                        version.get("description") or backend.description
-                    ),
-                    "online": bool(version.get("online", True)),
-                    "loaded": bool(version.get("loaded", False)),
-                    "gpu": health.get("gpu"),
-                    "speakers": speakers,
-                }
-            )
-        return entries
+    def _barbet_models(self) -> list[dict[str, Any]]:
+        checkpoints = self.barbet_runtime.registry.refresh()
+        return [
+            {
+                "id": checkpoint.id,
+                "label": checkpoint.label,
+                "kind": "checkpoint",
+                "description": checkpoint.description,
+                "online": checkpoint.valid,
+                "loaded": checkpoint.id == self.barbet_runtime.loaded_model_id,
+                "speakers": self.barbet_runtime.speakers(checkpoint),
+            }
+            for checkpoint in checkpoints
+        ]
 
     def catalog(self) -> dict[str, Any]:
-        remote_entries = []
-        for backend in self.remote_models:
-            online, health = self._remote_health(backend)
-            speakers = self._remote_speakers(backend) if online else []
-            remote_entries.extend(
-                self._remote_versions(
-                    backend,
-                    online=online,
-                    health=health,
-                    speakers=speakers,
-                )
-            )
+        barbet_models = self._barbet_models()
 
         engines = [
             {
@@ -286,14 +187,14 @@ class TTSGateway:
                 "models": self._native_models(),
             }
         ]
-        if remote_entries:
+        if barbet_models:
             engines.append(
                 {
-                    "id": "bluemagpie",
-                    "label": "BlueMagpie",
+                    "id": "barbet",
+                    "label": "Barbet",
                     "family": "barbet",
-                    "description": "Barbet TSLM + VoxCPM2 聲學模型",
-                    "online": any(entry["online"] for entry in remote_entries),
+                    "description": "本機 Barbet TSLM + VoxCPM2 聲學模型",
+                    "online": any(model["online"] for model in barbet_models),
                     "capabilities": {
                         "control_instruction": False,
                         "prompt_transcript": False,
@@ -301,7 +202,7 @@ class TTSGateway:
                         "speaker_selection": True,
                         "seed": True,
                     },
-                    "models": remote_entries,
+                    "models": barbet_models,
                 }
             )
         return {"engines": engines}
@@ -345,118 +246,49 @@ class TTSGateway:
             self._active_native_selection = model_id
         return self._wav_response(sample_rate, audio), {}
 
-    def _find_remote(self, model_id: str) -> tuple[RemoteModel, str | None]:
-        for model in self.remote_models:
-            if model.id == model_id:
-                return model, None
-            prefix = f"{model.id}{REMOTE_MODEL_SEPARATOR}"
-            if model_id.startswith(prefix):
-                return model, model_id.removeprefix(prefix)
-        raise HTTPException(status_code=404, detail=f"找不到 BlueMagpie 模型版本：{model_id}")
-
-    def _request_remote(
-        self,
-        model: RemoteModel,
-        *,
-        remote_model_id: str | None,
-        text: str,
-        reference_path: str | None,
-        reference_name: str,
-        speaker_id: str,
-        cfg_value: float,
-        inference_timesteps: int,
-        seed: int | None,
-    ) -> requests.Response:
-        try:
-            if reference_path:
-                data: dict[str, str] = {
-                    "target_text": text,
-                    "cfg_value": str(cfg_value),
-                    "inference_timesteps": str(inference_timesteps),
-                }
-                if remote_model_id:
-                    data["model_id"] = remote_model_id
-                if seed is not None:
-                    data["seed"] = str(seed)
-                with open(reference_path, "rb") as audio_file:
-                    response = requests.post(
-                        f"{model.base_url}/api/synthesize/clone",
-                        data=data,
-                        files={"reference_audio": (reference_name, audio_file, "audio/wav")},
-                        timeout=self.request_timeout,
-                    )
-            else:
-                payload: dict[str, Any] = {
-                    "model_id": remote_model_id,
-                    "target_text": text,
-                    "cfg_value": cfg_value,
-                    "inference_timesteps": inference_timesteps,
-                    "retry_badcase": True,
-                    "seed": seed,
-                }
-                if speaker_id:
-                    payload["speaker_id"] = speaker_id
-                response = requests.post(
-                    f"{model.base_url}/api/synthesize",
-                    json=payload,
-                    timeout=self.request_timeout,
-                )
-            response.raise_for_status()
-            return response
-        except requests.RequestException as exc:
-            detail = str(exc)
-            response = getattr(exc, "response", None)
-            if response is not None:
-                try:
-                    detail = response.json().get("detail", response.text)
-                except ValueError:
-                    detail = response.text or detail
-            raise HTTPException(status_code=502, detail=f"BlueMagpie 推論失敗：{detail}") from exc
-
-    async def synthesize_remote(
+    async def synthesize_barbet(
         self,
         *,
         model_id: str,
         text: str,
         reference_path: str | None,
-        reference_name: str,
         speaker_id: str,
         cfg_value: float,
         inference_timesteps: int,
         seed: int | None,
     ) -> tuple[bytes, dict[str, str]]:
-        model, remote_model_id = self._find_remote(model_id)
-        async with self._remote_locks[model.id]:
-            response = await asyncio.to_thread(
-                self._request_remote,
-                model,
-                remote_model_id=remote_model_id,
+        try:
+            self.barbet_runtime.registry.get(model_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        async with self._barbet_lock:
+            sample_rate, audio, elapsed = await asyncio.to_thread(
+                self.barbet_runtime.synthesize,
+                model_id=model_id,
                 text=text,
                 reference_path=reference_path,
-                reference_name=reference_name,
                 speaker_id=speaker_id,
                 cfg_value=cfg_value,
                 inference_timesteps=inference_timesteps,
                 seed=seed,
             )
-        headers = {}
-        synthesis_time = response.headers.get("X-Synthesis-Time")
-        if synthesis_time:
-            headers["X-Synthesis-Time"] = synthesis_time
-        return response.content, headers
+        return self._wav_response(sample_rate, audio), {
+            "X-Synthesis-Time": f"{elapsed:.2f}s",
+        }
 
 
 def create_app(
     demo: VoxCPMDemo | None = None,
     *,
-    remote_models: tuple[RemoteModel, ...] | None = None,
+    barbet_runtime: BarbetRuntime | None = None,
     mount_legacy: bool = True,
 ) -> FastAPI:
     demo = demo or VoxCPMDemo(
         model_id=os.environ.get("MODEL_ID", "openbmb/VoxCPM2"),
         device=os.environ.get("VOXCPM_DEVICE", "auto"),
     )
-    gateway = TTSGateway(demo, remote_models=remote_models)
+    gateway = TTSGateway(demo, barbet_runtime=barbet_runtime)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -475,14 +307,79 @@ def create_app(
     )
     app.state.tts_gateway = gateway
 
+    def _available_reference_presets() -> list[dict[str, str]]:
+        return [
+            {
+                "id": preset["id"],
+                "label": preset["label"],
+                "description": preset["description"],
+            }
+            for preset in _REFERENCE_AUDIO_PRESETS
+            if (_REFERENCE_AUDIO_DIR / preset["filename"]).is_file()
+        ]
+
+    async def _catalog_payload() -> dict[str, Any]:
+        payload = await asyncio.to_thread(gateway.catalog)
+        presets = _available_reference_presets()
+        default_id = (
+            _DEFAULT_REFERENCE_PRESET_ID
+            if any(preset["id"] == _DEFAULT_REFERENCE_PRESET_ID for preset in presets)
+            else (presets[0]["id"] if presets else "")
+        )
+        return {
+            **payload,
+            "reference_presets": presets,
+            "default_reference_preset_id": default_id,
+        }
+
     @app.get("/api/v1/health")
     async def health() -> dict[str, Any]:
-        catalog = await asyncio.to_thread(gateway.catalog)
+        catalog = await _catalog_payload()
         return {"status": "ok", **catalog}
 
     @app.get("/api/v1/catalog")
     async def catalog() -> dict[str, Any]:
-        return await asyncio.to_thread(gateway.catalog)
+        return await _catalog_payload()
+
+    def _resolve_reference_audio(
+        reference_preset_id: str,
+    ) -> str | None:
+        """解析白名單內建音檔，未指定時沿用環境覆寫或預設音檔。"""
+        requested_id = reference_preset_id.strip()
+        if requested_id:
+            preset = next(
+                (item for item in _REFERENCE_AUDIO_PRESETS if item["id"] == requested_id),
+                None,
+            )
+            if preset is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="選取的內建參考聲音不存在",
+                )
+            path = _REFERENCE_AUDIO_DIR / preset["filename"]
+            if not path.is_file():
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"內建參考聲音目前不可用：{preset['label']}",
+                )
+            return str(path)
+
+        override = os.environ.get("VOXCPM_DEFAULT_REFERENCE")
+        if override is not None:
+            if not override.strip():
+                return None
+            path = Path(override)
+            return str(path) if path.is_file() else None
+
+        default_preset = next(
+            (item for item in _REFERENCE_AUDIO_PRESETS if item["id"] == _DEFAULT_REFERENCE_PRESET_ID),
+            None,
+        )
+        if default_preset is not None:
+            path = _REFERENCE_AUDIO_DIR / default_preset["filename"]
+            if path.is_file():
+                return str(path)
+        return None
 
     @app.post("/api/v1/synthesize")
     async def synthesize(
@@ -491,6 +388,7 @@ def create_app(
         text: str = Form(...),
         control_instruction: str = Form(""),
         prompt_text: str = Form(""),
+        reference_preset_id: str = Form(""),
         speaker_id: str = Form(""),
         cfg_value: float = Form(2.0),
         inference_timesteps: int = Form(10),
@@ -508,34 +406,38 @@ def create_app(
             raise HTTPException(status_code=422, detail="取樣步數必須介於 1 與 50")
 
         temp_path: str | None = None
-        reference_name = "reference.wav"
+        active_reference: str | None = None
         try:
             if reference_audio is not None:
-                reference_name = reference_audio.filename or reference_name
-                suffix = Path(reference_name).suffix or ".wav"
+                uploaded_name = reference_audio.filename or "reference.wav"
+                suffix = Path(uploaded_name).suffix or ".wav"
                 payload = await reference_audio.read()
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
                     temp_file.write(payload)
                     temp_path = temp_file.name
+                active_reference = temp_path
+            else:
+                # 未上傳則採用預設台語參考音檔。不可寫進 temp_path ——
+                # 那個變數在 finally 會被 os.unlink，會刪掉預設檔本身。
+                active_reference = _resolve_reference_audio(reference_preset_id)
 
             if engine_id == "voxcpm2":
                 wav, extra_headers = await gateway.synthesize_native(
                     model_id=model_id,
                     text=text,
                     control_instruction=control_instruction,
-                    reference_path=temp_path,
+                    reference_path=active_reference,
                     prompt_text=prompt_text,
                     cfg_value=cfg_value,
                     normalize=normalize,
                     denoise=denoise,
                     inference_timesteps=inference_timesteps,
                 )
-            elif engine_id == "bluemagpie":
-                wav, extra_headers = await gateway.synthesize_remote(
+            elif engine_id == "barbet":
+                wav, extra_headers = await gateway.synthesize_barbet(
                     model_id=model_id,
                     text=text,
-                    reference_path=temp_path,
-                    reference_name=reference_name,
+                    reference_path=active_reference,
                     speaker_id=speaker_id,
                     cfg_value=cfg_value,
                     inference_timesteps=inference_timesteps,

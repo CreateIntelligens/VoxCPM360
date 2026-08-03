@@ -232,8 +232,9 @@ Supported values are `auto`, `cpu`, `mps`, `cuda`, and `cuda:N`. On Apple Silico
 #### Multi-model React studio (Docker)
 
 This repository also includes a React/TypeScript studio served by Nginx. It
-uses one public endpoint while routing requests to either the native VoxCPM2
-runtime (base model or a local LoRA checkpoint) or a BlueMagpie/Barbet backend.
+uses one public endpoint and one application container for both the native
+VoxCPM2 runtime and the local Barbet TTS runtime. No second repository, API
+service, or per-model environment variable is required.
 
 ```bash
 cp .env.example .env
@@ -245,15 +246,17 @@ docker compose up -d --build
 - Model catalog API: `http://localhost:8800/api/v1/catalog`
 
 The selector is directory-driven. Put native VoxCPM2 LoRA or full checkpoints
-under `models/native/<version>/` and complete BlueMagpie/Barbet TTS checkpoints
+under `models/native/<version>/` and complete Barbet TTS checkpoints
 under `models/barbet/<version>/`, then press **重新掃描**. Existing training
 outputs under `checkpoints/` remain visible. See
 [`models/README.md`](./models/README.md) for the required files and layouts.
 
 The React app and Nginx are built into the same `voxcpm360-web` image. Native
 LoRAs are registered dynamically in the VoxCPM runtime. Complete Barbet
-checkpoints are switched by the BlueMagpie runtime, which safely unloads the
-previous full checkpoint before loading the selected version.
+checkpoints are switched by the integrated runtime, which safely unloads the
+previous full checkpoint before loading the selected version. The incorporated
+OpenFormosa and OpenBMB source attributions are listed in
+[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
 
 ### 🚢 Production Deployment (Nano-vLLM)
 

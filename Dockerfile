@@ -37,6 +37,7 @@ RUN python3.10 -m venv /opt/venv
 
 # Copy dependency definition files
 COPY pyproject.toml uv.lock ./
+COPY scripts/patch_flash_attention_arch.py ./scripts/patch_flash_attention_arch.py
 
 # Target CUDA compute capabilities are configurable at build time so the same
 # Dockerfile works on Ampere (8.6), Hopper (9.0) and Blackwell (12.0) hosts.
@@ -55,6 +56,7 @@ RUN . /opt/venv/bin/activate && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
     python3 -c "import torch.utils.cpp_extension as c; p = c.__file__; content = open(p).read().replace('def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:', 'def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:\n    return'); open(p, 'w').write(content)" && \
     git clone --branch v2.6.3 --single-branch https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
+    python3 scripts/patch_flash_attention_arch.py /tmp/flash-attention/setup.py --architectures "${TORCH_ARCH_LIST}" && \
     sed -i 's/dprops->major == 9 \&\& dprops->minor == 0/(dprops->major == 9 \&\& dprops->minor == 0) || dprops->major >= 12/g' /tmp/flash-attention/csrc/flash_attn/flash_api.cpp && \
     cd /tmp/flash-attention && \
     uv pip install --no-build-isolation . && \

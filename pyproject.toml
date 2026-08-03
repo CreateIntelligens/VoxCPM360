@@ -28,7 +28,7 @@ dependencies = [
     "torch>=2.5.0",
     "torchaudio>=2.5.0",
     "torchcodec",
-    "transformers>=4.36.2",
+    "transformers>=4.45,<5",
     "einops",
     "gradio>=6,<7",
     "inflect",
@@ -47,8 +47,8 @@ dependencies = [
     "funasr",
     "spaces",
     "argbind",
-    "safetensors"
-
+    "safetensors",
+    "speechbrain",
 ]
 
 [project.optional-dependencies]
@@ -71,10 +71,15 @@ Documentation = "https://github.com/OpenBMB/VoxCPM#readme"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["voxcpm*"]
+include = ["voxcpm*", "bluemagpie*", "barbet*"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.setuptools.package-data]
+bluemagpie = ["LICENSE"]
+barbet = ["LICENSE"]
+"bluemagpie._vendor.voxcpm" = ["LICENSE", "PROVENANCE.md"]
 
 [tool.setuptools_scm]
 version_scheme = "post-release"

@@ -40,7 +40,7 @@ worker and loads that complete model; switching back to Base or a LoRA reloads
 the original VoxCPM2 runtime. The first request after a switch is therefore
 slower than an ordinary LoRA switch.
 
-## Barbet / BlueMagpie TTS
+## Barbet TTS
 
 Put each complete TTS checkpoint in `models/barbet/<version-name>/`:
 
@@ -48,7 +48,7 @@ Put each complete TTS checkpoint in `models/barbet/<version-name>/`:
 models/barbet/barbet-taiwanese-v1/
 ├── config.json
 ├── tokenizer.json
-├── pytorch_model.bin
+├── model.safetensors (or pytorch_model.bin)
 └── audiovae.pth
 ```
 
@@ -63,7 +63,7 @@ Optional `model.json`:
 
 A standalone `barbet-1b-base` language-model directory is not a complete TTS
 checkpoint: it does not contain the trained Barbet-to-VoxCPM bridge, diffusion
-decoder weights, and AudioVAE required by BlueMagpie.
+decoder weights, and AudioVAE required by the integrated TTS runtime.
 
 ### tai8 + Barbet merge
 
@@ -73,8 +73,7 @@ from the official BlueMagpie checkpoint, then replaces only the compatible
 VoxCPM2 acoustic modules and AudioVAE with
 `checkpoints/full_ft_tai8_step3000/`.
 
-The reusable merge tool is
-`../BlueMagpie-TTS/scripts/merge_voxcpm_acoustic.py`. It performs a dry-run
-name/shape check, refuses to overwrite an existing output, writes to a sibling
-temporary directory, reloads the completed checkpoint, and only then renames
-it into the model store. Source checkpoints are read-only inputs.
+The merge directory is retained only as an earlier experiment. Use a trained
+`bm-*` checkpoint for actual Barbet TTS; replacing only compatible acoustic
+tensors does not transfer the Taiwanese-language knowledge learned by the
+text-semantic model.
