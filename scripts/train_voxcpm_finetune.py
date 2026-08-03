@@ -129,8 +129,6 @@ def train(
             print("Detected architecture: bluemagpie -> BlueMagpieModel", file=sys.stderr)
         base_model = BlueMagpieModel.from_local(pretrained_path, training=True)
         set_training_stage(base_model, bluemagpie_stage)
-        # 資料沒有 speaker centroid（forward 的 speaker_centroids 不傳），
-        # 該模組拿不到梯度會讓 DDP 的 reduction 失敗，故明確凍結。
         # 這些模組不參與訓練用的 forward（speaker 路徑需 speaker_centroids，
         # duration_head 與 stop_context 屬推論期功能），解凍它們會讓 DDP 的
         # reduction 因未使用參數而失敗。

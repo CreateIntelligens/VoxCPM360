@@ -254,8 +254,22 @@ class VoxCPMDemo:
         self.asr_device = "cuda:0" if self.device.startswith("cuda") else "cpu"
         self.asr_model: Optional[AutoModel] = None
 
-        lora_root = Path(os.environ.get("VOXCPM_LORA_ROOT", "/app/checkpoints"))
-        self.lora_registry = LoraRegistry(lora_root)
+        roots_setting = os.environ.get(
+            "VOXCPM_LORA_ROOTS",
+            "/app/models/native:/app/checkpoints",
+        )
+        legacy_root = os.environ.get("VOXCPM_LORA_ROOT")
+        lora_roots = [
+            Path(value)
+            for value in (legacy_root or roots_setting).split(os.pathsep)
+            if value.strip()
+        ]
+        if not lora_roots:
+            lora_roots = [Path("/app/models/native"), Path("/app/checkpoints")]
+        self.lora_registry = LoraRegistry(
+            lora_roots[0],
+            additional_roots=lora_roots[1:],
+        )
         logger.info("Discovered %d LoRA checkpoints.", len(self.lora_registry.checkpoints))
 
         self.voxcpm_server = None
@@ -277,9 +291,18 @@ class VoxCPMDemo:
                     devices = [0]
         
         enforce_eager = not self.optimize
-        lora_config = LoRAConfig(
-            **build_nano_lora_config(self.lora_registry.checkpoints)
+        runtime_lora_config = build_nano_lora_config(
+            self.lora_registry.checkpoints
         )
+        # Reserve enough adapter capacity for checkpoints copied in after the
+        # server has started. This keeps ordinary rank/projection variations
+        # hot-loadable without restarting the base model.
+        runtime_lora_config["max_lora_rank"] = max(
+            runtime_lora_config["max_lora_rank"],
+            int(os.environ.get("VOXCPM_MAX_LORA_RANK", "128")),
+        )
+        runtime_lora_config["enable_proj"] = True
+        lora_config = LoRAConfig(**runtime_lora_config)
         self.voxcpm_server = VoxCPM.from_pretrained(
             self._model_id,
             inference_timesteps=10,
@@ -293,6 +316,24 @@ class VoxCPMDemo:
         )
         logger.info("nano-vllm model loaded successfully.")
         return self.voxcpm_server
+
+    def stop_voxcpm(self) -> None:
+        """Stop nano-vLLM worker processes and release their GPU allocation."""
+        server = self.voxcpm_server
+        self.voxcpm_server = None
+        self.lora_registry.reset_registrations()
+        if server is None:
+            return
+        logger.info("Stopping nano-vllm model: %s", self._model_id)
+        try:
+            stop = getattr(server, "stop", None)
+            if callable(stop):
+                stop()
+        finally:
+            import gc
+
+            gc.collect()
+        logger.info("nano-vllm model stopped.")
 
     def get_or_load_asr_model(self) -> AutoModel:
         if self.asr_model is not None:
@@ -411,6 +452,8 @@ class VoxCPMDemo:
             sig = inspect.signature(server.generate)
             if "ref_audio_latents" in sig.parameters:
                 generate_kwargs["ref_audio_latents"] = ref_audio_latents
+            if "inference_timesteps" in sig.parameters:
+                generate_kwargs["inference_timesteps"] = int(inference_timesteps)
                 
             for chunk in server.generate(**generate_kwargs):
                 buf.append(chunk)

@@ -296,8 +296,27 @@ tensor 的**全部**，其中 **254 個是 `base_lm.*`（MiniCPM4 文字腦）**
 tokenizer 實測：Barbet 少用 25% token，`恁`／`佗` 等台語專用字能整字編碼
 （VoxCPM2 要拆 3 個 byte fallback）。**但訓練文本全是華語漢字**，優勢發揮不出來。
 
-要用 Barbet 必須訓練（`conf/voxcpm_v2/bm_*.yaml` 四組，stage 見
-`bluemagpie.loading.set_training_stage`：`bridge` / `tslm` / `full`）。
+**訓練流程**（`conf/voxcpm_v2/bm_*.yaml`）：merge 產物已含台語聲學，
+直接拿 tai8 資料續訓，由 `bluemagpie.loading.set_training_stage` 決定解凍範圍：
+
+| stage | 解凍 | 可訓練參數 | 實測 val |
+|---|---|---|---|
+| `bridge` | 只有 `enc_to_tslm_proj` + `tslm_adapter` | 29.9M / 2030.8M (1.5%) | 1.1350 |
+| `tslm` | bridge + Barbet + speaker_projector，**聲學凍結** | 大部分 | 1.1035 (LR 1e-5) |
+| `tslm` | 同上，**LR 5e-5** | 大部分 | **1.0935** ⭐ |
+| `full` | 除 AudioVAE 外全部 | 全部 | **CUDA OOM**（4 卡放不下）|
+
+⭐ **`tslm` + LR 5e-5 與最佳 VoxCPM2（1.0935）完全打平。**
+LR 5e-5 勝過 1e-5 達 0.010（超出噪音 0.005）—— Barbet 學的是全新映射
+而非微調，需要較大 LR。聲學凍結是刻意的：保住 merge 帶入的台語聲學，
+只讓 Barbet 學「文字 → 語意」那一段。
+
+> ⚠️ **DDP 地雷**：`tslm`／`full` stage 會解凍 `speaker_projector`，但訓練資料
+> 沒有 speaker centroid，該模組拿不到梯度，DDP 會報
+> `Expected to have finished reduction in the prior iteration`。
+> 訓練腳本已明確凍結六個不參與 forward 的模組（`speaker_projector`、
+> `duration_head`、`stop_context_*`、`spk_*_gate`）。**不要改用
+> `find_unused_parameters=True`** —— 那會每步掃描計算圖且掩蓋真正的問題。
 `bluemagpie` 與 `barbet` 是純 Python 套件但未裝進容器，且**運算節點無對外網路**
 無法 pip install，故放在 `/app/vendor` 由 `train.sh` 以 `PYTHONPATH` 載入
 （該目錄已 gitignore，不屬於本 repo）。
@@ -396,11 +415,16 @@ nginx ─┬─ /        → web 服務（React 靜態檔，multi-stage build �
 
 放好後在前端按「重新掃描」即現身，不必重建 image。
 
-**預設參考音的必要性**：VoxCPM2 屬 zero-shot TTS，輸出語言跟隨 reference。
-訓練文本全是華語漢字（見 7.2.1），沒有台語 reference 時模型會依文字表面唸成
-華語——這正是「模型好像只講中文」的成因，**不是訓練失敗**。
+**預設參考音的必要性**：**沒有任何 reference 時模型會唸成華語**，加了就講台語
+——這是「模型好像只講中文」的成因，**不是訓練失敗**。
 `api.py` 於未上傳時取 `assets/default_reference/` 中字典序最前的 wav；
 `VOXCPM_DEFAULT_REFERENCE` 可覆寫路徑，設為空字串則停用。
+
+> 📌 **修正（2026-08-03）**：先前記載為「輸出語言跟隨 reference，故需台語
+> reference」，**該解釋有誤** —— 實測用**華語** reference 也會輸出台語。
+> 關鍵在「有沒有 reference」而非「reference 是什麼語言」：無 reference 時
+> 條件路徑缺失（log 不會出現 `[Voice Control] reference_wav only`），
+> 模型退回依文字表面發音。故預設參考音仍屬必要，但**不必堅持用台語音檔**。
 
 > ⚠️ 實作細節：預設路徑**不可**寫進 `temp_path`，那個變數在 `finally` 會被
 > `os.unlink` —— 會刪掉預設檔本身。故另用 `active_reference` 傳給推論。

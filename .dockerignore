@@ -1,0 +1,17 @@
+.git
+.gitignore
+.pytest_cache
+**/__pycache__
+**/*.pyc
+*.log
+
+checkpoints
+pretrained_models
+scratch
+venv-nano
+outputs
+models/native
+models/barbet
+
+frontend/node_modules
+frontend/dist

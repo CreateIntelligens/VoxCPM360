@@ -4,7 +4,7 @@ __pycache__
 .pytest_cache/
 voxcpm.egg-info
 .DS_Store
-./pretrained_models/
+/pretrained_models/
 app_local.py
 .env
 venv-nano/
@@ -37,7 +37,18 @@ events.out.tfevents.*
 .codex/
 .gemini/
 
-# 第三方套件原始碼，為繞過容器無對外網路而暫放（見 AGENTS.md 7.2.1）。
-# 上游為 OpenFormosa/BlueMagpie-TTS 與 OpenFormosa/Barbet，不納入本 repo。
+# 前端建置產物與相依（frontend/dist 由 web 服務的 Dockerfile 於建置期產生）
+frontend/node_modules/
+frontend/dist/
+frontend/vite.config.js
+frontend/vite.config.d.ts
+*.tsbuildinfo
+
+# Optional local scratch copy; the runtime and training path do not depend on it.
 /vendor/
-/models/barbet/*/
+
+# Local model store. Keep its instructions/layout, never commit model weights.
+/models/native/*
+!/models/native/.gitkeep
+/models/barbet/*
+!/models/barbet/.gitkeep

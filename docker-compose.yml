@@ -11,6 +11,7 @@ services:
       args:
         APP_UID: ${HOST_UID:-1000}
         APP_GID: ${HOST_GID:-1000}
+        TORCH_ARCH_LIST: ${TORCH_ARCH_LIST:-12.0}
     image: voxcpm360-app
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     container_name: voxcpm_app
@@ -21,12 +22,16 @@ services:
       - MODEL_ID=${MODEL_ID:-openbmb/VoxCPM2}
       - VOXCPM_OPTIMIZE=${VOXCPM_OPTIMIZE:-false}
       - VOXCPM_GPU_MEMORY_UTILIZATION=${VOXCPM_GPU_MEMORY_UTILIZATION:-0.35}
+      - VOXCPM_PRELOAD=${VOXCPM_PRELOAD:-true}
+      - VOXCPM_LORA_ROOTS=/app/models/native:/app/checkpoints
+      - VOXCPM_FULL_MODEL_ROOTS=/app/models/native:/app/checkpoints
+      - VOXCPM_BARBET_MODEL_ROOTS=/app/models/barbet
       # GB10 (Grace-Blackwell) reports sm_121, but torch cu128 nvrtc only knows up
       # to sm_120, so runtime JIT fusion (e.g. the @torch.jit.script snake op) fails
       # with "invalid value for --gpu-architecture". Disable JIT so these run eager.
       - PYTORCH_JIT=0
-    # Pre-download models first at startup, then start the Gradio app
-    command: bash -c "python scripts/download_models.py --model-id ${MODEL_ID:-openbmb/VoxCPM2} && python app.py --port 8000 --device ${VOXCPM_DEVICE:-auto} --model-id ${MODEL_ID:-openbmb/VoxCPM2}"
+    # Pre-download models first, then start the unified API plus legacy Gradio.
+    command: bash -c "python scripts/download_models.py --model-id ${MODEL_ID:-openbmb/VoxCPM2} && python api.py --port 8000"
     volumes:
       # Persistent cache for downloaded model weights (highly recommended to save GBs of downloading)
       - hf_cache:/home/voxcpm/.cache/huggingface
@@ -75,7 +80,10 @@ services:
               capabilities: [gpu]
 
   web:
-    image: nginx:alpine
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: voxcpm360-web
     container_name: voxcpm_nginx
     restart: unless-stopped
     ports:
@@ -85,8 +93,6 @@ services:
       - PORT=${PORT:-8800}
       # Restrict envsubst to ONLY replace PORT, preserving standard Nginx vars ($host, etc.)
       - NGINX_ENVSUBST_FILTER=PORT
-    volumes:
-      - ./nginx.template:/etc/nginx/templates/default.conf.template:ro
     depends_on:
       - app
 

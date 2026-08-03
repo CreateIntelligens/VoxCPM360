@@ -18,6 +18,7 @@ _DEFAULT_PROJ_MODULES = (
     "enc_to_lm_proj",
     "lm_to_dit_proj",
     "res_to_dit_proj",
+    "fusion_concat_proj",
 )
 
 
@@ -38,40 +39,56 @@ class LoraCheckpoint:
 
     @property
     def label(self) -> str:
-        return f"{self.run_name} / latest"
+        suffix = " / latest" if self.path.name == "latest" else ""
+        return f"{self.run_name}{suffix}"
+
+
+def _load_lora_checkpoint(run_dir: Path) -> LoraCheckpoint | None:
+    """Load one run in either ``run/latest`` or flat ``run`` layout."""
+    candidates = (run_dir / "latest", run_dir)
+    checkpoint_dir = next(
+        (
+            candidate
+            for candidate in candidates
+            if (candidate / "lora_config.json").is_file()
+            and (candidate / "lora_weights.safetensors").is_file()
+        ),
+        None,
+    )
+    if checkpoint_dir is None:
+        return None
+
+    config_path = checkpoint_dir / "lora_config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict) or not isinstance(
+            config.get("lora_config"), dict
+        ):
+            raise ValueError("lora_config must be an object")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Ignoring invalid LoRA checkpoint %s: %s", checkpoint_dir, exc)
+        return None
+
+    return LoraCheckpoint(
+        run_name=run_dir.name,
+        path=checkpoint_dir,
+        config=config,
+    )
 
 
 def discover_lora_checkpoints(root: Path) -> tuple[LoraCheckpoint, ...]:
-    """Scan root directory and discover all valid LoRA checkpoints containing latest/lora_config.json."""
+    """Scan one root for flat or training-run-style LoRA directories."""
     root = Path(root)
     if not root.is_dir():
         return ()
 
     checkpoints = []
     for run_dir in sorted(root.iterdir(), key=lambda path: path.name.casefold()):
-        latest = run_dir / "latest"
-        config_path = latest / "lora_config.json"
-        weights_path = latest / "lora_weights.safetensors"
-        if not run_dir.is_dir() or not config_path.is_file() or not weights_path.is_file():
+        if not run_dir.is_dir():
             continue
-
-        try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            if not isinstance(config, dict) or not isinstance(
-                config.get("lora_config"), dict
-            ):
-                raise ValueError("lora_config must be an object")
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-            logger.warning("Ignoring invalid LoRA checkpoint %s: %s", latest, exc)
-            continue
-
-        checkpoints.append(
-            LoraCheckpoint(
-                run_name=run_dir.name,
-                path=latest,
-                config=config,
-            )
-        )
+        checkpoint = _load_lora_checkpoint(run_dir)
+        if checkpoint is not None:
+            checkpoints.append(checkpoint)
 
     return tuple(checkpoints)
 
@@ -130,8 +147,15 @@ def build_nano_lora_config(
 class LoraRegistry:
     """Manages discovered LoRA checkpoints and adapter registration with VoxCPM server."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        additional_roots: Iterable[Path] = (),
+    ) -> None:
         self.root = Path(root)
+        self.roots = tuple(
+            dict.fromkeys([self.root, *(Path(path) for path in additional_roots)])
+        )
         self._lock = threading.Lock()
         self._checkpoints: dict[str, LoraCheckpoint] = {}
         self._registered: dict[str, str] = {}
@@ -142,16 +166,24 @@ class LoraRegistry:
         return tuple(self._checkpoints.values())
 
     def refresh(self) -> tuple[LoraCheckpoint, ...]:
-        checkpoints = discover_lora_checkpoints(self.root)
-        self._checkpoints = {
-            checkpoint.run_name: checkpoint for checkpoint in checkpoints
-        }
+        checkpoints: dict[str, LoraCheckpoint] = {}
+        for root in self.roots:
+            for checkpoint in discover_lora_checkpoints(root):
+                if checkpoint.run_name in checkpoints:
+                    logger.warning(
+                        "Ignoring duplicate LoRA model id %s from %s",
+                        checkpoint.run_name,
+                        checkpoint.path,
+                    )
+                    continue
+                checkpoints[checkpoint.run_name] = checkpoint
+        self._checkpoints = checkpoints
         self._registered = {
             key: value
             for key, value in self._registered.items()
             if key in self._checkpoints
         }
-        return checkpoints
+        return self.checkpoints
 
     def choices(self) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = [(BASE_MODEL_LABEL, BASE_MODEL_KEY)]
@@ -166,6 +198,11 @@ class LoraRegistry:
         if checkpoint is None:
             return "找不到這個訓練結果，請重新掃描模型。"
         return f"下一次生成將使用 {checkpoint.label}。"
+
+    def reset_registrations(self) -> None:
+        """Forget registrations owned by a stopped nano-vLLM server."""
+        with self._lock:
+            self._registered.clear()
 
     def ensure_registered(self, server: Any, selection: str) -> str | None:
         if selection == BASE_MODEL_KEY:
