@@ -1,0 +1,35 @@
+# E5 混合資料基準（3 epoch）
+#
+# mixed 28.8 萬句，是三組資料量最大者。同 E1 設定以檢驗資料量優勢。
+# 注意 val 集與 E1 不同，需用 eval_ckpt.py 對齊後才可比較。
+#
+# 以 epoch 為單位：已完成三輪的最佳點都在 epoch 1.7~2.5，故跑 3 epoch
+# 涵蓋谷底並留出過擬合觀察區。每 epoch 驗證/存檔 8 次，配合 best 追蹤。
+pretrained_path: /mnt/home/csl426-aicr-ae5f63/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/bffb3df5a29440629464e5e839f4d214c8714c3d
+
+train_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/mixed/manifests/tai8_naer/train.jsonl
+val_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/mixed/manifests/tai8_naer/val_seen.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+
+batch_size: 4
+grad_accum_steps: 8
+num_workers: 8
+max_batch_tokens: 16384
+
+log_interval: 50
+
+learning_rate: 0.00001
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+
+save_path: /app/checkpoints/e_mixed_base
+tensorboard: /app/checkpoints/e_mixed_base/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+
+num_epochs: 3.0
+valid_per_epoch: 8
+save_per_epoch: 8

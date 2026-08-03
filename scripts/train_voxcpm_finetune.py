@@ -41,6 +41,13 @@ from voxcpm.training import (
 )
 
 
+def encode_text(tokenizer, text: str):
+    """Return token ids for both VoxCPM callables and HF tokenizers."""
+    if hasattr(tokenizer, "encode"):
+        return tokenizer.encode(text, add_special_tokens=False)
+    return tokenizer(text)
+
+
 @argbind.bind(without_prefix=True)
 def train(
     pretrained_path: str,
@@ -60,6 +67,15 @@ def train(
     warmup_steps: int = 1_000,
     max_steps: int = 100_000,
     max_batch_tokens: int = 0,
+    # BlueMagpie 專用：bridge / tslm / full，僅在偵測到該架構時生效。
+    # 預設 tslm —— 聲學堆疊凍結，只訓 bridge + Barbet + speaker_projector。
+    bluemagpie_stage: str = "tslm",
+    # 以 epoch 表示訓練長度（設了就覆蓋對應的 step 版設定）。step 數在不同
+    # 資料集之間沒有可比性——tai8 的 7,000 步是 4.03 epoch，naer 同樣
+    # 7,000 步卻是 11.81 epoch，過擬合程度天差地遠卻看不出來。
+    num_epochs: float = 0.0,
+    valid_per_epoch: int = 0,
+    save_per_epoch: int = 0,
     save_path: str = "checkpoints",
     tensorboard: str = "",
     lambdas: Dict[str, float] = {"loss/diff": 1.0, "loss/stop": 1.0},
@@ -85,6 +101,16 @@ def train(
     if accelerator.rank == 0:
         save_dir.mkdir(parents=True, exist_ok=True)
         tb_dir.mkdir(parents=True, exist_ok=True)
+    # YAML 1.1 的科學記號若未帶小數點（2e-5 而非 2.0e-5）會被解析為字串，
+    # 一路傳到 AdamW 才炸，且已浪費模型載入與 warmup 的時間。此處先轉型。
+    learning_rate = float(learning_rate)
+    weight_decay = float(weight_decay)
+    max_grad_norm = float(max_grad_norm)
+    num_epochs = float(num_epochs)
+    for _n, _v in (("learning_rate", learning_rate), ("weight_decay", weight_decay)):
+        if not 0.0 <= _v:
+            raise ValueError(f"{_n} 必須為非負數，取得 {_v!r}")
+
     accelerator.barrier()  # Wait for directory creation
 
     writer = SummaryWriter(log_dir=str(tb_dir)) if accelerator.rank == 0 else None
@@ -92,15 +118,53 @@ def train(
 
     # Auto-detect model architecture from config.json
     with open(os.path.join(pretrained_path, "config.json"), "r", encoding="utf-8") as _f:
-        _arch = json.load(_f).get("architecture", "voxcpm").lower()
-    _model_cls = VoxCPM2Model if _arch == "voxcpm2" else VoxCPMModel
-    LoRAConfig = LoRAConfigV2 if _arch == "voxcpm2" else LoRAConfigV1
-    if accelerator.rank == 0:
-        print(f"Detected architecture: {_arch} -> {_model_cls.__name__}", file=sys.stderr)
-    base_model = _model_cls.from_local(
-        pretrained_path, optimize=False, training=True, lora_config=LoRAConfig(**lora) if lora else None
-    )
-    tokenizer = base_model.text_tokenizer
+        _cfg = json.load(_f)
+    _arch = (_cfg.get("architecture") or "").lower()
+    # BlueMagpie 的 config 沒有 architecture 欄位，靠 barbet_config 判別。
+    if not _arch and "barbet_config" in _cfg:
+        _arch = "bluemagpie"
+
+    if _arch == "bluemagpie":
+        # Barbet 取代 VoxCPM2 的 TSLM，其餘聲學堆疊沿用，forward 簽名與
+        # loss key 與 VoxCPM2 相同，故底下的訓練迴圈可直接共用。
+        from bluemagpie.loading import set_training_stage
+        from bluemagpie.model import BlueMagpieModel
+
+        if lora:
+            raise ValueError("BlueMagpie 尚未支援 LoRA，請移除 config 的 lora 區塊")
+        if accelerator.rank == 0:
+            print("Detected architecture: bluemagpie -> BlueMagpieModel", file=sys.stderr)
+        base_model = BlueMagpieModel.from_local(pretrained_path, training=True)
+        set_training_stage(base_model, bluemagpie_stage)
+        tokenizer = base_model.text_tokenizer
+        if tokenizer is None:
+            raise ValueError(f"{pretrained_path} 缺少 tokenizer，無法訓練")
+        if accelerator.rank == 0:
+            _train_n = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+            _all_n = sum(p.numel() for p in base_model.parameters())
+            print(
+                f"[bluemagpie] stage={bluemagpie_stage} "
+                f"trainable={_train_n/1e6:.1f}M / {_all_n/1e6:.1f}M "
+                f"({100*_train_n/max(1,_all_n):.1f}%)",
+                file=sys.stderr,
+            )
+    else:
+        _model_cls = VoxCPM2Model if _arch == "voxcpm2" else VoxCPMModel
+        LoRAConfig = LoRAConfigV2 if _arch == "voxcpm2" else LoRAConfigV1
+        if accelerator.rank == 0:
+            print(f"Detected architecture: {_arch} -> {_model_cls.__name__}", file=sys.stderr)
+        base_model = _model_cls.from_local(
+            pretrained_path, optimize=False, training=True, lora_config=LoRAConfig(**lora) if lora else None
+        )
+        tokenizer = base_model.text_tokenizer
+
+    # epoch -> step 換算。需在資料集載入後才知道 num_train_samples，
+    # 故實際換算延後到下方 _apply_epoch_settings()。
+    _epoch_cfg = {
+        "num_epochs": num_epochs,
+        "valid_per_epoch": valid_per_epoch,
+        "save_per_epoch": save_per_epoch,
+    }
 
     expected_sr = base_model.audio_vae.sample_rate
     assert sample_rate == expected_sr, (
@@ -114,9 +178,27 @@ def train(
         sample_rate=sample_rate,
     )
 
+    if any(_epoch_cfg.values()):
+        _n = len(train_ds)
+        _per_epoch = max(1, round(_n / (grad_accum_steps * batch_size * accelerator.world_size)))
+        if _epoch_cfg["num_epochs"] > 0:
+            num_iters = max(1, round(_per_epoch * _epoch_cfg["num_epochs"]))
+            max_steps = num_iters
+        if _epoch_cfg["valid_per_epoch"] > 0:
+            valid_interval = max(1, _per_epoch // _epoch_cfg["valid_per_epoch"])
+        if _epoch_cfg["save_per_epoch"] > 0:
+            save_interval = max(1, _per_epoch // _epoch_cfg["save_per_epoch"])
+        if accelerator.rank == 0:
+            print(
+                f"[epoch] {_n:,} samples, 1 epoch = {_per_epoch:,} steps -> "
+                f"num_iters={num_iters:,} valid_interval={valid_interval:,} "
+                f"save_interval={save_interval:,}",
+                file=sys.stderr,
+            )
+
     def tokenize(batch):
         text_list = batch["text"]
-        text_ids = [tokenizer(text) for text in text_list]
+        text_ids = [encode_text(tokenizer, text) for text in text_list]
         return {"text_ids": text_ids}
 
     train_ds = train_ds.map(tokenize, batched=True, remove_columns=["text"])
@@ -272,6 +354,16 @@ def train(
             return next(train_iter)
 
     with tracker.live():
+        best_val_loss = float("inf")
+        _best_meta = save_dir / "best" / "best_metric.json"
+        if _best_meta.is_file():
+            try:
+                best_val_loss = float(json.loads(_best_meta.read_text())["val_loss"])
+                if accelerator.rank == 0:
+                    tracker.print(f"[best] 沿用既有紀錄 val {best_val_loss:.6f}")
+            except Exception:
+                pass
+
         for step in range(start_step, num_iters):
             # update resume step so signal handler can save current progress
             resume["step"] = step
@@ -335,7 +427,7 @@ def train(
                 tracker.log_metrics(loss_values, split="train")
 
             if val_loader is not None and (step % valid_interval == 0 or step == num_iters - 1):
-                validate(
+                _val_loss = validate(
                     model,
                     val_loader,
                     batch_processor,
@@ -352,6 +444,27 @@ def train(
                     tokenizer=tokenizer,
                     valid_interval=valid_interval,
                 )
+
+                # 追蹤 val 最佳。訓練無 early stopping，且過擬合後 `latest`
+                # 會明顯劣於谷底，故一發現新低就另存一份到 best/，避免
+                # 谷底落在兩個 save_interval 之間而永遠取不到。
+                if _val_loss is not None and _val_loss < best_val_loss and accelerator.rank == 0:
+                    best_val_loss = _val_loss
+                    save_checkpoint(
+                        model,
+                        optimizer,
+                        scheduler,
+                        save_dir,
+                        step,
+                        pretrained_path,
+                        hf_model_id,
+                        distribute,
+                        tag="best",
+                    )
+                    (save_dir / "best" / "best_metric.json").write_text(
+                        json.dumps({"step": step, "val_loss": _val_loss}, indent=2)
+                    )
+                    tracker.print(f"[best] step {step}: val {_val_loss:.6f} -> {save_dir / 'best'}")
 
             if (step % save_interval == 0 or step == num_iters - 1) and accelerator.rank == 0:
                 save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute)
@@ -428,6 +541,9 @@ def validate(
             val_metrics[key] = mean_sub_loss.item()
 
         tracker.log_metrics(val_metrics, split="val")
+        _val_total = val_metrics["loss/total"]
+    else:
+        _val_total = None
 
     # Generate sample audio for TensorBoard display
     if writer is not None and val_ds is not None and audio_vae is not None and accelerator.rank == 0:
@@ -467,6 +583,7 @@ def validate(
             tracker.print(f"[Warning] Skip audio generation: missing {', '.join(missing)}")
 
     model.train()
+    return _val_total
 
 
 def compute_mel_spectrogram(audio_np, sample_rate, n_mels=128):
@@ -667,7 +784,7 @@ def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
         return 0
 
     unwrapped = model.module if hasattr(model, "module") else model
-    lora_cfg = unwrapped.lora_config
+    lora_cfg = getattr(unwrapped, "lora_config", None)
 
     # Load model weights
     if lora_cfg is not None:
@@ -751,6 +868,7 @@ def save_checkpoint(
     pretrained_path: str = None,
     hf_model_id: str = "",
     distribute: bool = False,
+    tag: str = None,
 ):
     """
     Save checkpoint with different strategies for full finetune vs LoRA:
@@ -760,13 +878,13 @@ def save_checkpoint(
     import shutil
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"step_{step:07d}"
+    tag = tag or f"step_{step:07d}"
     folder = save_dir / tag
     folder.mkdir(parents=True, exist_ok=True)
 
     unwrapped = model.module if hasattr(model, "module") else model
     full_state = unwrapped.state_dict()
-    lora_cfg = unwrapped.lora_config
+    lora_cfg = getattr(unwrapped, "lora_config", None)
 
     if lora_cfg is not None:
         # LoRA finetune: save only lora_A/lora_B weights

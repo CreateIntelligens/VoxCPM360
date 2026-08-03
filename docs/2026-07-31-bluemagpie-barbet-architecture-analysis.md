@@ -3,6 +3,10 @@
 日期：2026-07-31
 狀態：依公開原始碼、模型 metadata、VoxCPM2 本機原始碼與作者提供的 Barbet HF 發布包查核
 
+> 2026-08-03 更新：VoxCPM360 已採用下方「路線 B」，把必要原始碼與 runtime
+> 收進本 repo，由同一個 API 與容器在本機載入 checkpoint。專案不依賴另一份
+> BlueMagpie checkout、外部 BlueMagpie API 或外部 Docker image。
+
 ## 結論先行
 
 原摘要的主方向成立，但用「Barbet 是全部護城河、TTS 只是 VoxCPM2 套殼」描述得太絕對。
@@ -21,8 +25,8 @@ Barbet 確實是專案中最具獨立再利用價值的資產：它是 1.088B �
 2. **但它不是不需訓練的 checkpoint 拼接。** Barbet、兩側 bridge、speaker
    projector 與 TTS special tokens 必須經過蒸餾／TTS 對齊；不同 BlueMagpie
    發布 checkpoint 間，Barbet 的 380 個 tensors 全部都在變化。
-3. **產品整合與自行換腦是兩件事。** 把完整 BlueMagpie checkpoint 接成
-   VoxCPM360 第二後端不需訓練；只拿 raw `barbet-1b-base` 替換 VoxCPM2
+3. **載入成品與自行換腦是兩件事。** 把完整 BlueMagpie checkpoint 交給
+   VoxCPM360 的本機 Barbet runtime 不需訓練；只拿 raw `barbet-1b-base` 替換 VoxCPM2
    `base_lm` 則一定需要重新對齊訓練。
 
 本文件的判定優先順序是：本機 tensor／runtime 實測 > 固定 revision 原始碼 >
@@ -457,64 +461,33 @@ LoRA config 是 `enable_lm=true`、`enable_dit=true`、`enable_proj=false`。本
 因此本機 Barbet 權重本身可用；尚未具備的是 TTS bridge／alignment，而不是
 Barbet 檔案損壞或無法載入。
 
-若要在 VoxCPM360 使用 Barbet／BlueMagpie，有三條路：
+當時評估了三條路；目前已採用路線 B：
 
-### 路線 A：把既有 BlueMagpie Docker 接成第二後端（建議先做）
+### 路線 A：把既有 BlueMagpie Docker 接成第二後端（歷史方案，未採用）
 
-這條路不需要訓練，也不需要把兩套 Python／CUDA runtime 塞進同一個 process。
-目前已實測：
+這條路曾用來快速驗證完整 checkpoint，不需要重新訓練。它會讓 VoxCPM360
+透過網路呼叫另一個服務，因此不符合「本專案獨立部署」的最終要求，相關 gateway、
+遠端 URL 與 HTTP client 整合已從正式 runtime 移除。
 
-- `bluemagpie-tts` 服務在 host port `1981` 提供 `/health`、`/api/synthesize`、
-  `/api/synthesize/clone` 與 `/api/synthesize/stream`。
-- `voxcpm_app` 容器可透過 Docker host gateway 存取該服務，health 回傳
-  `model_loaded=true`。
-- VoxCPM360 容器已有 `httpx` 和 `requests`，無須增加 HTTP client dependency。
-
-正式整合不應硬編碼 gateway IP；應將兩個服務加入同一個 Compose network，
-以 `BLUEMAGPIE_URL=http://bluemagpie:8000` 連線。現有 `app.py` 的 model dropdown
-實際上是 LoRA selector，建議另加「引擎」選擇：
-
-```text
-TTS 引擎
-├── VoxCPM2
-│   └── 基礎模型／既有 LoRA selector
-└── BlueMagpie
-    └── 內建 speaker／reference audio clone
-```
-
-應以統一 backend protocol 封裝：
+保留下來的是統一 backend protocol 的概念：
 
 ```text
 synthesize(text, reference_audio, cfg, steps, seed, model_selection)
     -> (sample_rate, waveform)
 ```
 
-VoxCPM2 backend 維持現有 Nano-vLLM 與 LoRA registry；BlueMagpie backend 呼叫 REST
-API。BlueMagpie 不支援 VoxCPM2 的 control instruction、prompt transcript 或現有
-LoRA，UI 必須依 backend 隱藏不適用欄位，不能默默忽略。
+現在兩個 backend 都是本機 Python runtime；前端依引擎隱藏不適用欄位。
 
-這是「整合 BlueMagpie 成品到本專案」，不是「把 raw Barbet base 塞進 VoxCPM2」。
-前者免訓練，後者仍必須訓練。
+### 路線 B：把 BlueMagpie runtime 內嵌成第二個本機模型（已採用）
 
-### 路線 B：把 BlueMagpie runtime 內嵌成第二個本機模型
+必要的 BlueMagpie、Barbet 與 VoxCPM 聲學程式已納入 `src/`，授權與來源記錄在
+`THIRD_PARTY_NOTICES.md`。本專案會掃描 `models/barbet/`，直接載入完整 TTS
+checkpoint；前端透過同一個 VoxCPM360 API 在原生 VoxCPM2 與 Barbet runtime
+之間切換。
 
-可以把 BlueMagpie package 納入同一 repo，再由本專案直接載入完整 TTS checkpoint。
-它同樣不需要重新訓練，但目前不優先，原因是：
-
-- 現有主服務使用 Nano-vLLM-VoxCPM，BlueMagpie 公開版使用獨立 PyTorch runtime。
-- 兩套模型的依賴、cache 與生成 API 不同。
-- 同 process 載入會把錯誤隔離、升級與 GPU 記憶體管理綁在一起。
-- 公開 BlueMagpie source 與最新 checkpoint 尚未配對。
-
-若日後需要單容器部署，應先有 backend abstraction 與固定版本的整合測試，再把
-HTTP backend 換成 in-process backend；不應一開始直接修改 `VoxCPM2Model`。
-
-路線 A／B 都必須先選擇：
-
-1. 取得與最新 `4c2c5b...` 配對的作者原始碼；或
-2. 使用公開程式並 pin `78b3cbe...`（`step_0006000`）。
-
-另需確認 BlueMagpie model weights 的 `other` license 是否允許預定用途。
+兩套模型仍保有各自的 loader、cache 與生成介面，沒有假裝 checkpoint 能互換；
+共用的是 catalog、API、容器與前端。切換時 runtime 會卸載前一個模型，以控制 GPU
+記憶體。完整 checkpoint 可直接推論，raw Barbet base 則不能直接發聲。
 
 ### 路線 C：在本專案自行做 Barbet TSLM transplant
 
@@ -528,9 +501,8 @@ HTTP backend 換成 in-process backend；不應一開始直接修改 `VoxCPM2Mod
 6. 再以授權語音資料做 TTS 訓練與 speaker-conditioning 訓練。
 7. 固定 checkpoint 與評測 protocol，和原始 VoxCPM2 做 A/B。
 
-這不是單純的 checkpoint key rename。若目標是產品驗證，路線 A 最合理；若目標
-是單容器包裝，待 A 驗證後再走 B；若目標是掌握訓練能力與建立自有台灣 TTS，
-才走 C。
+這不是單純的 checkpoint key rename。路線 B 已完成獨立部署；若要讓 raw Barbet
+學會台語 TTS，仍須走路線 C 的對齊訓練。
 
 ## 仍待作者材料才能確認的項目
 
@@ -543,9 +515,9 @@ HTTP backend 換成 in-process backend；不應一開始直接修改 `VoxCPM2Mod
 - 最新 HF revision `4c2c5b...` 所對應、目前未公開的完整 source commit。
 - Barbet 與 BlueMagpie 權重的完整授權條款；目前 metadata 只有 `license: other`。
 
-## 本機部署安全觀察
+## 歷史部署安全觀察
 
-現有 BlueMagpie Docker 的環境變數與 Git remote URL 含明文存取權杖。權杖值不應
+先前用於驗證的外部 BlueMagpie Docker，其環境變數與 Git remote URL 曾含明文存取權杖。權杖值不應
 出現在文件、log 或 issue；建議立即在對應平台撤銷／輪替，將 Git remote 改成不含
 credential 的 URL，並改用 Docker secret、credential helper 或只讀 deploy token。
 這不影響上述模型架構判定，但屬於獨立且高優先的部署風險。

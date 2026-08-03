@@ -1,0 +1,35 @@
+# E4 tai8 有效 batch 加倍
+#
+# grad_accum 8 -> 16（有效 batch 128 -> 256）。較大 batch 梯度更穩，
+# 可能延後過擬合點。LR 同步微調至 1.4e-5（約 sqrt(2) 倍）。
+#
+# 以 epoch 為單位：已完成三輪的最佳點都在 epoch 1.7~2.5，故跑 3 epoch
+# 涵蓋谷底並留出過擬合觀察區。每 epoch 驗證/存檔 8 次，配合 best 追蹤。
+pretrained_path: /mnt/home/csl426-aicr-ae5f63/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/bffb3df5a29440629464e5e839f4d214c8714c3d
+
+train_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/train.jsonl
+val_manifest: /mnt/home/csl426-aicr-ae5f63/dataset202607_1/tai8/manifests/voxcpm2_abs/val_seen.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+
+batch_size: 4
+grad_accum_steps: 16
+num_workers: 8
+max_batch_tokens: 8192
+
+log_interval: 50
+
+learning_rate: 1.4e-05
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+
+save_path: /app/checkpoints/e_tai8_bs256
+tensorboard: /app/checkpoints/e_tai8_bs256/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+
+num_epochs: 3.0
+valid_per_epoch: 8
+save_per_epoch: 8

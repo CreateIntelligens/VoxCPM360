@@ -44,6 +44,9 @@ frontend/vite.config.js
 frontend/vite.config.d.ts
 *.tsbuildinfo
 
+# Optional local scratch copy; the runtime and training path do not depend on it.
+/vendor/
+
 # Local model store. Keep its instructions/layout, never commit model weights.
 /models/native/*
 !/models/native/.gitkeep

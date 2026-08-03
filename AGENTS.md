@@ -300,8 +300,8 @@ tokenizer 實測：Barbet 少用 25% token，`恁`／`佗` 等台語專用字能
 `bluemagpie.loading.set_training_stage`：`bridge` / `tslm` / `full`）。
 `bluemagpie` 與 `barbet` 的推論必要原始碼已依 Apache-2.0 收進本 repo 的
 `src/bluemagpie` 與 `src/barbet`，來源聲明見 `THIRD_PARTY_NOTICES.md`。推論服務
-不得依賴另一份 `~/BlueMagpie-TTS` checkout、`:1981` API 或外部 Docker image。
-Taipei-1 訓練環境仍可由 `train.sh` 透過 `/app/vendor` 載入叢集端副本。
+不得依賴另一份 checkout、分離的網路服務或外部 Docker image。本機、Docker 與
+Taipei-1 訓練都直接使用 repo 內的 `src/`，不需要另一份專案或套件副本。
 
 ### 7.3 多卡啟動
 `train.sh` 已支援 GPU 數自動偵測（多卡 `torchrun`／單卡 `python`）。
