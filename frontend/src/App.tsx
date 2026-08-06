@@ -1,5 +1,6 @@
 import {
   AudioLines,
+  BarChart3,
   BrainCircuit,
   Check,
   ChevronDown,
@@ -19,8 +20,17 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { fetchCatalog, synthesize } from "./api";
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { fetchCatalog, fetchGenerationHistory, synthesize } from "./api";
+import ModelComparison from "./ModelComparison";
+import { usePersistentState } from "./usePersistentState";
 import type {
   Catalog,
   Engine,
@@ -29,6 +39,7 @@ import type {
 } from "./types";
 
 const DEFAULT_TEXT = "逐家好，歡迎使用 VoxCPM 360 多模型語音工作室。";
+const HISTORY_LIMIT = 100;
 
 function createHistoryId(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {
@@ -38,6 +49,13 @@ function createHistoryId(): string {
 }
 
 function App() {
+  const [activeView, setActiveView] = usePersistentState<
+    "studio" | "comparison"
+  >(
+    "active-view",
+    "studio",
+  );
+  const [comparisonReloadKey, setComparisonReloadKey] = useState(0);
   const [catalog, setCatalog] = useState<Catalog>({
     engines: [],
     reference_presets: [],
@@ -45,24 +63,40 @@ function App() {
   });
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState("");
-  const [engineId, setEngineId] = useState("");
-  const [modelId, setModelId] = useState("");
-  const [speakerId, setSpeakerId] = useState("");
-  const [text, setText] = useState(DEFAULT_TEXT);
-  const [controlInstruction, setControlInstruction] = useState("");
-  const [promptText, setPromptText] = useState("");
+  const [engineId, setEngineId] = usePersistentState("engine-id", "");
+  const [modelId, setModelId] = usePersistentState("model-id", "");
+  const [speakerId, setSpeakerId] = usePersistentState("speaker-id", "");
+  const [text, setText] = usePersistentState("target-text", DEFAULT_TEXT);
+  const [controlInstruction, setControlInstruction] = usePersistentState(
+    "control-instruction",
+    "",
+  );
+  const [promptText, setPromptText] = usePersistentState("prompt-text", "");
   const [referenceAudio, setReferenceAudio] = useState<File>();
-  const [referencePresetId, setReferencePresetId] = useState("");
-  const [cfgValue, setCfgValue] = useState(2);
-  const [steps, setSteps] = useState(10);
-  const [normalize, setNormalize] = useState(false);
-  const [denoise, setDenoise] = useState(false);
-  const [seed, setSeed] = useState("");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [referencePresetId, setReferencePresetId] = usePersistentState(
+    "reference-preset-id",
+    "",
+  );
+  const [cfgValue, setCfgValue] = usePersistentState("cfg-value", 2);
+  // 與 api.py 的 Form 預設對齊。steps=10 會讓 diffusion 沒收斂完就輸出
+  // （實聽「亂叫、聽不懂」），normalize=false 則會讓音量爆掉；兩者原本都
+  // 只寫在後端，但前端每次都顯式送值，後端預設等於被架空。
+  // key 加 -v2 是為了讓已存舊值的瀏覽器重新套用新預設。
+  const [steps, setSteps] = usePersistentState("inference-steps-v2", 30);
+  const [speed, setSpeed] = usePersistentState("speech-speed", 1);
+  const [normalize, setNormalize] = usePersistentState("normalize-v2", true);
+  const [denoise, setDenoise] = usePersistentState("denoise", false);
+  const [seed, setSeed] = usePersistentState("seed", "");
+  const [advancedOpen, setAdvancedOpen] = usePersistentState(
+    "advanced-open",
+    false,
+  );
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState("");
-  const [currentAudioUrl, setCurrentAudioUrl] = useState("");
+  const [currentHistoryId, setCurrentHistoryId] = useState("");
+  const [autoPlayHistoryId, setAutoPlayHistoryId] = useState("");
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const audioUrlsRef = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const selectedEngine = useMemo(
@@ -74,6 +108,17 @@ function App() {
     [selectedEngine, modelId],
   );
   const speakers = selectedModel?.speakers || [];
+  const selectedSpeaker = speakers.find((speaker) => speaker.id === speakerId);
+  const currentHistoryItem = useMemo(
+    () => history.find((item) => item.id === currentHistoryId),
+    [currentHistoryId, history],
+  );
+  const supportsControlInstruction = Boolean(
+    selectedEngine?.capabilities.control_instruction,
+  );
+  const supportsPromptTranscript = Boolean(
+    selectedEngine?.capabilities.prompt_transcript,
+  );
   const selectedReferencePreset = useMemo(
     () =>
       catalog.reference_presets.find(
@@ -81,6 +126,63 @@ function App() {
       ),
     [catalog.reference_presets, referencePresetId],
   );
+
+  // 內建聲音的逐字稿是固定事實，直接填入並鎖為唯讀 —— 改了只會讓克隆變差。
+  // 自訂上傳時清空並開放編輯：我們不知道使用者的音檔在講什麼，只能由他自己填。
+  useEffect(() => {
+    if (referenceAudio) {
+      // 切到自訂上傳：清掉殘留的預設逐字稿，否則會拿別支音檔的內容去對，
+      // 比留空更糟 —— 使用者還不見得會發現。
+      setPromptText((current) => {
+        const isPresetText = catalog.reference_presets.some(
+          (item) => item.prompt_text && item.prompt_text === current.trim(),
+        );
+        return isPresetText ? "" : current;
+      });
+      return;
+    }
+    if (selectedReferencePreset?.prompt_text) {
+      setPromptText(selectedReferencePreset.prompt_text);
+    }
+  }, [
+    selectedReferencePreset,
+    referenceAudio,
+    catalog.reference_presets,
+    setPromptText,
+  ]);
+
+  const loadGlobalHistory = useCallback(async () => {
+    try {
+      const records = await fetchGenerationHistory(HISTORY_LIMIT);
+      setHistory((current) => {
+        const localAudioUrls = new Map(
+          current
+            .filter((item) => audioUrlsRef.current.has(item.audioUrl))
+            .map((item) => [item.id, item.audioUrl]),
+        );
+        const next = records.map((item) => ({
+          ...item,
+          audioUrl: localAudioUrls.get(item.id) || item.audioUrl,
+        }));
+        const nextIds = new Set(next.map((item) => item.id));
+        current
+          .filter((item) => !nextIds.has(item.id))
+          .forEach((item) => {
+            if (audioUrlsRef.current.delete(item.audioUrl)) {
+              URL.revokeObjectURL(item.audioUrl);
+            }
+          });
+        return next;
+      });
+      setCurrentHistoryId((currentId) =>
+        records.some((item) => item.id === currentId)
+          ? currentId
+          : records[0]?.id || "",
+      );
+    } catch {
+      // A temporary sync failure must not discard history already visible to the user.
+    }
+  }, []);
   let referencePresetState = "success";
   if (catalogLoading) {
     referencePresetState = "loading";
@@ -106,6 +208,12 @@ function App() {
         nextEngine?.models.find((model) => model.online !== false) ||
         nextEngine?.models[0];
       setModelId(nextModel?.id || "");
+      setSpeakerId((currentId) => {
+        const nextSpeaker =
+          nextModel?.speakers?.find((speaker) => speaker.id === currentId) ||
+          nextModel?.speakers?.[0];
+        return nextSpeaker?.id || "";
+      });
       setReferencePresetId((currentId) => {
         const nextPreset =
           next.reference_presets.find((item) => item.id === currentId) ||
@@ -126,13 +234,37 @@ function App() {
 
   useEffect(() => {
     void loadCatalog();
-    return () => {
-      history.forEach((item) => URL.revokeObjectURL(item.audioUrl));
-    };
-    // The cleanup captures initial history intentionally; individual URLs are
-    // revoked when history entries roll off.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 只在整個 App 卸載時回收 blob URL。不可與輪詢的 effect 合併 —— 那個
+  // effect 依賴 activeView，切換分頁時會連帶把播放中的音訊 URL 撤銷掉。
+  useEffect(() => {
+    const audioUrls = audioUrlsRef.current;
+    return () => {
+      audioUrls.forEach((audioUrl) => URL.revokeObjectURL(audioUrl));
+      audioUrls.clear();
+    };
+  }, []);
+
+  // 比較分頁不顯示歷史紀錄，輪詢在那裡是純粹的浪費（每次都會掃整個
+  // 紀錄目錄）。
+  useEffect(() => {
+    if (activeView !== "studio") {
+      return;
+    }
+    void loadGlobalHistory();
+    const refreshTimer = window.setInterval(
+      () => void loadGlobalHistory(),
+      15_000,
+    );
+    const refreshOnFocus = () => void loadGlobalHistory();
+    window.addEventListener("focus", refreshOnFocus);
+    return () => {
+      window.clearInterval(refreshTimer);
+      window.removeEventListener("focus", refreshOnFocus);
+    };
+  }, [loadGlobalHistory, activeView]);
 
   useEffect(() => {
     if (!catalogError) {
@@ -189,26 +321,48 @@ function App() {
         speakerId,
         cfgValue,
         inferenceTimesteps: steps,
+        speed,
         normalize,
         denoise,
         seed: seed ? Number(seed) : undefined,
         referenceAudio,
       });
       const audioUrl = URL.createObjectURL(result.blob);
-      setCurrentAudioUrl(audioUrl);
+      audioUrlsRef.current.add(audioUrl);
       const item: HistoryItem = {
-        id: createHistoryId(),
+        id: result.historyId || createHistoryId(),
         text: targetText,
+        engineId: result.engineId,
         engineLabel: selectedEngine.label,
+        modelId: result.modelId,
         modelLabel: selectedModel.label,
+        referenceLabel: referenceAudio
+          ? `自訂：${referenceAudio.name}（${(referenceAudio.size / 1024 / 1024).toFixed(2)} MB）`
+          : selectedReferencePreset
+            ? `${selectedReferencePreset.label} · ${selectedReferencePreset.description}`
+            : "未指定參考音",
+        speakerLabel: selectedSpeaker?.name,
+        seed: result.seed,
+        cfgValue,
+        inferenceTimesteps: steps,
+        speed,
+        normalize,
+        denoise,
+        promptText: promptText.trim() || undefined,
+        controlInstruction: controlInstruction.trim() || undefined,
         createdAt: new Date(),
         audioUrl,
         durationLabel: result.durationLabel,
       };
+      setCurrentHistoryId(item.id);
+      setAutoPlayHistoryId(item.id);
       setHistory((previous) => {
         const next = [item, ...previous];
-        next.slice(5).forEach((old) => URL.revokeObjectURL(old.audioUrl));
-        return next.slice(0, 5);
+        next.slice(HISTORY_LIMIT).forEach((old) => {
+          URL.revokeObjectURL(old.audioUrl);
+          audioUrlsRef.current.delete(old.audioUrl);
+        });
+        return next.slice(0, HISTORY_LIMIT);
       });
     } catch (error) {
       setGenerateError(
@@ -251,31 +405,76 @@ function App() {
               <Sparkles size={14} />
               MULTI-MODEL SPEECH LAB
             </span>
-            <h1>讓每一種語言，找到自己的聲音。</h1>
-            <p>
-              在原生 VoxCPM2 與 Barbet 換腦模型之間自由切換，
-              同時管理基礎模型與每一次訓練成果。
-            </p>
+            <h1>
+              {activeView === "studio"
+                ? "讓每一種語言，找到自己的聲音。"
+                : "用同一把尺，看懂每一次訓練。"}
+            </h1>
+            {activeView === "studio" ? (
+              <p>
+                在原生 VoxCPM2 與 Barbet 換腦模型之間自由切換，
+                同時管理基礎模型與每一次訓練成果。
+              </p>
+            ) : (
+              <p>
+                依驗證集分組檢視訓練結果，在可比較的範圍內排序模型表現、收斂位置與容量。
+              </p>
+            )}
           </div>
-          <button
-            className="icon-button refresh-button"
-            onClick={() => void loadCatalog()}
-            disabled={catalogLoading}
-            title="重新整理模型"
-          >
-            <RefreshCw size={17} className={catalogLoading ? "spin" : ""} />
-            重新掃描
-          </button>
+          <div className="intro-actions">
+            <nav className="view-switcher" aria-label="主要功能">
+              <button
+                type="button"
+                className={activeView === "studio" ? "active" : ""}
+                onClick={() => setActiveView("studio")}
+                aria-current={activeView === "studio" ? "page" : undefined}
+              >
+                <Mic2 size={16} />
+                語音生成
+              </button>
+              <button
+                type="button"
+                className={activeView === "comparison" ? "active" : ""}
+                onClick={() => setActiveView("comparison")}
+                aria-current={activeView === "comparison" ? "page" : undefined}
+              >
+                <BarChart3 size={16} />
+                模型比較
+              </button>
+            </nav>
+            {activeView === "studio" ? (
+              <button
+                className="icon-button refresh-button"
+                onClick={() => void loadCatalog()}
+                disabled={catalogLoading}
+                title="重新整理模型"
+              >
+                <RefreshCw size={17} className={catalogLoading ? "spin" : ""} />
+                重新掃描
+              </button>
+            ) : (
+              <button
+                className="icon-button refresh-button"
+                onClick={() => setComparisonReloadKey((current) => current + 1)}
+                title="重新載入模型比較資料"
+              >
+                <RefreshCw size={17} />
+                重新載入
+              </button>
+            )}
+          </div>
         </section>
 
-        {catalogError && (
-          <div className="alert error-alert">
-            <CircleAlert size={18} />
-            <span>{catalogError}</span>
-          </div>
-        )}
+        {activeView === "studio" && (
+          <>
+            {catalogError && (
+              <div className="alert error-alert">
+                <CircleAlert size={18} />
+                <span>{catalogError}</span>
+              </div>
+            )}
 
-        <form className="studio-grid" onSubmit={handleSubmit}>
+            <form className="studio-grid" onSubmit={handleSubmit}>
           <aside className="control-panel panel">
             <div className="panel-heading">
               <span className="step-number">01</span>
@@ -429,26 +628,42 @@ function App() {
               <span className="character-count">{text.length} / 2000</span>
             </div>
 
-            {selectedEngine?.capabilities.control_instruction && (
-              <div className="form-row">
-                <label>
-                  <span className="field-label">聲音控制指令</span>
-                  <input
-                    value={controlInstruction}
-                    onChange={(event) =>
-                      setControlInstruction(event.target.value)
-                    }
-                    placeholder="例如：溫暖、沉穩、語速稍慢"
-                  />
-                </label>
-                <label>
-                  <span className="field-label">參考音訊逐字稿</span>
-                  <input
-                    value={promptText}
-                    onChange={(event) => setPromptText(event.target.value)}
-                    placeholder="有逐字稿時可做精準聲音複製"
-                  />
-                </label>
+            {(supportsControlInstruction || supportsPromptTranscript) && (
+              <div
+                className={`form-row ${
+                  supportsControlInstruction && supportsPromptTranscript
+                    ? ""
+                    : "single-field"
+                }`}
+              >
+                {supportsControlInstruction && (
+                  <label>
+                    <span className="field-label">聲音控制指令</span>
+                    <input
+                      value={controlInstruction}
+                      onChange={(event) =>
+                        setControlInstruction(event.target.value)
+                      }
+                      placeholder="例如：溫暖、沉穩、語速稍慢"
+                    />
+                  </label>
+                )}
+                {supportsPromptTranscript && (
+                  <label>
+                    <span className="field-label">參考音訊逐字稿</span>
+                    <input
+                      value={promptText}
+                      onChange={(event) => setPromptText(event.target.value)}
+                      readOnly={!referenceAudio}
+                      aria-readonly={!referenceAudio}
+                      placeholder={
+                        referenceAudio
+                          ? "請填入上傳音檔的逐字稿，留空會失去聲音克隆效果"
+                          : "選用內建聲音時自動帶入，不需手動填寫"
+                      }
+                    />
+                  </label>
+                )}
               </div>
             )}
 
@@ -493,9 +708,11 @@ function App() {
                     data-state={referenceAudio ? "custom" : "preset"}
                   >
                     {referenceAudio
-                      ? "已使用自訂上傳音檔；移除後會恢復內建選擇"
-                      : selectedReferencePreset?.description ||
-                        "未上傳音檔時會使用此內建聲音"}
+                      ? "已使用自訂上傳音檔；請在下方「參考音訊逐字稿」填入其內容，留空會失去聲音克隆效果"
+                      : selectedReferencePreset?.prompt_text
+                        ? `逐字稿（已自動帶入）：${selectedReferencePreset.prompt_text}`
+                        : selectedReferencePreset?.description ||
+                          "未上傳音檔時會使用此內建聲音"}
                   </small>
                 </label>
                 <div className="reference-upload-field">
@@ -547,6 +764,20 @@ function App() {
               </div>
             )}
 
+            {selectedEngine?.capabilities.seed && (
+              <div className="form-row single-field">
+                <label>
+                  <span className="field-label">隨機種子</span>
+                  <input
+                    type="number"
+                    value={seed}
+                    onChange={(event) => setSeed(event.target.value)}
+                    placeholder="留空則隨機"
+                  />
+                </label>
+              </div>
+            )}
+
             <button
               type="button"
               className="advanced-toggle"
@@ -592,17 +823,20 @@ function App() {
                     onChange={(event) => setSteps(Number(event.target.value))}
                   />
                 </label>
-                {selectedEngine?.capabilities.seed && (
-                  <label>
-                    <span className="field-label">隨機種子</span>
-                    <input
-                      type="number"
-                      value={seed}
-                      onChange={(event) => setSeed(event.target.value)}
-                      placeholder="留空則隨機"
-                    />
-                  </label>
-                )}
+                <label className="range-field">
+                  <span>
+                    <span className="field-label">語速（後製變速）</span>
+                    <output>{speed.toFixed(2)}x</output>
+                  </span>
+                  <input
+                    type="range"
+                    min="0.5"
+                    max="2"
+                    step="0.05"
+                    value={speed}
+                    onChange={(event) => setSpeed(Number(event.target.value))}
+                  />
+                </label>
                 <label className="toggle-row">
                   <input
                     type="checkbox"
@@ -671,7 +905,7 @@ function App() {
               </div>
             </div>
 
-            {currentAudioUrl ? (
+            {currentHistoryItem ? (
               <div className="audio-result">
                 <div className="result-art">
                   <div className="pulse-ring">
@@ -692,11 +926,71 @@ function App() {
                     />
                   ))}
                 </div>
-                <audio controls src={currentAudioUrl} autoPlay />
+                <audio
+                  key={currentHistoryItem.id}
+                  controls
+                  src={currentHistoryItem.audioUrl}
+                  autoPlay={autoPlayHistoryId === currentHistoryItem.id}
+                />
+                <dl className="result-metadata">
+                  <div>
+                    <dt>模型</dt>
+                    <dd>
+                      {currentHistoryItem.engineLabel}
+                      <small>{currentHistoryItem.modelLabel}</small>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>參考音</dt>
+                    <dd>{currentHistoryItem.referenceLabel}</dd>
+                  </div>
+                  {currentHistoryItem.speakerLabel && (
+                    <div>
+                      <dt>語者</dt>
+                      <dd>{currentHistoryItem.speakerLabel}</dd>
+                    </div>
+                  )}
+                  {currentHistoryItem.seed !== undefined && (
+                    <div>
+                      <dt>種子</dt>
+                      <dd className="numeric-value">{currentHistoryItem.seed}</dd>
+                    </div>
+                  )}
+                  <div>
+                    <dt>生成參數</dt>
+                    <dd>
+                      CFG {currentHistoryItem.cfgValue.toFixed(1)} · {currentHistoryItem.inferenceTimesteps} steps
+                      {currentHistoryItem.speed !== undefined &&
+                      currentHistoryItem.speed !== 1
+                        ? ` · ${currentHistoryItem.speed.toFixed(2)}x`
+                        : ""}
+                      {currentHistoryItem.normalize ? " · 正規化" : ""}
+                      {currentHistoryItem.denoise ? " · 去噪" : ""}
+                    </dd>
+                  </div>
+                  {currentHistoryItem.promptText && (
+                    <div>
+                      <dt>參考逐字稿</dt>
+                      <dd>{currentHistoryItem.promptText}</dd>
+                    </div>
+                  )}
+                  {currentHistoryItem.controlInstruction && (
+                    <div>
+                      <dt>聲音控制</dt>
+                      <dd>{currentHistoryItem.controlInstruction}</dd>
+                    </div>
+                  )}
+                  {currentHistoryItem.durationLabel && (
+                    <div>
+                      <dt>耗時</dt>
+                      <dd className="numeric-value">{currentHistoryItem.durationLabel}</dd>
+                    </div>
+                  )}
+                </dl>
                 <a
                   className="download-button"
-                  href={currentAudioUrl}
-                  download={`voxcpm360-${Date.now()}.wav`}
+                  href={currentHistoryItem.audioUrl}
+                  download={`voxcpm360-${currentHistoryItem.id}.wav`}
                 >
                   <Download size={17} />
                   下載 WAV
@@ -716,9 +1010,9 @@ function App() {
               <div className="history-title">
                 <span>
                   <History size={16} />
-                  本次工作階段
+                  全域生成紀錄
                 </span>
-                <small>{history.length} / 5</small>
+                <small>{history.length} / {HISTORY_LIMIT}</small>
               </div>
               {history.length === 0 ? (
                 <p className="history-empty">尚無生成紀錄</p>
@@ -728,8 +1022,11 @@ function App() {
                     <button
                       type="button"
                       key={item.id}
-                      className="history-item"
-                      onClick={() => setCurrentAudioUrl(item.audioUrl)}
+                      className={`history-item ${item.id === currentHistoryId ? "active" : ""}`}
+                      onClick={() => {
+                        setCurrentHistoryId(item.id);
+                        setAutoPlayHistoryId(item.id);
+                      }}
                     >
                       <span className="history-play">
                         <AudioLines size={16} />
@@ -739,10 +1036,16 @@ function App() {
                         <small>
                           {item.engineLabel} · {item.modelLabel}
                         </small>
+                        <small>
+                          參考：{item.referenceLabel}
+                          {item.seed !== undefined ? ` · Seed ${item.seed}` : ""}
+                        </small>
                       </span>
                       <span className="history-time">
                         <Clock3 size={12} />
-                        {item.createdAt.toLocaleTimeString("zh-TW", {
+                        {item.createdAt.toLocaleString("zh-TW", {
+                          month: "2-digit",
+                          day: "2-digit",
                           hour: "2-digit",
                           minute: "2-digit",
                         })}
@@ -753,7 +1056,13 @@ function App() {
               )}
             </div>
           </aside>
-        </form>
+            </form>
+          </>
+        )}
+
+        {activeView === "comparison" && (
+          <ModelComparison reloadToken={comparisonReloadKey} />
+        )}
       </main>
       <footer>
         <span>VoxCPM 360 · Multi-model inference gateway</span>

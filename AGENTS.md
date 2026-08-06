@@ -227,15 +227,25 @@ find <路徑> -name "*.sh" ! -perm -g=x -print | head       # 腳本 group 不�
 
 **三台機器的分工**（詳見第 2 節主機表）：
 
-| 機器 | 角色 | 注意 |
-|---|---|---|
-| Taipei-1 | 訓練（Slurm + Enroot） | 無 docker、無 sudo、**無對外網路**、無 GitHub 寫入憑證 |
-| GB10 `10.9.0.37` | 推論服務、前端、git 操作 | **唯一有 GitHub 寫入憑證**（`gh` 已登入）|
-| A4000 `10.9.0.32` | 備援 | 與 GB10 **不同網段，兩者無法直連** |
+| 機器 | 角色 | GitHub 寫入 | 可連 Taipei-1 |
+|---|---|---|---|
+| Taipei-1 | 訓練（Slurm + Enroot） | ❌ 無憑證、無 `gh`、**無對外網路** | — |
+| GB10 `10.9.0.37` | 推論服務、前端、主要 git 操作 | ✅ `gh` 已登入 `ac-Spark` | ❌ |
+| A4000 `10.9.0.32` | 備援、可直接與叢集同步 | ✅ `gh` + `credential.helper store` | ✅ |
 
-**權重搬運只能經本機中轉**：Taipei-1 → 本機 → GB10。
-**Taipei-1 的 commit 要推 GitHub**：用 `git bundle` 搬到 GB10 再推
-（比 clone 快得多，一批 commit 通常只有幾十 KB）。
+Taipei-1 無 docker、無 sudo。GB10 與 A4000 **不同網段，兩者無法直連**。
+
+**權重搬運**：Taipei-1 → 本機 → GB10（GB10 連不到叢集，必須中轉）。
+**Taipei-1 的 commit 要推 GitHub**：兩條路
+- 經 GB10：`git bundle` 搬過去再推（一批 commit 通常只有幾十 KB）
+- 經 A4000：它連得到叢集，可直接 `git pull` 再 push，少一次中轉
+
+> ⚠️ **程式碼改動一律在 GB10 做，Taipei-1 只 pull。**
+> 在 Taipei-1 直接編輯看似省一輪往返，但遠端一有整合（別人或 codex 推的
+> merge commit）就會分歧，得手工解衝突 —— 2026-08-03 即因此在
+> `AGENTS.md`／`TRAINING_LOG.md`／`train_voxcpm_finetune.py` 撞上三處衝突。
+> 唯一該破例的情況是叢集上的訓練正在失敗、需要立刻修；**破例後要馬上
+> 同步回 GB10 並推送**，不要累積。
 
 > ⚠️ **在叢集端絕不要用 `git add -A`** —— 它會遞迴 stat 800 GB 以上的
 > `checkpoints/`（雖被 ignore 仍要掃），在 Lustre 上會卡數分鐘並鎖住 index。

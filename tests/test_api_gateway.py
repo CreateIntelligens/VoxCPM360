@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
 import api
+
+
+@pytest.fixture(autouse=True)
+def isolate_generation_history(monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "_HISTORY_DIR", tmp_path / "generation_history")
 
 
 class FakeRegistry:
@@ -111,6 +117,38 @@ def test_catalog_exposes_available_reference_presets(monkeypatch, tmp_path):
         "Hayley 開心說開場白",
     ]
     assert payload["default_reference_preset_id"] == "middle-aged-female"
+
+
+def test_model_registry_endpoint_returns_document(monkeypatch, tmp_path):
+    registry_path = tmp_path / "model_registry.json"
+    registry_path.write_text(
+        '{"_val_sets":{"tai8":"同一驗證集"},"models":[{"name":"tai8-best"}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api, "_MODEL_REGISTRY_PATH", registry_path)
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/models/registry")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "_val_sets": {"tai8": "同一驗證集"},
+        "models": [{"name": "tai8-best"}],
+    }
+
+
+def test_model_registry_endpoint_returns_empty_document_when_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "_MODEL_REGISTRY_PATH", tmp_path / "missing.json")
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/models/registry")
+
+    assert response.status_code == 200
+    assert response.json() == {"_val_sets": {}, "models": []}
 
 
 def test_native_synthesis_uses_selected_reference_preset(
@@ -234,15 +272,31 @@ def test_local_barbet_catalog_and_synthesis(monkeypatch):
                 "engine_id": "barbet",
                 "model_id": "barbet::barbet-tw-v1",
                 "text": "逐家好",
+                "prompt_text": "逐家好，食飽未",
                 "speaker_id": "voice-a",
                 "cfg_value": "2.2",
                 "inference_timesteps": "10",
             },
         )
+        history_response = client.get("/api/v1/history?limit=5")
+        history_item = history_response.json()["items"][0]
+        audio_response = client.get(history_item["audio_url"])
 
-    assert catalog["engines"][1]["models"][0]["speakers"][0]["id"] == "voice-a"
+    barbet_engine = catalog["engines"][1]
+    assert barbet_engine["capabilities"]["prompt_transcript"] is True
+    assert barbet_engine["models"][0]["speakers"][0]["id"] == "voice-a"
     assert response.status_code == 200
     assert response.content.startswith(b"RIFF")
     assert response.headers["x-synthesis-time"] == "1.25s"
+    assert response.headers["x-history-id"] == history_item["id"]
+    actual_seed = int(response.headers["x-random-seed"])
     assert runtime.calls[0]["speaker_id"] == "voice-a"
     assert runtime.calls[0]["model_id"] == "barbet::barbet-tw-v1"
+    assert runtime.calls[0]["prompt_text"] == "逐家好，食飽未"
+    assert runtime.calls[0]["seed"] == actual_seed
+    assert history_response.status_code == 200
+    assert history_item["model_label"] == "Barbet 台語 v1"
+    assert history_item["reference_label"].startswith("中年女聲")
+    assert history_item["seed"] == actual_seed
+    assert audio_response.status_code == 200
+    assert audio_response.content.startswith(b"RIFF")

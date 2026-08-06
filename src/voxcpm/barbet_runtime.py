@@ -125,6 +125,7 @@ class BarbetRuntime:
         model_id: str,
         text: str,
         reference_path: str | None,
+        prompt_text: str,
         speaker_id: str,
         cfg_value: float,
         inference_timesteps: int,
@@ -137,9 +138,14 @@ class BarbetRuntime:
                 if reference_path
                 else self._load_speaker_centroid(speaker_id)
             )
+            prompt_text = prompt_text.strip()
+            if prompt_text and not reference_path:
+                raise ValueError("Barbet prompt 逐字稿必須搭配參考音訊")
             started_at = time.perf_counter()
             audio = self._model.generate(
                 target_text=text,
+                prompt_text=prompt_text,
+                prompt_wav_path=reference_path if prompt_text else "",
                 speaker_centroid=centroid,
                 cfg_value=cfg_value,
                 inference_timesteps=inference_timesteps,

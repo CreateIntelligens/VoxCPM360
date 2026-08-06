@@ -44,6 +44,9 @@ frontend/vite.config.js
 frontend/vite.config.d.ts
 *.tsbuildinfo
 
+# Shared generated-audio history is runtime data served by the API.
+/data/generation_history/
+
 # Optional local scratch copy; the runtime and training path do not depend on it.
 /vendor/
 
