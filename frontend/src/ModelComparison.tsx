@@ -13,18 +13,21 @@ import { usePersistentState } from "./usePersistentState";
 import type {
   ModelRegistry,
   ModelRegistryEntry,
-  ModelTrainingMethod,
 } from "./types";
 
-type SortKey = "name" | "family_method" | "val_loss" | "best_epoch" | "size_gb";
+type NumericSortKey = "val_loss" | "best_epoch" | "size_gb";
+type SortKey = "name" | "family_method" | NumericSortKey;
 type SortDirection = "asc" | "desc";
 type ModelFamily = "native" | "barbet";
 
 const EMPTY_REGISTRY: ModelRegistry = { _val_sets: {}, models: [] };
-const METHOD_LABELS: Record<ModelTrainingMethod, string> = {
+const METHOD_LABELS: Record<string, string> = {
   "full-finetune": "全參微調",
   lora: "LoRA",
+  "bluemagpie-pretrained": "預訓練／合併",
   "bluemagpie-tslm": "TSLM 訓練",
+  "bluemagpie-tslm-avg": "權重平均",
+  "bluemagpie-full": "Full 訓練",
   "bluemagpie-bridge": "Bridge 訓練",
 };
 
@@ -44,20 +47,50 @@ function getModelFamily(model: ModelRegistryEntry): ModelFamily {
   return model.method.startsWith("bluemagpie-") ? "barbet" : "native";
 }
 
-const METHOD_DESCRIPTIONS: Partial<Record<ModelTrainingMethod, string>> = {
+const METHOD_DESCRIPTIONS: Record<string, string> = {
+  "bluemagpie-pretrained": "未經本專案訓練的官方基礎模型，或由既有權重合併而成的模型。",
   "bluemagpie-bridge":
     "只訓練橋接層（約 1.5% 參數），用來對齊 Barbet 與 VoxCPM2 的隱藏表示空間。",
   "bluemagpie-tslm":
     "訓練橋接層、Barbet TSLM 與語者投影層，VoxCPM2 聲學主幹維持凍結。",
+  "bluemagpie-tslm-avg": "由同一輪訓練的多個 checkpoint 進行權重平均。",
+  "bluemagpie-full": "除 AudioVAE 外解凍完整 BlueMagpie 模型進行訓練。",
 };
+
+function getMethodLabel(method: string): string {
+  return METHOD_LABELS[method] || method;
+}
+
+function isFiniteNumber(value: number | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function compareOptionalNumbers(
+  left: number | undefined,
+  right: number | undefined,
+  direction: SortDirection,
+): number {
+  const leftIsNumber = isFiniteNumber(left);
+  const rightIsNumber = isFiniteNumber(right);
+  if (!leftIsNumber || !rightIsNumber) {
+    if (leftIsNumber === rightIsNumber) {
+      return 0;
+    }
+    // Missing metrics stay at the bottom for both ascending and descending sorts.
+    return leftIsNumber ? -1 : 1;
+  }
+  return direction === "asc" ? left - right : right - left;
+}
 
 function compareModels(
   left: ModelRegistryEntry,
   right: ModelRegistryEntry,
   sortKey: SortKey,
+  direction: SortDirection,
 ): number {
+  const directionFactor = direction === "asc" ? 1 : -1;
   if (sortKey === "name") {
-    return left.name.localeCompare(right.name, "zh-TW");
+    return left.name.localeCompare(right.name, "zh-TW") * directionFactor;
   }
 
   if (sortKey === "family_method") {
@@ -65,17 +98,28 @@ function compareModels(
       FAMILY_LABELS[getModelFamily(right)],
       "zh-TW",
     );
-    const methodDifference = METHOD_LABELS[left.method].localeCompare(
-      METHOD_LABELS[right.method],
+    const methodDifference = getMethodLabel(left.method).localeCompare(
+      getMethodLabel(right.method),
       "zh-TW",
     );
-    return familyDifference || methodDifference;
+    return (familyDifference || methodDifference) * directionFactor;
   }
 
-  return left[sortKey] - right[sortKey];
+  return compareOptionalNumbers(left[sortKey], right[sortKey], direction);
 }
 
-function formatSize(sizeGb: number): string {
+function formatMetric(value: number | undefined, digits: number): string {
+  return isFiniteNumber(value) ? value.toFixed(digits) : "—";
+}
+
+function formatStep(step: number | undefined): string {
+  return isFiniteNumber(step) ? step.toLocaleString("zh-TW") : "—";
+}
+
+function formatSize(sizeGb: number | undefined): string {
+  if (!isFiniteNumber(sizeGb)) {
+    return "—";
+  }
   if (sizeGb < 1) {
     return `${Math.round(sizeGb * 1000).toLocaleString("zh-TW")} MB`;
   }
@@ -212,9 +256,14 @@ export default function ModelComparison({ reloadToken }: ModelComparisonProps) {
         models: filteredModels
           .filter((model) => model.val_set === valSet)
           .sort((left, right) => {
-            const difference = compareModels(left, right, sortKey);
+            const difference = compareModels(
+              left,
+              right,
+              sortKey,
+              sortDirection,
+            );
             if (difference !== 0) {
-              return sortDirection === "asc" ? difference : -difference;
+              return difference;
             }
             return left.name.localeCompare(right.name, "zh-TW");
           }),
@@ -243,8 +292,9 @@ export default function ModelComparison({ reloadToken }: ModelComparisonProps) {
       <div className="comparison-warning" role="note">
         <Info size={19} />
         <p>
-          <strong>Val loss 只能在同一個驗證集內比較。</strong>
-          naer 的 0.93 不代表優於 tai8 的 1.09；排序只會改變各驗證集分組內的順序。
+          <strong>Val loss 只能在同一個驗證集內比較，也不等同實際聽感。</strong>
+          naer 的 0.93 不代表優於 tai8 的 1.09；未評估或刻意取後段 epoch
+          的模型會以「—」顯示，排序時置於該組末尾。
         </p>
       </div>
 
@@ -277,7 +327,7 @@ export default function ModelComparison({ reloadToken }: ModelComparisonProps) {
               <option value="">全部方法</option>
               {methods.map((method) => (
                 <option key={method} value={method}>
-                  {METHOD_LABELS[method as ModelTrainingMethod] || method}
+                  {getMethodLabel(method)}
                 </option>
               ))}
             </select>
@@ -341,9 +391,19 @@ export default function ModelComparison({ reloadToken }: ModelComparisonProps) {
             <section className="registry-group panel" key={group.valSet}>
               <header className="registry-group-heading">
                 <div>
-                  <span className="val-set-badge">VAL · {group.valSet}</span>
-                  <h3>{group.valSet} 驗證集</h3>
-                  <p>{group.description}</p>
+                  <span className="val-set-badge">
+                    {group.valSet === "-" ? "VAL · 未評估" : `VAL · ${group.valSet}`}
+                  </span>
+                  <h3>
+                    {group.valSet === "-"
+                      ? "未提供驗證結果"
+                      : `${group.valSet} 驗證集`}
+                  </h3>
+                  <p>
+                    {group.valSet === "-"
+                      ? "基礎或合併模型，未提供可供此表比較的驗證指標。"
+                      : group.description}
+                  </p>
                 </div>
                 <span>{group.models.length} 個模型</span>
               </header>
@@ -385,7 +445,7 @@ export default function ModelComparison({ reloadToken }: ModelComparisonProps) {
                           activeKey={sortKey}
                           direction={sortDirection}
                           field="best_epoch"
-                          label="最佳 Epoch"
+                          label="Epoch"
                           onSort={handleSort}
                         />
                       </th>
@@ -424,23 +484,37 @@ export default function ModelComparison({ reloadToken }: ModelComparisonProps) {
                             className="registry-arch"
                             title={METHOD_DESCRIPTIONS[model.method]}
                           >
-                            {METHOD_LABELS[model.method]} · {model.arch.match(/\((.+)\)/)?.[1] || model.arch}
+                            {getMethodLabel(model.method)} · {model.arch.match(/\((.+)\)/)?.[1] || model.arch}
                           </small>
                         </td>
                         <td>
                           <span className="data-set-label">{model.train_data}</span>
                         </td>
                         <td className="metric-cell primary-metric">
-                          {model.val_loss.toFixed(4)}
+                          {formatMetric(model.val_loss, 4)}
                         </td>
-                        <td className="metric-cell">{model.best_epoch.toFixed(2)}</td>
-                        <td className="metric-cell">{model.best_step.toLocaleString("zh-TW")}</td>
+                        <td className="metric-cell">
+                          {formatMetric(model.best_epoch, 2)}
+                        </td>
+                        <td className="metric-cell">{formatStep(model.best_step)}</td>
                         <td>
-                          <span className="training-detail">LR {model.lr}</span>
-                          <small>
-                            Batch {model.effective_batch}
-                            {model.lora_r ? ` · r${model.lora_r}` : ""}
-                          </small>
+                          {model.lr ||
+                          model.effective_batch !== undefined ||
+                          model.lora_r !== undefined ? (
+                            <>
+                              <span className="training-detail">
+                                {model.lr ? `LR ${model.lr}` : "LR —"}
+                              </span>
+                              <small>
+                                {model.effective_batch !== undefined
+                                  ? `Batch ${model.effective_batch}`
+                                  : "Batch —"}
+                                {model.lora_r ? ` · r${model.lora_r}` : ""}
+                              </small>
+                            </>
+                          ) : (
+                            <span className="training-detail">—</span>
+                          )}
                         </td>
                         <td className="metric-cell size-cell">{formatSize(model.size_gb)}</td>
                       </tr>

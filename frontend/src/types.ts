@@ -100,8 +100,12 @@ export interface HistoryItem {
 export type ModelTrainingMethod =
   | "full-finetune"
   | "lora"
+  | "bluemagpie-pretrained"
   | "bluemagpie-tslm"
-  | "bluemagpie-bridge";
+  | "bluemagpie-tslm-avg"
+  | "bluemagpie-full"
+  | "bluemagpie-bridge"
+  | (string & {});
 
 export interface ModelRegistryEntry {
   name: string;
@@ -109,12 +113,12 @@ export interface ModelRegistryEntry {
   arch: string;
   train_data: string;
   val_set: string;
-  val_loss: number;
-  best_epoch: number;
-  best_step: number;
-  lr: string;
-  effective_batch: number;
-  size_gb: number;
+  val_loss?: number;
+  best_epoch?: number;
+  best_step?: number;
+  lr?: string;
+  effective_batch?: number;
+  size_gb?: number;
   lora_r?: number;
   note?: string;
 }
