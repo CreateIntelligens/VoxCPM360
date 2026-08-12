@@ -619,8 +619,14 @@ def create_app(
                     )
 
             if engine_id == "voxcpm2":
-                # 使用者沒指定就帶入預設語言指令（見 _DEFAULT_CONTROL_INSTRUCTION）
-                if not control_instruction.strip():
+                # prompt cloning 與文字控制是兩條互斥路徑。VoxCPM2 並沒有獨立的
+                # instruction channel；app.py 會把 control 包成「(指令)正文」送進
+                # TSLM。若同時帶 prompt 音訊／逐字稿，部分微調模型會把指令當正文
+                # 朗讀出來。舊版 Gradio 也明確在 cloning 模式清空 control。
+                if active_reference and prompt_text.strip():
+                    control_instruction = ""
+                # 非 cloning 模式下，使用者沒指定才帶入預設語言指令。
+                elif not control_instruction.strip():
                     control_instruction = _DEFAULT_CONTROL_INSTRUCTION
                 wav, extra_headers = await gateway.synthesize_native(
                     model_id=model_id,

@@ -18,6 +18,7 @@ class FakeRegistry:
 class FakeServer:
     def __init__(self):
         self.lora_names = []
+        self.target_texts = []
 
     def generate(
         self,
@@ -31,6 +32,7 @@ class FakeServer:
         lora_name=None,
     ):
         self.lora_names.append(lora_name)
+        self.target_texts.append(target_text)
         yield np.zeros(16, dtype=np.float32)
 
     def get_model_info(self):
@@ -57,6 +59,29 @@ def test_generate_passes_selected_lora_to_nano_server():
     assert audio.shape == (16,)
     assert registry.selections == ["trial_lora_20epochs"]
     assert server.lora_names == ["trial-adapter"]
+
+
+def test_prompt_cloning_does_not_prefix_control_instruction(tmp_path):
+    server = FakeServer()
+    demo = VoxCPMDemo.__new__(VoxCPMDemo)
+    demo.voxcpm_server = server
+    demo.lora_registry = FakeRegistry()
+    demo.text_normalizer = None
+    demo.denoiser = None
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    server.encode_latents = lambda *_args: np.zeros((1, 1), dtype=np.float32)
+
+    demo.generate_tts_audio(
+        text_input="真正要說的內容",
+        control_instruction="用女聲說",
+        reference_wav_path_input=str(reference),
+        prompt_text="參考音訊內容",
+        do_normalize=False,
+        denoise=False,
+    )
+
+    assert server.target_texts == ["真正要說的內容"]
 
 
 def test_defaults_to_guarded_gpu_memory_utilization(monkeypatch, tmp_path):

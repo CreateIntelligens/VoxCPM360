@@ -380,11 +380,16 @@ class VoxCPMDemo:
 
         lora_name = self.lora_registry.ensure_registered(server, model_selection)
 
+        prompt_text_clean = (prompt_text or "").strip() or None
         control = (control_instruction or "").strip()
         control = re.sub(r"[()（）]", "", control).strip()
+        # Voice cloning（音訊 + 對應逐字稿）與文字控制不可同時使用。
+        # control 並非獨立條件，而是直接前綴到 target text；兩者並用時部分模型
+        # 會把「用台語說／雀躍女生」真的念出來。API 端也會清空，這裡再做一層
+        # 防護，涵蓋舊版 UI 或其他直接呼叫者。
+        if reference_wav_path_input and prompt_text_clean:
+            control = ""
         final_text = f"({control}){text}" if control else text
-
-        prompt_text_clean = (prompt_text or "").strip() or None
 
         if reference_wav_path_input and prompt_text_clean:
             logger.info(f"[Voice Cloning] prompt_wav + prompt_text + reference_wav")

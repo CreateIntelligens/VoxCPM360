@@ -176,6 +176,55 @@ def test_native_synthesis_uses_selected_reference_preset(
 
     assert response.status_code == 200
     assert demo.calls[0]["reference_wav_path_input"] == str(selected_reference)
+    assert demo.calls[0]["prompt_text"] == "只要一套比基尼這樣就夠了"
+    assert demo.calls[0]["control_instruction"] == ""
+
+
+def test_native_prompt_cloning_drops_explicit_control_instruction(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    demo = FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/synthesize",
+            data={
+                "engine_id": "voxcpm2",
+                "model_id": "__base__",
+                "text": "台語測試",
+                "control_instruction": "用女聲說",
+                "prompt_text": "參考音訊內容",
+            },
+            files={"reference_audio": ("custom.wav", b"RIFF", "audio/wav")},
+        )
+        history_item = client.get("/api/v1/history?limit=1").json()["items"][0]
+
+    assert response.status_code == 200
+    assert demo.calls[0]["control_instruction"] == ""
+    assert demo.calls[0]["prompt_text"] == "參考音訊內容"
+    assert history_item["control_instruction"] is None
+
+
+def test_native_control_instruction_is_preserved_without_prompt_transcript(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    demo = FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/synthesize",
+            data={
+                "engine_id": "voxcpm2",
+                "model_id": "__base__",
+                "text": "台語測試",
+                "control_instruction": "溫暖沉穩",
+            },
+            files={"reference_audio": ("custom.wav", b"RIFF", "audio/wav")},
+        )
+
+    assert response.status_code == 200
+    assert demo.calls[0]["control_instruction"] == "溫暖沉穩"
+    assert demo.calls[0]["prompt_text"] == ""
 
 
 def test_uploaded_reference_overrides_selected_preset(monkeypatch):

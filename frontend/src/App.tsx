@@ -126,6 +126,9 @@ function App() {
       ),
     [catalog.reference_presets, referencePresetId],
   );
+  const promptCloningActive = Boolean(
+    promptText.trim() && (referenceAudio || selectedReferencePreset),
+  );
 
   // 內建聲音的逐字稿是固定事實，直接填入並鎖為唯讀 —— 改了只會讓克隆變差。
   // 自訂上傳時清空並開放編輯：我們不知道使用者的音檔在講什麼，只能由他自己填。
@@ -315,7 +318,7 @@ function App() {
         engineId: selectedEngine.id,
         modelId: selectedModel.id,
         text: targetText,
-        controlInstruction,
+        controlInstruction: promptCloningActive ? "" : controlInstruction,
         promptText,
         referencePresetId,
         speakerId,
@@ -644,8 +647,21 @@ function App() {
                       onChange={(event) =>
                         setControlInstruction(event.target.value)
                       }
+                      disabled={promptCloningActive}
+                      aria-describedby={
+                        promptCloningActive ? "control-instruction-help" : undefined
+                      }
                       placeholder="例如：溫暖、沉穩、語速稍慢"
                     />
+                    {promptCloningActive && (
+                      <small
+                        id="control-instruction-help"
+                        className="field-helper"
+                      >
+                        使用參考音與逐字稿時由聲音克隆控制語氣；為避免模型朗讀指令，
+                        此欄不會送入模型。
+                      </small>
+                    )}
                   </label>
                 )}
                 {supportsPromptTranscript && (

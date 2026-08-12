@@ -910,6 +910,19 @@ select:focus {
   font-size: 11px;
 }
 
+.form-row input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.field-helper {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
 .upload-section {
   margin-top: 18px;
   display: grid;
