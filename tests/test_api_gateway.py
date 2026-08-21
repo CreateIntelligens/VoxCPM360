@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +15,7 @@ import api
 @pytest.fixture(autouse=True)
 def isolate_generation_history(monkeypatch, tmp_path):
     monkeypatch.setattr(api, "_HISTORY_DIR", tmp_path / "generation_history")
+    monkeypatch.setattr(api, "_CASTVOICE_BATCH_DIR", tmp_path / "castvoice_batches")
 
 
 class FakeRegistry:
@@ -50,6 +56,13 @@ class FakeBarbetCheckpoint:
     valid = True
 
 
+class FakeBarbetCheckpointV2:
+    id = "barbet::barbet-tw-v2"
+    label = "Barbet 台語 v2"
+    description = "本機測試模型 v2"
+    valid = True
+
+
 class FakeBarbetRegistry:
     def __init__(self, checkpoints=()):
         self.checkpoints = tuple(checkpoints)
@@ -68,14 +81,22 @@ class FakeBarbetRegistry:
 
 
 class FakeBarbetRuntime:
-    def __init__(self, checkpoints=()):
+    def __init__(
+        self,
+        checkpoints=(),
+        speakers=({"id": "voice-a", "name": "Voice A", "gender": "unknown"},),
+        speakers_by_checkpoint=None,
+    ):
         self.registry = FakeBarbetRegistry(checkpoints)
         self.loaded_model_id = None
         self.calls = []
+        self._speakers = list(speakers)
+        self._speakers_by_checkpoint = speakers_by_checkpoint or {}
 
     def speakers(self, checkpoint):
-        del checkpoint
-        return [{"id": "voice-a", "name": "Voice A"}]
+        if checkpoint.id in self._speakers_by_checkpoint:
+            return self._speakers_by_checkpoint[checkpoint.id]
+        return self._speakers
 
     def synthesize(self, **kwargs):
         self.calls.append(kwargs)
@@ -270,6 +291,10 @@ def test_native_synthesis_returns_wav(monkeypatch):
     assert response.status_code == 200
     assert response.headers["content-type"] == "audio/wav"
     assert response.content.startswith(b"RIFF")
+    assert response.headers["x-request-id"]
+    assert response.headers["x-queue-wait"].endswith("s")
+    assert response.headers["x-gpu-job-time"].endswith("s")
+    assert response.headers["x-total-time"].endswith("s")
     assert demo.calls[0]["inference_timesteps"] == 8
 
 
@@ -349,3 +374,478 @@ def test_local_barbet_catalog_and_synthesis(monkeypatch):
     assert history_item["seed"] == actual_seed
     assert audio_response.status_code == 200
     assert audio_response.content.startswith(b"RIFF")
+
+
+def test_native_and_barbet_share_bounded_gpu_queue(monkeypatch):
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "1")
+    monkeypatch.setenv("VOXCPM_QUEUE_TIMEOUT_SECONDS", "1")
+
+    native_started = threading.Event()
+    release_native = threading.Event()
+
+    class BlockingDemo(FakeDemo):
+        def generate_tts_audio(self, **kwargs):
+            self.calls.append(kwargs)
+            native_started.set()
+            assert release_native.wait(timeout=2)
+            return 16_000, np.zeros(320, dtype=np.float32)
+
+    demo = BlockingDemo()
+    runtime = FakeBarbetRuntime(checkpoints=(FakeBarbetCheckpoint(),))
+    gateway = api.TTSGateway(demo, barbet_runtime=runtime)
+
+    async def run_scenario():
+        native_task = asyncio.create_task(
+            gateway.synthesize_native(
+                request_id="native-active",
+                model_id="__base__",
+                text="第一筆",
+                control_instruction="",
+                reference_path=None,
+                prompt_text="",
+                cfg_value=2.0,
+                normalize=False,
+                denoise=False,
+                inference_timesteps=10,
+            )
+        )
+        assert await asyncio.to_thread(native_started.wait, 1)
+
+        barbet_task = asyncio.create_task(
+            gateway.synthesize_barbet(
+                request_id="barbet-waiting",
+                model_id="barbet::barbet-tw-v1",
+                text="第二筆",
+                reference_path=None,
+                prompt_text="",
+                speaker_id="voice-a",
+                cfg_value=2.0,
+                inference_timesteps=10,
+                seed=1,
+            )
+        )
+        for _ in range(20):
+            if gateway._inflight_jobs == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        assert gateway._inflight_jobs == 2
+        assert runtime.calls == []
+        with pytest.raises(api.HTTPException) as exc_info:
+            await gateway.synthesize_native(
+                request_id="native-rejected",
+                model_id="__base__",
+                text="第三筆",
+                control_instruction="",
+                reference_path=None,
+                prompt_text="",
+                cfg_value=2.0,
+                normalize=False,
+                denoise=False,
+                inference_timesteps=10,
+            )
+        assert exc_info.value.status_code == 429
+
+        release_native.set()
+        await asyncio.gather(native_task, barbet_task)
+
+    asyncio.run(run_scenario())
+    assert len(runtime.calls) == 1
+
+
+def test_gpu_queue_wait_has_server_side_timeout(monkeypatch):
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "1")
+    monkeypatch.setenv("VOXCPM_QUEUE_TIMEOUT_SECONDS", "0.02")
+
+    native_started = threading.Event()
+    release_native = threading.Event()
+
+    class BlockingDemo(FakeDemo):
+        def generate_tts_audio(self, **kwargs):
+            self.calls.append(kwargs)
+            native_started.set()
+            assert release_native.wait(timeout=2)
+            return 16_000, np.zeros(320, dtype=np.float32)
+
+    gateway = api.TTSGateway(
+        BlockingDemo(),
+        barbet_runtime=FakeBarbetRuntime(checkpoints=(FakeBarbetCheckpoint(),)),
+    )
+
+    async def run_scenario():
+        active_task = asyncio.create_task(
+            gateway.synthesize_native(
+                request_id="native-active",
+                model_id="__base__",
+                text="第一筆",
+                control_instruction="",
+                reference_path=None,
+                prompt_text="",
+                cfg_value=2.0,
+                normalize=False,
+                denoise=False,
+                inference_timesteps=10,
+            )
+        )
+        assert await asyncio.to_thread(native_started.wait, 1)
+        with pytest.raises(api.HTTPException) as exc_info:
+            await gateway.synthesize_barbet(
+                request_id="barbet-timeout",
+                model_id="barbet::barbet-tw-v1",
+                text="第二筆",
+                reference_path=None,
+                prompt_text="",
+                speaker_id="voice-a",
+                cfg_value=2.0,
+                inference_timesteps=10,
+                seed=1,
+            )
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.headers["X-Request-ID"] == "barbet-timeout"
+        release_native.set()
+        await active_task
+
+    asyncio.run(run_scenario())
+
+
+def test_castvoice_voices_lists_available_voxcpm2_and_barbet_voices(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    runtime = FakeBarbetRuntime(
+        checkpoints=(FakeBarbetCheckpoint(),),
+        speakers=({"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"},),
+    )
+    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/tts/voices")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model_version"]
+    voice_ids = {voice["voice_id"] for voice in body["voices"]}
+    assert voice_ids == {
+        "voxcpm2-tai8-female-01",
+        "voxcpm2-tai8-male-01",
+        "voxcpm2-hayley-01",
+        "barbet-hung-yi-lee",
+    }
+    for voice in body["voices"]:
+        assert voice["gender"] in {"male", "female", "unknown"}
+
+
+def test_castvoice_voices_omits_barbet_when_speaker_unavailable(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    # No checkpoints exposes "hung_yi_lee", so the barbet voice must drop out.
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        voice_ids = {v["voice_id"] for v in client.get("/api/v1/tts/voices").json()["voices"]}
+
+    assert "barbet-hung-yi-lee" not in voice_ids
+    assert "voxcpm2-tai8-female-01" in voice_ids
+
+
+def test_castvoice_synthesize_returns_mp3_for_voxcpm2_voice(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    demo = FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={"text": "台語測試", "voice_id": "voxcpm2-tai8-female-01"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert len(response.content) > 0
+    assert response.headers["x-request-id"]
+    # Cloning mode: control_instruction must be cleared, prompt_text carried in.
+    assert demo.calls[0]["control_instruction"] == ""
+    assert demo.calls[0]["prompt_text"]
+
+
+def test_castvoice_synthesize_returns_mp3_for_barbet_voice(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    runtime = FakeBarbetRuntime(
+        checkpoints=(FakeBarbetCheckpoint(),),
+        speakers=({"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"},),
+    )
+    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={"text": "逐家好", "voice_id": "barbet-hung-yi-lee"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert runtime.calls[0]["speaker_id"] == "hung_yi_lee"
+    assert runtime.calls[0]["model_id"] == "barbet::barbet-tw-v1"
+
+
+def test_castvoice_synthesize_rejects_empty_text(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={"text": "  ", "voice_id": "voxcpm2-tai8-female-01"},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_text", "message": "text 不可為空白"}
+
+
+def test_castvoice_synthesize_rejects_unknown_voice(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={"text": "hi", "voice_id": "does-not-exist"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "voice_not_found"
+
+
+def test_castvoice_synthesize_rejects_unsupported_format(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={"text": "hi", "voice_id": "voxcpm2-tai8-female-01", "format": "wav"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "unsupported_format"
+
+
+def test_castvoice_synthesize_requires_bearer_token_when_configured(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setattr(api, "_TTS_API_KEY", "secret-token")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        unauthorized = client.post(
+            "/api/v1/tts/synthesize",
+            json={"text": "hi", "voice_id": "voxcpm2-tai8-female-01"},
+        )
+        authorized = client.post(
+            "/api/v1/tts/synthesize",
+            json={"text": "hi", "voice_id": "voxcpm2-tai8-female-01"},
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+
+
+def test_castvoice_synthesize_returns_429_with_retry_after_when_queue_full(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "0")
+
+    native_started = threading.Event()
+    release_native = threading.Event()
+
+    class BlockingDemo(FakeDemo):
+        def generate_tts_audio(self, **kwargs):
+            self.calls.append(kwargs)
+            native_started.set()
+            assert release_native.wait(timeout=2)
+            return 16_000, np.zeros(320, dtype=np.float32)
+
+    app = api.create_app(BlockingDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                client.post,
+                "/api/v1/tts/synthesize",
+                json={"text": "第一筆", "voice_id": "voxcpm2-tai8-female-01"},
+            )
+            assert native_started.wait(timeout=2)
+            second = client.post(
+                "/api/v1/tts/synthesize",
+                json={"text": "第二筆", "voice_id": "voxcpm2-tai8-female-01"},
+            )
+            release_native.set()
+            first_response = first.result()
+
+    assert second.status_code == 429
+    assert second.json()["error"] == "rate_limited"
+    assert second.headers["retry-after"] == "30"
+    assert first_response.status_code == 200
+
+
+def test_castvoice_synthesize_accepts_valid_voxcpm2_model_override(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    demo = FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "hi",
+                "voice_id": "voxcpm2-tai8-female-01",
+                "model_id": "__base__",
+            },
+        )
+
+    assert response.status_code == 200
+    assert demo.calls[0]["model_selection"] == "__base__"
+
+
+def test_castvoice_synthesize_rejects_unknown_voxcpm2_model_override(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "hi",
+                "voice_id": "voxcpm2-tai8-female-01",
+                "model_id": "does-not-exist",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "model_not_found"
+
+
+def test_castvoice_synthesize_accepts_valid_barbet_model_override(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    runtime = FakeBarbetRuntime(
+        checkpoints=(FakeBarbetCheckpoint(), FakeBarbetCheckpointV2()),
+        speakers_by_checkpoint={
+            "barbet::barbet-tw-v1": [
+                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
+            ],
+            "barbet::barbet-tw-v2": [
+                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
+            ],
+        },
+    )
+    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "逐家好",
+                "voice_id": "barbet-hung-yi-lee",
+                "model_id": "barbet::barbet-tw-v2",
+            },
+        )
+
+    assert response.status_code == 200
+    assert runtime.calls[0]["model_id"] == "barbet::barbet-tw-v2"
+    assert runtime.calls[0]["speaker_id"] == "hung_yi_lee"
+
+
+def test_castvoice_synthesize_rejects_barbet_model_without_requested_speaker(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    runtime = FakeBarbetRuntime(
+        checkpoints=(FakeBarbetCheckpoint(), FakeBarbetCheckpointV2()),
+        speakers_by_checkpoint={
+            "barbet::barbet-tw-v1": [
+                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
+            ],
+            "barbet::barbet-tw-v2": [
+                {"id": "someone_else", "name": "別人", "gender": "female"}
+            ],
+        },
+    )
+    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "逐家好",
+                "voice_id": "barbet-hung-yi-lee",
+                "model_id": "barbet::barbet-tw-v2",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "model_not_found"
+
+
+def test_castvoice_synthesize_rejects_unknown_barbet_model_override(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    runtime = FakeBarbetRuntime(
+        checkpoints=(FakeBarbetCheckpoint(),),
+        speakers_by_checkpoint={
+            "barbet::barbet-tw-v1": [
+                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
+            ],
+        },
+    )
+    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "逐家好",
+                "voice_id": "barbet-hung-yi-lee",
+                "model_id": "does-not-exist",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "model_not_found"
+
+
+def test_castvoice_batch_item_supports_model_override(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    runtime = FakeBarbetRuntime(
+        checkpoints=(FakeBarbetCheckpoint(), FakeBarbetCheckpointV2()),
+        speakers_by_checkpoint={
+            "barbet::barbet-tw-v1": [
+                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
+            ],
+            "barbet::barbet-tw-v2": [
+                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
+            ],
+        },
+    )
+    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+
+    with TestClient(app) as client:
+        submit = client.post(
+            "/api/v1/tts/synthesize/batch",
+            json={
+                "items": [
+                    {
+                        "text": "逐家好",
+                        "voice_id": "barbet-hung-yi-lee",
+                        "model_id": "barbet::barbet-tw-v2",
+                    }
+                ]
+            },
+        )
+        assert submit.status_code == 202
+        batch_id = submit.json()["batch_id"]
+
+        deadline = time.monotonic() + 5.0
+        status = None
+        while time.monotonic() < deadline:
+            status = client.get(f"/api/v1/tts/synthesize/batch/{batch_id}").json()
+            if status["done"]:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("batch did not finish in time")
+
+    assert status["items"][0]["status"] == "done"
+    assert runtime.calls[0]["model_id"] == "barbet::barbet-tw-v2"

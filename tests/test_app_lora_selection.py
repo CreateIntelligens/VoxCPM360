@@ -19,6 +19,7 @@ class FakeServer:
     def __init__(self):
         self.lora_names = []
         self.target_texts = []
+        self.max_generate_lengths = []
 
     def generate(
         self,
@@ -33,6 +34,7 @@ class FakeServer:
     ):
         self.lora_names.append(lora_name)
         self.target_texts.append(target_text)
+        self.max_generate_lengths.append(max_generate_length)
         yield np.zeros(16, dtype=np.float32)
 
     def get_model_info(self):
@@ -59,6 +61,26 @@ def test_generate_passes_selected_lora_to_nano_server():
     assert audio.shape == (16,)
     assert registry.selections == ["trial_lora_20epochs"]
     assert server.lora_names == ["trial-adapter"]
+    assert server.max_generate_lengths == [22]
+
+
+def test_generate_length_guard_is_configurable():
+    server = FakeServer()
+    demo = VoxCPMDemo.__new__(VoxCPMDemo)
+    demo.voxcpm_server = server
+    demo.lora_registry = FakeRegistry()
+    demo.text_normalizer = None
+    demo.denoiser = None
+    demo.max_generate_length = 15
+    demo.max_audio_text_ratio = 3.0
+
+    demo.generate_tts_audio(
+        text_input="這是一段較長的測試文字",
+        do_normalize=False,
+        denoise=False,
+    )
+
+    assert server.max_generate_lengths == [15]
 
 
 def test_prompt_cloning_does_not_prefix_control_instruction(tmp_path):

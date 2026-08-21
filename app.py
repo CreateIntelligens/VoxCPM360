@@ -243,11 +243,24 @@ class VoxCPMDemo:
         )
         if not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError("VOXCPM_GPU_MEMORY_UTILIZATION must be in (0, 1]")
+        self.max_generate_length = int(
+            os.environ.get("VOXCPM_MAX_GENERATE_LENGTH", "2000")
+        )
+        if self.max_generate_length < 1:
+            raise ValueError("VOXCPM_MAX_GENERATE_LENGTH must be >= 1")
+        self.max_audio_text_ratio = float(
+            os.environ.get("VOXCPM_MAX_AUDIO_TEXT_RATIO", "6.0")
+        )
+        if self.max_audio_text_ratio <= 0:
+            raise ValueError("VOXCPM_MAX_AUDIO_TEXT_RATIO must be > 0")
         logger.info(
-            "Running VoxCPM on device: %s (optimize=%s, gpu_memory_utilization=%.2f)",
+            "Running VoxCPM on device: %s (optimize=%s, gpu_memory_utilization=%.2f, "
+            "max_generate_length=%d, max_audio_text_ratio=%.1f)",
             self.device,
             self.optimize,
             self.gpu_memory_utilization,
+            self.max_generate_length,
+            self.max_audio_text_ratio,
         )
 
         self.asr_model_id = "iic/SenseVoiceSmall"
@@ -439,7 +452,26 @@ class VoxCPMDemo:
                     ref_audio_latents = encoded
 
             # 4. Generate audio via Server Pool
-            logger.info(f"Generating audio with vLLM engine for text: '{final_text[:80]}...'")
+            # The bundled PyTorch runtime limits generation to roughly six
+            # audio tokens per target text token.  nano-vLLM only applies the
+            # absolute 2000-token ceiling, so a missed EOS could occupy the GPU
+            # for 9-11 minutes.  Chinese text is deliberately tokenized one
+            # character at a time by VoxCPM2; len(final_text) is therefore the
+            # matching estimate here (and a conservative overestimate for most
+            # Latin text).
+            text_length = max(1, len(final_text))
+            length_from_text = int(
+                text_length * getattr(self, "max_audio_text_ratio", 6.0) + 10
+            )
+            max_generate_length = min(
+                getattr(self, "max_generate_length", 2000), length_from_text
+            )
+            logger.info(
+                "Generating audio with vLLM engine for text: '%s...' "
+                "(max_generate_length=%d)",
+                final_text[:80],
+                max_generate_length,
+            )
             buf = []
             
             generate_kwargs = {
@@ -447,7 +479,7 @@ class VoxCPMDemo:
                 "prompt_latents": prompt_latents,
                 "prompt_text": prompt_text_clean if prompt_text_clean else "",
                 "cfg_value": float(cfg_value_input),
-                "max_generate_length": 2000,
+                "max_generate_length": max_generate_length,
                 "temperature": 1.0,
                 "lora_name": lora_name,
             }

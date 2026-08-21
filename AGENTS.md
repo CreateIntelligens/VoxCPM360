@@ -443,6 +443,20 @@ nginx ─┬─ /        → web 服務（React 靜態檔，multi-stage build �
 提到 25~30 明顯較穩；`prompt_text` 填參考音的逐字稿可讓音色與內容解耦；
 `cfg_value` 2.0→2.5 更貼合 reference。
 
-**重建**：`docker compose up -d --build web`（前端）／
-`docker compose restart app`（api.py）。
+**生成佇列與長尾防護（2026-08-17）**：VoxCPM2／Barbet 共用同一張 GPU，
+`api.py` 已改為共用單一 GPU gate，不可再拆成兩把 engine lock。預設僅 1 個任務
+執行、最多 2 個等待；滿載回 429，等待超過 120 秒回 503。client 中斷時必須繼續
+持有 gate，直到已進入 thread/CUDA 的工作結束，否則下一筆會和殘留工作同時進 GPU。
+每筆 response 帶 `X-Request-ID`／`X-Queue-Wait`／`X-GPU-Job-Time`／`X-Total-Time`，
+log 以 `received → queued → started → completed/rejected` 追蹤。相關環境變數：
+`VOXCPM_MAX_PENDING_SYNTHESIS`、`VOXCPM_QUEUE_TIMEOUT_SECONDS`。
 
+VoxCPM2 的 nano-vLLM 原本只設固定 `max_generate_length=2000`，missed EOS 時實測會
+占 GPU 9~11 分鐘；現已比照上游 runtime，把實際上限設為
+`min(VOXCPM_MAX_GENERATE_LENGTH, 文字長度 × VOXCPM_MAX_AUDIO_TEXT_RATIO + 10)`，
+ratio 預設 6.0。`application/x-www-form-urlencoded` 與 `multipart/form-data` 都支援；
+8/15 的 499/504 也出現在瀏覽器 multipart，故**表單編碼不是根因**。
+
+**重建**：`docker compose up -d --build web`（前端）／
+`docker compose restart app`（只改 Python）／若改 compose 環境變數則用
+`docker compose up -d --no-deps --force-recreate app`。

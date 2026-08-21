@@ -15,6 +15,7 @@ from voxcpm.barbet_registry import BarbetCheckpoint, BarbetModelRegistry
 logger = logging.getLogger(__name__)
 
 _SPEAKER_LABELS = {"hung_yi_lee": "李宏毅老師"}
+_SPEAKER_GENDERS = {"hung_yi_lee": "male"}
 
 
 class BarbetRuntime:
@@ -50,6 +51,7 @@ class BarbetRuntime:
                 speakers[speaker_id] = {
                     "id": speaker_id,
                     "name": _SPEAKER_LABELS.get(speaker_id, speaker_id),
+                    "gender": _SPEAKER_GENDERS.get(speaker_id, "unknown"),
                     "desc": "模型內建語者",
                     "is_custom": False,
                 }
@@ -149,7 +151,9 @@ class BarbetRuntime:
                 speaker_centroid=centroid,
                 cfg_value=cfg_value,
                 inference_timesteps=inference_timesteps,
-                retry_badcase=True,
+                # 官方 release_metadata.json 的 inference_policies 明寫
+                # retry_badcase: False —— 我們原本設 True，與官方相反。
+                retry_badcase=False,
                 seed=seed,
             )
             elapsed = time.perf_counter() - started_at

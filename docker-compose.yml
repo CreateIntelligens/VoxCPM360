@@ -23,9 +23,21 @@ services:
       - VOXCPM_OPTIMIZE=${VOXCPM_OPTIMIZE:-false}
       - VOXCPM_GPU_MEMORY_UTILIZATION=${VOXCPM_GPU_MEMORY_UTILIZATION:-0.35}
       - VOXCPM_PRELOAD=${VOXCPM_PRELOAD:-true}
+      # One GB10 GPU is shared by both engines. Keep one active job, allow at
+      # most two waiters, and fail queued requests explicitly instead of
+      # leaving HTTP connections hanging until nginx's 900-second timeout.
+      - VOXCPM_MAX_PENDING_SYNTHESIS=${VOXCPM_MAX_PENDING_SYNTHESIS:-2}
+      - VOXCPM_QUEUE_TIMEOUT_SECONDS=${VOXCPM_QUEUE_TIMEOUT_SECONDS:-120}
+      # Match the upstream VoxCPM bad-case guard: cap audio generation relative
+      # to target text length so a missed EOS cannot always run to 2000 tokens.
+      - VOXCPM_MAX_GENERATE_LENGTH=${VOXCPM_MAX_GENERATE_LENGTH:-2000}
+      - VOXCPM_MAX_AUDIO_TEXT_RATIO=${VOXCPM_MAX_AUDIO_TEXT_RATIO:-6.0}
       - VOXCPM_LORA_ROOTS=/app/models/native:/app/checkpoints
       - VOXCPM_FULL_MODEL_ROOTS=/app/models/native:/app/checkpoints
       - VOXCPM_BARBET_MODEL_ROOTS=/app/models/barbet
+      # Bearer token for the CastAgent-compatible /api/v1/tts/* endpoints.
+      # Blank disables auth (local development only).
+      - TTS_API_KEY=${TTS_API_KEY:-}
       # GB10 (Grace-Blackwell) reports sm_121, but torch cu128 nvrtc only knows up
       # to sm_120, so runtime JIT fusion (e.g. the @torch.jit.script snake op) fails
       # with "invalid value for --gpu-architecture". Disable JIT so these run eager.

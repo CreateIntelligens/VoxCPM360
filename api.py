@@ -7,19 +7,23 @@ import json
 import logging
 import os
 import secrets
+import subprocess
 import tempfile
+import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import librosa
 import numpy as np
 import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel
 
 from app import VoxCPMDemo, create_demo_interface
 from voxcpm.barbet_registry import BarbetModelRegistry
@@ -43,6 +47,8 @@ _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
         "filename": "tai8_drama1_005.wav",
         "description": "tai8 台語劇集片段，約 5.2 秒",
         "prompt_text": "碧玉拿給我看他先生的相片好像不是長這樣",
+        "gender": "female",
+        "language": "nan-TW",
     },
     {
         "id": "middle-aged-male",
@@ -50,6 +56,8 @@ _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
         "filename": "tai8_female_drama1_002.wav",
         "description": "tai8 台語劇集片段，約 2.7 秒",
         "prompt_text": "只要一套比基尼這樣就夠了",
+        "gender": "male",
+        "language": "nan-TW",
     },
     {
         "id": "hayley-happy-opening",
@@ -57,9 +65,67 @@ _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
         "filename": "hayley_happy_opening.mp3",
         "description": "Hayley 開心語氣開場白，約 12.9 秒",
         "prompt_text": "Hi，我是創造智能的 AI 代言人愛卡，想知道你的 MBTI 是哪一型嗎？還是對我們的 AI 服務好奇，我都可以告訴你，快來跟我聊聊吧！",
+        "gender": "female",
+        "language": "zh-TW",
     },
 )
 _DEFAULT_REFERENCE_PRESET_ID = "middle-aged-female"
+
+# CastAgent 自建 TTS API 規格採用固定的「演員聲音」清單，而不是把
+# engine/model/speaker 的排列組合整個攤平給外部服務。這裡手動選一小批
+# 品質確認過的聲音出來，voice_id 是外部合約的一部分、不可隨便改名。
+_CASTVOICE_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    {
+        "voice_id": "voxcpm2-tai8-female-01",
+        "label": "碧玉（台語・女）",
+        "gender": "female",
+        "language": "nan-TW",
+        "desc": "tai8 台語劇集片段訓練的中年女聲，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "middle-aged-female",
+    },
+    {
+        "voice_id": "voxcpm2-tai8-male-01",
+        "label": "台語中年男聲",
+        "gender": "male",
+        "language": "nan-TW",
+        "desc": "tai8 台語劇集片段訓練的中年男聲，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "middle-aged-male",
+    },
+    {
+        "voice_id": "voxcpm2-hayley-01",
+        "label": "Hayley（華語・女）",
+        "gender": "female",
+        "language": "zh-TW",
+        "desc": "Hayley 開心語氣，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "hayley-happy-opening",
+    },
+    {
+        "voice_id": "barbet-hung-yi-lee",
+        "label": "李宏毅老師（華語・男）",
+        "gender": "male",
+        "language": "zh-TW",
+        "desc": "Barbet TSLM 固定語者音色",
+        "engine_id": "barbet",
+        "speaker_id": "hung_yi_lee",
+    },
+)
+_CASTVOICE_DEFINITIONS_BY_ID = {
+    definition["voice_id"]: definition for definition in _CASTVOICE_DEFINITIONS
+}
+_CASTVOICE_MODEL_VERSION = os.environ.get(
+    "VOXCPM_CASTVOICE_MODEL_VERSION", "voxcpm360-castvoice-1.0"
+)
+_TTS_API_KEY = os.environ.get("TTS_API_KEY", "").strip()
+_CASTVOICE_BATCH_DIR = Path(
+    os.environ.get(
+        "VOXCPM_CASTVOICE_BATCH_DIR",
+        Path(__file__).resolve().parent / "data" / "castvoice_batches",
+    )
+)
+_CASTVOICE_BATCH_MAX_ITEMS = int(os.environ.get("VOXCPM_CASTVOICE_BATCH_MAX_ITEMS", "500"))
 
 # 訓練資料的文字全是華語漢字（例：「我跟他的感情真的很好」而非台語漢字
 # 「我佮伊的感情真正好」），模型學到的是「華語漢字 -> 台語發音」。但底模
@@ -106,6 +172,39 @@ def _save_generation_history(record: dict[str, Any], wav: bytes) -> None:
     )
     os.replace(wav_temp, wav_path)
     os.replace(metadata_temp, metadata_path)
+
+
+def _wav_to_mp3(wav_bytes: bytes) -> bytes:
+    """呼叫系統 ffmpeg 把 wav 轉成 mp3。CastAgent 的 pipeline 全程走 mp3
+    （快取路徑、混音、拼接皆是），所以在 API 端轉一次比 CastAgent 每句都轉划算。
+    """
+    process = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-f",
+            "mp3",
+            "-codec:a",
+            "libmp3lame",
+            "-qscale:a",
+            "2",
+            "pipe:1",
+        ],
+        input=wav_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if process.returncode != 0 or not process.stdout:
+        raise RuntimeError(
+            f"ffmpeg wav->mp3 轉檔失敗（exit={process.returncode}）："
+            f"{process.stderr.decode('utf-8', errors='replace')[-500:]}"
+        )
+    return process.stdout
 
 
 def _load_generation_history(limit: int) -> list[dict[str, Any]]:
@@ -172,8 +271,181 @@ class TTSGateway:
                 device=os.environ.get("VOXCPM_DEVICE", "auto"),
             )
         self.barbet_runtime = barbet_runtime
-        self._native_lock = asyncio.Lock()
-        self._barbet_lock = asyncio.Lock()
+        # VoxCPM2 and Barbet share the same physical GPU.  Separate per-engine
+        # locks allow both runtimes to enter CUDA concurrently, so all model
+        # loading and inference must pass through one process-wide gate.
+        self._gpu_lock = asyncio.Lock()
+        self._admission_lock = asyncio.Lock()
+        self._inflight_jobs = 0
+        self._max_pending_jobs = self._read_int_setting(
+            "VOXCPM_MAX_PENDING_SYNTHESIS",
+            default=2,
+            minimum=0,
+        )
+        self._queue_timeout_seconds = self._read_float_setting(
+            "VOXCPM_QUEUE_TIMEOUT_SECONDS",
+            default=120.0,
+            minimum=0.001,
+        )
+
+    @staticmethod
+    def _read_int_setting(name: str, *, default: int, minimum: int) -> int:
+        raw_value = os.environ.get(name, str(default))
+        try:
+            value = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        if value < minimum:
+            raise ValueError(f"{name} must be >= {minimum}")
+        return value
+
+    @staticmethod
+    def _read_float_setting(name: str, *, default: float, minimum: float) -> float:
+        raw_value = os.environ.get(name, str(default))
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a number") from exc
+        if value < minimum:
+            raise ValueError(f"{name} must be >= {minimum}")
+        return value
+
+    async def _run_gpu_job(
+        self,
+        *,
+        request_id: str,
+        engine_id: str,
+        model_id: str,
+        work: Callable[[], Any],
+    ) -> tuple[Any, float, float]:
+        """Run one non-cancellable CUDA job behind the shared bounded gate.
+
+        A thread already executing CUDA cannot be safely stopped by cancelling
+        its asyncio waiter.  If the HTTP task is cancelled, keep the gate held
+        until the worker thread exits so another model is never started on top
+        of the abandoned job.
+        """
+        queued_at = time.perf_counter()
+        async with self._admission_lock:
+            capacity = self._max_pending_jobs + 1
+            if self._inflight_jobs >= capacity:
+                logger.warning(
+                    "synthesis.request request_id=%s stage=rejected reason=queue_full "
+                    "engine=%s model=%s inflight=%d capacity=%d",
+                    request_id,
+                    engine_id,
+                    model_id,
+                    self._inflight_jobs,
+                    capacity,
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail="語音生成佇列已滿，請稍後再試",
+                    headers={"Retry-After": "30", "X-Request-ID": request_id},
+                )
+            self._inflight_jobs += 1
+            queue_position = self._inflight_jobs - 1
+
+        logger.info(
+            "synthesis.request request_id=%s stage=queued engine=%s model=%s "
+            "queue_position=%d inflight=%d",
+            request_id,
+            engine_id,
+            model_id,
+            queue_position,
+            self._inflight_jobs,
+        )
+
+        acquired = False
+        started_at: float | None = None
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._gpu_lock.acquire(),
+                    timeout=self._queue_timeout_seconds,
+                )
+                acquired = True
+            except asyncio.TimeoutError as exc:
+                queue_wait = time.perf_counter() - queued_at
+                logger.warning(
+                    "synthesis.request request_id=%s stage=rejected reason=queue_timeout "
+                    "engine=%s model=%s queue_wait_seconds=%.3f",
+                    request_id,
+                    engine_id,
+                    model_id,
+                    queue_wait,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="等待語音生成資源逾時，請稍後再試",
+                    headers={"Retry-After": "30", "X-Request-ID": request_id},
+                ) from exc
+
+            started_at = time.perf_counter()
+            queue_wait = started_at - queued_at
+            logger.info(
+                "synthesis.request request_id=%s stage=started engine=%s model=%s "
+                "queue_wait_seconds=%.3f",
+                request_id,
+                engine_id,
+                model_id,
+                queue_wait,
+            )
+
+            worker_task = asyncio.create_task(asyncio.to_thread(work))
+            try:
+                result = await asyncio.shield(worker_task)
+            except asyncio.CancelledError:
+                logger.warning(
+                    "synthesis.request request_id=%s stage=client_cancelled "
+                    "engine=%s model=%s action=wait_for_worker",
+                    request_id,
+                    engine_id,
+                    model_id,
+                )
+                try:
+                    await worker_task
+                except Exception:
+                    logger.exception(
+                        "synthesis.request request_id=%s stage=failed_after_cancel "
+                        "engine=%s model=%s",
+                        request_id,
+                        engine_id,
+                        model_id,
+                    )
+                raise
+
+            execution_time = time.perf_counter() - started_at
+            logger.info(
+                "synthesis.request request_id=%s stage=completed engine=%s model=%s "
+                "queue_wait_seconds=%.3f execution_seconds=%.3f",
+                request_id,
+                engine_id,
+                model_id,
+                queue_wait,
+                execution_time,
+            )
+            return result, queue_wait, execution_time
+        except (HTTPException, asyncio.CancelledError):
+            raise
+        except Exception:
+            execution_time = (
+                time.perf_counter() - started_at if started_at is not None else 0.0
+            )
+            logger.exception(
+                "synthesis.request request_id=%s stage=failed engine=%s model=%s "
+                "execution_seconds=%.3f",
+                request_id,
+                engine_id,
+                model_id,
+                execution_time,
+            )
+            raise
+        finally:
+            if acquired:
+                self._gpu_lock.release()
+            async with self._admission_lock:
+                self._inflight_jobs -= 1
 
     def _native_models(self) -> list[dict[str, Any]]:
         self.demo.lora_registry.refresh()
@@ -336,9 +608,17 @@ class TTSGateway:
         sf.write(buffer, np.asarray(audio, dtype=np.float32), sample_rate, format="WAV", subtype="PCM_16")
         return buffer.getvalue()
 
+    @staticmethod
+    def _job_timing_headers(queue_wait: float, execution_time: float) -> dict[str, str]:
+        return {
+            "X-Queue-Wait": f"{queue_wait:.3f}s",
+            "X-GPU-Job-Time": f"{execution_time:.3f}s",
+        }
+
     async def synthesize_native(
         self,
         *,
+        request_id: str,
         model_id: str,
         text: str,
         control_instruction: str,
@@ -350,13 +630,9 @@ class TTSGateway:
         inference_timesteps: int,
         speed: float = 1.0,
     ) -> tuple[bytes, dict[str, str]]:
-        async with self._native_lock:
-            selected_demo, runtime_selection = await asyncio.to_thread(
-                self._switch_native_runtime,
-                model_id,
-            )
-            sample_rate, audio = await asyncio.to_thread(
-                selected_demo.generate_tts_audio,
+        def generate() -> tuple[int, np.ndarray]:
+            selected_demo, runtime_selection = self._switch_native_runtime(model_id)
+            result = selected_demo.generate_tts_audio(
                 text_input=text,
                 control_instruction=control_instruction,
                 reference_wav_path_input=reference_path,
@@ -368,11 +644,23 @@ class TTSGateway:
                 model_selection=runtime_selection,
             )
             self._active_native_selection = model_id
-        return self._wav_response(sample_rate, audio, speed), {}
+            return result
+
+        result, queue_wait, execution_time = await self._run_gpu_job(
+            request_id=request_id,
+            engine_id="voxcpm2",
+            model_id=model_id,
+            work=generate,
+        )
+        sample_rate, audio = result
+        return self._wav_response(sample_rate, audio, speed), self._job_timing_headers(
+            queue_wait, execution_time
+        )
 
     async def synthesize_barbet(
         self,
         *,
+        request_id: str,
         model_id: str,
         text: str,
         reference_path: str | None,
@@ -389,9 +677,9 @@ class TTSGateway:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         actual_seed = seed if seed is not None else secrets.randbelow(2**31)
-        async with self._barbet_lock:
-            sample_rate, audio, elapsed = await asyncio.to_thread(
-                self.barbet_runtime.synthesize,
+
+        def generate() -> tuple[int, np.ndarray, float]:
+            return self.barbet_runtime.synthesize(
                 model_id=model_id,
                 text=text,
                 reference_path=reference_path,
@@ -401,10 +689,177 @@ class TTSGateway:
                 inference_timesteps=inference_timesteps,
                 seed=actual_seed,
             )
-        return self._wav_response(sample_rate, audio, speed), {
+
+        result, queue_wait, execution_time = await self._run_gpu_job(
+            request_id=request_id,
+            engine_id="barbet",
+            model_id=model_id,
+            work=generate,
+        )
+        sample_rate, audio, elapsed = result
+        headers = {
             "X-Synthesis-Time": f"{elapsed:.2f}s",
             "X-Random-Seed": str(actual_seed),
+            **self._job_timing_headers(queue_wait, execution_time),
         }
+        return self._wav_response(sample_rate, audio, speed), headers
+
+    def find_barbet_model_for_speaker(self, speaker_id: str) -> str | None:
+        """回傳第一個含有此 speaker_id centroid、且可用的 checkpoint id。"""
+        for checkpoint in self.barbet_runtime.registry.refresh():
+            if not checkpoint.valid:
+                continue
+            if any(
+                speaker["id"] == speaker_id
+                for speaker in self.barbet_runtime.speakers(checkpoint)
+            ):
+                return checkpoint.id
+        return None
+
+
+class CastVoiceSynthesizeRequest(BaseModel):
+    text: str
+    voice_id: str
+    format: str = "mp3"
+    speed: float = 1.0
+    # 選填：覆寫該 voice_id 預設綁定的模型/checkpoint，沿用同一個
+    # 參考音／語者身份，只換底層權重。留空則用 voice_id 的預設模型。
+    model_id: str | None = None
+
+
+class CastVoiceBatchItemRequest(BaseModel):
+    text: str
+    voice_id: str
+    speed: float = 1.0
+    model_id: str | None = None
+
+
+class CastVoiceBatchRequest(BaseModel):
+    items: list[CastVoiceBatchItemRequest]
+
+
+class _CastVoiceError(Exception):
+    """單句合成失敗的統一錯誤形狀，帶著要回給呼叫端的 HTTP 狀態碼與訊息。"""
+
+    def __init__(self, status_code: int, error: str, message: str, **headers: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error = error
+        self.message = message
+        self.headers = headers
+
+
+@dataclass
+class _CastVoiceBatchItem:
+    index: int
+    text: str
+    voice_id: str
+    speed: float
+    model_id: str | None = None
+    status: str = "pending"  # pending | processing | done | failed
+    error: str | None = None
+
+
+@dataclass
+class _CastVoiceBatch:
+    items: list[_CastVoiceBatchItem]
+
+
+class CastVoiceBatchManager:
+    """batch 合成的 in-process job queue。
+
+    單顆 GPU 意味著真正的並行度就是 1，不管佇列多深，所以一個背景 worker
+    task 逐一消化 asyncio.Queue 就夠了，不需要外部 broker（Redis 等）。
+    取捨：process 重啟會遺失還沒跑完的 job（in-memory），但已完成的 mp3
+    在完成當下就落地到磁碟，重啟後仍可透過 batch_id 查到已完成的部分
+    （除非連 _batches 這個索引本身也重建 —— 目前沒做跨重啟的索引還原，
+    這是刻意先求簡單，之後真的需要多機/不掉件再上 Redis）。
+    """
+
+    def __init__(
+        self,
+        *,
+        synthesize: Callable[[str, str, float, str | None], Awaitable[tuple[bytes, str]]],
+        storage_dir: Path,
+    ) -> None:
+        self._synthesize = synthesize
+        self._storage_dir = storage_dir
+        self._batches: dict[str, _CastVoiceBatch] = {}
+        self._queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._run_worker())
+
+    async def stop(self) -> None:
+        if self._worker_task is None:
+            return
+        self._worker_task.cancel()
+        try:
+            await self._worker_task
+        except asyncio.CancelledError:
+            pass
+        self._worker_task = None
+
+    async def submit(self, requests: list[CastVoiceBatchItemRequest]) -> str:
+        batch_id = uuid.uuid4().hex
+        items = [
+            _CastVoiceBatchItem(
+                index=i,
+                text=req.text,
+                voice_id=req.voice_id,
+                speed=req.speed,
+                model_id=req.model_id,
+            )
+            for i, req in enumerate(requests)
+        ]
+        self._batches[batch_id] = _CastVoiceBatch(items=items)
+        await asyncio.to_thread(
+            (self._storage_dir / batch_id).mkdir, parents=True, exist_ok=True
+        )
+        for item in items:
+            self._queue.put_nowait((batch_id, item.index))
+        return batch_id
+
+    def get(self, batch_id: str) -> _CastVoiceBatch | None:
+        return self._batches.get(batch_id)
+
+    def audio_path(self, batch_id: str, index: int) -> Path:
+        return self._storage_dir / batch_id / f"{index}.mp3"
+
+    async def _run_worker(self) -> None:
+        while True:
+            batch_id, index = await self._queue.get()
+            try:
+                await self._process_item(batch_id, index)
+            except Exception:
+                logger.exception(
+                    "castvoice.batch stage=worker_failed batch_id=%s index=%d",
+                    batch_id,
+                    index,
+                )
+            finally:
+                self._queue.task_done()
+
+    async def _process_item(self, batch_id: str, index: int) -> None:
+        batch = self._batches.get(batch_id)
+        if batch is None:
+            return
+        item = batch.items[index]
+        item.status = "processing"
+        try:
+            mp3_bytes, _request_id = await self._synthesize(
+                item.text, item.voice_id, item.speed, item.model_id
+            )
+        except _CastVoiceError as exc:
+            item.status = "failed"
+            item.error = exc.message
+            return
+        await asyncio.to_thread(
+            self.audio_path(batch_id, index).write_bytes, mp3_bytes
+        )
+        item.status = "done"
 
 
 def create_app(
@@ -424,9 +879,11 @@ def create_app(
         if os.environ.get("VOXCPM_PRELOAD", "true").lower() == "true":
             logger.info("Preloading VoxCPM2 runtime")
             await asyncio.to_thread(demo.get_or_load_voxcpm)
+        app.state.castvoice_batch_manager.start()
         try:
             yield
         finally:
+            await app.state.castvoice_batch_manager.stop()
             await asyncio.to_thread(gateway.close)
 
     app = FastAPI(
@@ -555,6 +1012,7 @@ def create_app(
 
     @app.post("/api/v1/synthesize")
     async def synthesize(
+        request: Request,
         engine_id: str = Form(...),
         model_id: str = Form(...),
         text: str = Form(...),
@@ -576,6 +1034,17 @@ def create_app(
         seed: int | None = Form(None),
         reference_audio: UploadFile | None = File(None),
     ) -> Response:
+        request_id = uuid.uuid4().hex
+        request_started_at = time.perf_counter()
+        logger.info(
+            "synthesis.request request_id=%s stage=received engine=%s model=%s "
+            "content_type=%s text_chars=%d",
+            request_id,
+            engine_id,
+            model_id,
+            request.headers.get("content-type", ""),
+            len(text),
+        )
         text = text.strip()
         if not text:
             raise HTTPException(status_code=422, detail="請輸入要合成的文字")
@@ -629,6 +1098,7 @@ def create_app(
                 elif not control_instruction.strip():
                     control_instruction = _DEFAULT_CONTROL_INSTRUCTION
                 wav, extra_headers = await gateway.synthesize_native(
+                    request_id=request_id,
                     model_id=model_id,
                     text=text,
                     control_instruction=control_instruction,
@@ -642,6 +1112,7 @@ def create_app(
                 )
             elif engine_id == "barbet":
                 wav, extra_headers = await gateway.synthesize_barbet(
+                    request_id=request_id,
                     model_id=model_id,
                     text=text,
                     reference_path=active_reference,
@@ -659,6 +1130,7 @@ def create_app(
                 "Content-Disposition": 'inline; filename="tts-output.wav"',
                 "X-Model-Engine": engine_id,
                 "X-Model-Version": model_id,
+                "X-Request-ID": request_id,
                 **extra_headers,
             }
             history_id = uuid.uuid4().hex
@@ -693,6 +1165,9 @@ def create_app(
             async with history_lock:
                 await asyncio.to_thread(_save_generation_history, record, wav)
             headers["X-History-ID"] = history_id
+            headers["X-Total-Time"] = (
+                f"{time.perf_counter() - request_started_at:.3f}s"
+            )
             return Response(content=wav, media_type="audio/wav", headers=headers)
         finally:
             if temp_path:
@@ -700,6 +1175,278 @@ def create_app(
                     os.unlink(temp_path)
                 except OSError:
                     pass
+
+    def _require_castvoice_auth(request: Request) -> None:
+        """驗證 Authorization: Bearer <TTS_API_KEY>。未設定 TTS_API_KEY 時
+        （本機開發）略過驗證。"""
+        if not _TTS_API_KEY:
+            return
+        auth_header = request.headers.get("authorization", "")
+        scheme, _, token = auth_header.partition(" ")
+        if scheme.lower() != "bearer" or token != _TTS_API_KEY:
+            raise HTTPException(status_code=401, detail="缺少或無效的 API token")
+
+    def _castvoice_error(status_code: int, error: str, message: str, **headers: str) -> JSONResponse:
+        return JSONResponse(
+            status_code=status_code,
+            content={"error": error, "message": message},
+            headers=headers or None,
+        )
+
+    async def _resolve_native_model_override(model_id: str) -> str:
+        """驗證使用者指定的 model_id 是否為合法的 voxcpm2 原生模型
+        （base / full checkpoint / lora）。合法就原樣回傳，否則拋
+        model_not_found。"""
+        native_models = await asyncio.to_thread(gateway._native_models)
+        if not any(model["id"] == model_id for model in native_models):
+            raise _CastVoiceError(400, "model_not_found", f"找不到模型 {model_id}")
+        return model_id
+
+    async def _resolve_barbet_model_override(model_id: str, speaker_id: str) -> str:
+        """驗證使用者指定的 model_id 是可用的 Barbet checkpoint，且該
+        checkpoint 內含 speaker_id 的 centroid（否則克隆對象根本不存在）。"""
+        checkpoints = await asyncio.to_thread(gateway.barbet_runtime.registry.refresh)
+        checkpoint = next((c for c in checkpoints if c.id == model_id), None)
+        if checkpoint is None or not checkpoint.valid:
+            raise _CastVoiceError(400, "model_not_found", f"找不到模型 {model_id}")
+        speakers = await asyncio.to_thread(gateway.barbet_runtime.speakers, checkpoint)
+        if not any(speaker["id"] == speaker_id for speaker in speakers):
+            raise _CastVoiceError(
+                400, "model_not_found", f"模型 {model_id} 沒有語者 {speaker_id}"
+            )
+        return model_id
+
+    async def _synthesize_castvoice(
+        text: str, voice_id: str, speed: float, model_id: str | None = None
+    ) -> tuple[bytes, str]:
+        """單句 CastAgent 語音合成的共用邏輯。單筆 /synthesize 與 batch worker
+        都走這裡，失敗一律拋 _CastVoiceError，呼叫端自行決定怎麼回應
+        （單筆轉成 HTTP response；batch 則記到該筆 item 的 error 欄位）。
+
+        model_id 是選填的模型覆寫：留空沿用 voice_id 綁定的預設模型；有給
+        則驗證該模型存在（且對 barbet 而言含有這個語者），沿用同一個參考音
+        ／語者身份、只換底層權重。
+        """
+        text = text.strip()
+        if not text:
+            raise _CastVoiceError(400, "invalid_text", "text 不可為空白")
+        if not 0.5 <= speed <= 2.0:
+            raise _CastVoiceError(400, "invalid_speed", "speed 必須介於 0.5 與 2.0")
+
+        definition = _CASTVOICE_DEFINITIONS_BY_ID.get(voice_id)
+        if definition is None:
+            raise _CastVoiceError(400, "voice_not_found", f"找不到語音 {voice_id}")
+
+        request_id = uuid.uuid4().hex
+        try:
+            if definition["engine_id"] == "voxcpm2":
+                preset = _find_reference_preset(definition["reference_preset_id"])
+                if preset is None:
+                    raise _CastVoiceError(
+                        503, "voice_unavailable", f"語音 {voice_id} 目前無法使用"
+                    )
+                resolved_model_id = (
+                    await _resolve_native_model_override(model_id)
+                    if model_id
+                    else BASE_MODEL_KEY
+                )
+                reference_path = _resolve_reference_audio(definition["reference_preset_id"])
+                wav, _ = await gateway.synthesize_native(
+                    request_id=request_id,
+                    model_id=resolved_model_id,
+                    text=text,
+                    control_instruction="",
+                    reference_path=reference_path,
+                    prompt_text=preset.get("prompt_text", ""),
+                    cfg_value=2.0,
+                    normalize=True,
+                    denoise=False,
+                    inference_timesteps=30,
+                    speed=speed,
+                )
+            else:
+                speaker_id = definition["speaker_id"]
+                if model_id:
+                    resolved_model_id = await _resolve_barbet_model_override(
+                        model_id, speaker_id
+                    )
+                else:
+                    resolved_model_id = await asyncio.to_thread(
+                        gateway.find_barbet_model_for_speaker, speaker_id
+                    )
+                    if resolved_model_id is None:
+                        raise _CastVoiceError(
+                            503, "voice_unavailable", f"語音 {voice_id} 目前無法使用"
+                        )
+                wav, _ = await gateway.synthesize_barbet(
+                    request_id=request_id,
+                    model_id=resolved_model_id,
+                    text=text,
+                    reference_path=None,
+                    prompt_text="",
+                    speaker_id=speaker_id,
+                    cfg_value=2.0,
+                    inference_timesteps=30,
+                    seed=None,
+                    speed=speed,
+                )
+        except HTTPException as exc:
+            headers = dict(exc.headers or {})
+            error_code = {429: "rate_limited", 503: "service_unavailable"}.get(
+                exc.status_code, "request_failed"
+            )
+            raise _CastVoiceError(
+                exc.status_code, error_code, str(exc.detail), **headers
+            ) from exc
+        except _CastVoiceError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "castvoice.synthesize request_id=%s stage=failed voice_id=%s",
+                request_id,
+                voice_id,
+            )
+            raise _CastVoiceError(500, "internal_error", "語音合成失敗") from exc
+
+        try:
+            mp3_bytes = await asyncio.to_thread(_wav_to_mp3, wav)
+        except RuntimeError as exc:
+            logger.exception(
+                "castvoice.synthesize request_id=%s stage=mp3_encode_failed", request_id
+            )
+            raise _CastVoiceError(500, "internal_error", "音檔轉檔失敗") from exc
+
+        return mp3_bytes, request_id
+
+    batch_manager = CastVoiceBatchManager(
+        synthesize=_synthesize_castvoice,
+        storage_dir=_CASTVOICE_BATCH_DIR,
+    )
+    app.state.castvoice_batch_manager = batch_manager
+
+    @app.get("/api/v1/tts/health")
+    async def castvoice_health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/api/v1/tts/voices")
+    async def castvoice_voices() -> dict[str, Any]:
+        available_preset_ids = {
+            preset["id"] for preset in _available_reference_presets()
+        }
+        voices: list[dict[str, str]] = []
+        for definition in _CASTVOICE_DEFINITIONS:
+            if definition["engine_id"] == "voxcpm2":
+                if definition["reference_preset_id"] not in available_preset_ids:
+                    continue
+            elif definition["engine_id"] == "barbet":
+                model_id = await asyncio.to_thread(
+                    gateway.find_barbet_model_for_speaker, definition["speaker_id"]
+                )
+                if model_id is None:
+                    continue
+            voice: dict[str, str] = {
+                "voice_id": definition["voice_id"],
+                "label": definition["label"],
+                "gender": definition["gender"],
+                "language": definition["language"],
+                "desc": definition["desc"],
+            }
+            voices.append(voice)
+        return {"model_version": _CASTVOICE_MODEL_VERSION, "voices": voices}
+
+    @app.post("/api/v1/tts/synthesize")
+    async def castvoice_synthesize(request: Request, body: CastVoiceSynthesizeRequest) -> Response:
+        _require_castvoice_auth(request)
+
+        if body.format != "mp3":
+            return _castvoice_error(
+                400, "unsupported_format", f"不支援的格式：{body.format}，目前僅支援 mp3"
+            )
+
+        try:
+            mp3_bytes, request_id = await _synthesize_castvoice(
+                body.text, body.voice_id, body.speed, body.model_id
+            )
+        except _CastVoiceError as exc:
+            return _castvoice_error(exc.status_code, exc.error, exc.message, **exc.headers)
+
+        return Response(
+            content=mp3_bytes,
+            media_type="audio/mpeg",
+            headers={"X-Request-ID": request_id},
+        )
+
+    @app.post("/api/v1/tts/synthesize/batch")
+    async def castvoice_synthesize_batch(
+        request: Request, body: CastVoiceBatchRequest
+    ) -> Response:
+        _require_castvoice_auth(request)
+
+        if not body.items:
+            return _castvoice_error(400, "invalid_batch", "items 不可為空")
+        if len(body.items) > _CASTVOICE_BATCH_MAX_ITEMS:
+            return _castvoice_error(
+                400,
+                "batch_too_large",
+                f"單批次最多 {_CASTVOICE_BATCH_MAX_ITEMS} 筆，收到 {len(body.items)} 筆",
+            )
+
+        batch_id = await batch_manager.submit(body.items)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "batch_id": batch_id,
+                "total": len(body.items),
+                "status_url": f"/api/v1/tts/synthesize/batch/{batch_id}",
+            },
+        )
+
+    @app.get("/api/v1/tts/synthesize/batch/{batch_id}")
+    async def castvoice_batch_status(request: Request, batch_id: str) -> Response:
+        _require_castvoice_auth(request)
+        batch = batch_manager.get(batch_id)
+        if batch is None:
+            return _castvoice_error(404, "batch_not_found", f"找不到 batch {batch_id}")
+
+        counts = {"pending": 0, "processing": 0, "done": 0, "failed": 0}
+        items_payload: list[dict[str, Any]] = []
+        for item in batch.items:
+            counts[item.status] += 1
+            entry: dict[str, Any] = {"index": item.index, "status": item.status}
+            if item.status == "done":
+                entry["audio_url"] = (
+                    f"/api/v1/tts/synthesize/batch/{batch_id}/{item.index}/audio"
+                )
+            elif item.status == "failed":
+                entry["error"] = item.error
+            items_payload.append(entry)
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "batch_id": batch_id,
+                "total": len(batch.items),
+                "counts": counts,
+                "done": counts["done"] + counts["failed"] == len(batch.items),
+                "items": items_payload,
+            },
+        )
+
+    @app.get("/api/v1/tts/synthesize/batch/{batch_id}/{index}/audio")
+    async def castvoice_batch_item_audio(
+        request: Request, batch_id: str, index: int
+    ) -> Response:
+        _require_castvoice_auth(request)
+        batch = batch_manager.get(batch_id)
+        if batch is None or not 0 <= index < len(batch.items):
+            return _castvoice_error(404, "item_not_found", "找不到該筆項目")
+        item = batch.items[index]
+        if item.status != "done":
+            return _castvoice_error(404, "item_not_ready", "該筆尚未完成或已失敗")
+        audio_path = batch_manager.audio_path(batch_id, index)
+        if not audio_path.is_file():
+            return _castvoice_error(404, "item_not_found", "音檔不存在")
+        return FileResponse(audio_path, media_type="audio/mpeg")
 
     if mount_legacy:
         import gradio as gr
@@ -714,6 +1461,7 @@ def create_app(
             allowed_paths=[str(Path.cwd() / "assets")],
         )
         app.state.tts_gateway = gateway
+        app.state.castvoice_batch_manager = batch_manager
 
     return app
 
