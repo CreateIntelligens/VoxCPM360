@@ -31,11 +31,12 @@ import {
 import { fetchCatalog, fetchGenerationHistory, synthesize } from "./api";
 import ModelComparison from "./ModelComparison";
 import { usePersistentState } from "./usePersistentState";
-import type {
-  Catalog,
-  Engine,
-  HistoryItem,
-  ModelVersion,
+import {
+  REFERENCE_AUDIO_LANGUAGE_LABELS,
+  type Catalog,
+  type Engine,
+  type HistoryItem,
+  type ModelVersion,
 } from "./types";
 
 const DEFAULT_TEXT = "逐家好，歡迎使用 VoxCPM 360 多模型語音工作室。";
@@ -712,7 +713,7 @@ function App() {
                       )}
                       {catalog.reference_presets.map((preset) => (
                         <option key={preset.id} value={preset.id}>
-                          {preset.label}
+                          {`${preset.label}（${REFERENCE_AUDIO_LANGUAGE_LABELS[preset.language]}）`}
                         </option>
                       ))}
                     </select>
