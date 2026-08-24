@@ -32,6 +32,12 @@ services:
       # to target text length so a missed EOS cannot always run to 2000 tokens.
       - VOXCPM_MAX_GENERATE_LENGTH=${VOXCPM_MAX_GENERATE_LENGTH:-2000}
       - VOXCPM_MAX_AUDIO_TEXT_RATIO=${VOXCPM_MAX_AUDIO_TEXT_RATIO:-6.0}
+      # Batch chunks are selected at runtime from CUDA and container memory
+      # headroom. These values are portable safety ceilings, not GB10-specific.
+      - VOXCPM_BATCH_MAX_CONCURRENCY=${VOXCPM_BATCH_MAX_CONCURRENCY:-16}
+      - VOXCPM_BATCH_MEMORY_RESERVE_GIB=${VOXCPM_BATCH_MEMORY_RESERVE_GIB:-2.0}
+      - VOXCPM_BATCH_MEMORY_PER_ITEM_GIB=${VOXCPM_BATCH_MEMORY_PER_ITEM_GIB:-1.5}
+      - VOXCPM_BATCH_MEMORY_MIN_PER_ITEM_GIB=${VOXCPM_BATCH_MEMORY_MIN_PER_ITEM_GIB:-0.5}
       - VOXCPM_LORA_ROOTS=/app/models/native:/app/checkpoints
       - VOXCPM_FULL_MODEL_ROOTS=/app/models/native:/app/checkpoints
       - VOXCPM_BARBET_MODEL_ROOTS=/app/models/barbet

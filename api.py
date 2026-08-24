@@ -32,6 +32,9 @@ from voxcpm.full_model_registry import FULL_MODEL_PREFIX, FullModelRegistry
 from voxcpm.lora_registry import BASE_MODEL_KEY
 
 logger = logging.getLogger(__name__)
+BASE_MODEL_PREFIX = "base::"
+LORA_MODEL_PREFIX = "lora::"
+PUBLIC_BASE_MODEL_ID = f"{BASE_MODEL_PREFIX}{BASE_MODEL_KEY}"
 _REFERENCE_AUDIO_DIR = Path(__file__).resolve().parent / "assets" / "default_reference"
 _MODEL_REGISTRY_PATH = Path(__file__).resolve().parent / "docs" / "model_registry.json"
 _HISTORY_DIR = Path(
@@ -250,7 +253,7 @@ class TTSGateway:
         self._base_demo = demo
         self._native_demo = demo
         self._native_runtime_id = BASE_MODEL_KEY
-        self._active_native_selection = BASE_MODEL_KEY
+        self._active_native_selection = PUBLIC_BASE_MODEL_ID
         full_roots_setting = os.environ.get(
             "VOXCPM_FULL_MODEL_ROOTS",
             "/app/models/native:/app/checkpoints",
@@ -452,11 +455,11 @@ class TTSGateway:
         self.full_model_registry.refresh()
         models: list[dict[str, Any]] = [
             {
-                "id": BASE_MODEL_KEY,
+                "id": PUBLIC_BASE_MODEL_ID,
                 "label": "VoxCPM2 基礎模型",
                 "kind": "base",
                 "description": "原生 MiniCPM4 Text-Semantic LM",
-                "loaded": self._active_native_selection == BASE_MODEL_KEY,
+                "loaded": self._active_native_selection == PUBLIC_BASE_MODEL_ID,
             }
         ]
         for checkpoint in self.full_model_registry.checkpoints:
@@ -473,23 +476,79 @@ class TTSGateway:
         for checkpoint in self.demo.lora_registry.checkpoints:
             models.append(
                 {
-                    "id": checkpoint.run_name,
+                    "id": f"{LORA_MODEL_PREFIX}{checkpoint.run_name}",
                     "label": checkpoint.label,
                     "kind": "lora",
                     "description": self.demo.lora_registry.describe(checkpoint.run_name),
-                    "loaded": self._active_native_selection == checkpoint.run_name,
+                    "loaded": self._active_native_selection
+                    == f"{LORA_MODEL_PREFIX}{checkpoint.run_name}",
                 }
             )
         return models
 
-    def _switch_native_runtime(self, model_id: str) -> tuple[VoxCPMDemo, str]:
-        is_full_model = model_id.startswith(FULL_MODEL_PREFIX)
-        desired_runtime_id = model_id if is_full_model else BASE_MODEL_KEY
-        runtime_selection = BASE_MODEL_KEY if is_full_model else model_id
-        if desired_runtime_id == self._native_runtime_id:
-            return self._native_demo, runtime_selection
+    def resolve_native_model_id(self, model_id: str) -> str:
+        """Return the canonical public id for a native VoxCPM2 model.
 
-        checkpoint = self.full_model_registry.get(model_id) if is_full_model else None
+        Catalog ids are always namespaced (``base::``, ``full::``, ``lora::``).
+        Legacy base/LoRA ids and bare full-checkpoint directory names remain
+        accepted as unambiguous input aliases.
+        """
+        requested_id = model_id.strip()
+        self.demo.lora_registry.refresh()
+        self.full_model_registry.refresh()
+
+        if requested_id in {BASE_MODEL_KEY, PUBLIC_BASE_MODEL_ID}:
+            return PUBLIC_BASE_MODEL_ID
+
+        full_checkpoints = {
+            checkpoint.id: checkpoint
+            for checkpoint in self.full_model_registry.checkpoints
+            if checkpoint.valid
+        }
+        lora_names = {
+            checkpoint.run_name for checkpoint in self.demo.lora_registry.checkpoints
+        }
+
+        if requested_id.startswith(FULL_MODEL_PREFIX):
+            if requested_id in full_checkpoints:
+                return requested_id
+            raise ValueError(f"找不到模型 {requested_id}")
+
+        if requested_id.startswith(LORA_MODEL_PREFIX):
+            lora_name = requested_id.removeprefix(LORA_MODEL_PREFIX)
+            if lora_name in lora_names:
+                return requested_id
+            raise ValueError(f"找不到模型 {requested_id}")
+
+        full_id = f"{FULL_MODEL_PREFIX}{requested_id}"
+        matches_full = full_id in full_checkpoints
+        matches_lora = requested_id in lora_names
+        if matches_full and matches_lora:
+            raise ValueError(
+                f"模型名稱 {requested_id} 同時存在 full 與 LoRA，請使用完整前綴"
+            )
+        if matches_full:
+            return full_id
+        if matches_lora:
+            return f"{LORA_MODEL_PREFIX}{requested_id}"
+        raise ValueError(f"找不到模型 {requested_id}")
+
+    def _switch_native_runtime(self, model_id: str) -> tuple[VoxCPMDemo, str, str]:
+        canonical_id = self.resolve_native_model_id(model_id)
+        is_full_model = canonical_id.startswith(FULL_MODEL_PREFIX)
+        is_lora = canonical_id.startswith(LORA_MODEL_PREFIX)
+        desired_runtime_id = canonical_id if is_full_model else BASE_MODEL_KEY
+        runtime_selection = (
+            canonical_id.removeprefix(LORA_MODEL_PREFIX)
+            if is_lora
+            else BASE_MODEL_KEY
+        )
+        if desired_runtime_id == self._native_runtime_id:
+            return self._native_demo, runtime_selection, canonical_id
+
+        checkpoint = (
+            self.full_model_registry.get(canonical_id) if is_full_model else None
+        )
         previous_demo = self._native_demo
         previous_runtime_id = self._native_runtime_id
         previous_demo.stop_voxcpm()
@@ -502,7 +561,7 @@ class TTSGateway:
         try:
             next_demo.get_or_load_voxcpm()
         except Exception:
-            logger.exception("Failed to switch native runtime to %s", model_id)
+            logger.exception("Failed to switch native runtime to %s", canonical_id)
             self._native_demo = previous_demo
             self._native_runtime_id = previous_runtime_id
             raise
@@ -510,7 +569,7 @@ class TTSGateway:
         self._native_demo = next_demo
         self._native_runtime_id = desired_runtime_id
         logger.info("Native runtime switched to %s", desired_runtime_id)
-        return next_demo, runtime_selection
+        return next_demo, runtime_selection, canonical_id
 
     def close(self) -> None:
         stop = getattr(self._native_demo, "stop_voxcpm", None)
@@ -630,32 +689,86 @@ class TTSGateway:
         inference_timesteps: int,
         speed: float = 1.0,
     ) -> tuple[bytes, dict[str, str]]:
-        def generate() -> tuple[int, np.ndarray]:
-            selected_demo, runtime_selection = self._switch_native_runtime(model_id)
-            result = selected_demo.generate_tts_audio(
-                text_input=text,
-                control_instruction=control_instruction,
-                reference_wav_path_input=reference_path,
-                prompt_text=prompt_text,
-                cfg_value_input=cfg_value,
-                do_normalize=normalize,
-                denoise=denoise,
-                inference_timesteps=inference_timesteps,
-                model_selection=runtime_selection,
-            )
-            self._active_native_selection = model_id
-            return result
+        wavs, headers = await self.synthesize_native_batch(
+            request_id=request_id,
+            model_id=model_id,
+            requests=[
+                {
+                    "text": text,
+                    "control_instruction": control_instruction,
+                    "reference_path": reference_path,
+                    "prompt_text": prompt_text,
+                    "cfg_value": cfg_value,
+                    "normalize": normalize,
+                    "denoise": denoise,
+                    "inference_timesteps": inference_timesteps,
+                    "speed": speed,
+                }
+            ],
+        )
+        return wavs[0], headers
 
-        result, queue_wait, execution_time = await self._run_gpu_job(
+    async def synthesize_native_batch(
+        self,
+        *,
+        request_id: str,
+        model_id: str,
+        requests: list[dict[str, Any]],
+    ) -> tuple[list[bytes], dict[str, str]]:
+        """Generate a same-model chunk within one GPU admission slot.
+
+        ``VoxCPMDemo`` submits all requests to nano-vLLM's async server pool,
+        which can continuously batch their text/audio tokens. Model switching
+        and the shared VoxCPM2/Barbet GPU exclusion still happen exactly once
+        around the whole chunk.
+        """
+        if not requests:
+            return [], self._job_timing_headers(0.0, 0.0)
+
+        def generate() -> list[tuple[int, np.ndarray]]:
+            selected_demo, runtime_selection, canonical_id = (
+                self._switch_native_runtime(model_id)
+            )
+            generation_requests = [
+                {
+                    "text_input": request["text"],
+                    "control_instruction": request.get("control_instruction", ""),
+                    "reference_wav_path_input": request.get("reference_path"),
+                    "prompt_text": request.get("prompt_text", ""),
+                    "cfg_value_input": request.get("cfg_value", 2.0),
+                    "do_normalize": request.get("normalize", True),
+                    "denoise": request.get("denoise", True),
+                    "inference_timesteps": request.get("inference_timesteps", 10),
+                    "model_selection": runtime_selection,
+                }
+                for request in requests
+            ]
+            batch_generate = getattr(selected_demo, "generate_tts_audio_batch", None)
+            if callable(batch_generate):
+                results = batch_generate(generation_requests)
+            else:
+                results = [
+                    selected_demo.generate_tts_audio(**generation_request)
+                    for generation_request in generation_requests
+                ]
+            self._active_native_selection = canonical_id
+            return results
+
+        results, queue_wait, execution_time = await self._run_gpu_job(
             request_id=request_id,
             engine_id="voxcpm2",
             model_id=model_id,
             work=generate,
         )
-        sample_rate, audio = result
-        return self._wav_response(sample_rate, audio, speed), self._job_timing_headers(
-            queue_wait, execution_time
-        )
+        wavs = [
+            self._wav_response(
+                sample_rate,
+                audio,
+                float(request.get("speed", 1.0)),
+            )
+            for (sample_rate, audio), request in zip(results, requests, strict=True)
+        ]
+        return wavs, self._job_timing_headers(queue_wait, execution_time)
 
     async def synthesize_barbet(
         self,
@@ -765,11 +878,166 @@ class _CastVoiceBatch:
     items: list[_CastVoiceBatchItem]
 
 
+class DynamicBatchSizer:
+    """Choose a safe nano-vLLM chunk size from live GPU/container headroom.
+
+    CUDA memory works for ordinary discrete GPUs and unified-memory devices
+    whose nvidia-smi memory fields may be unavailable. Linux cgroup v1/v2
+    headroom is a second ceiling; non-container hosts simply skip that check.
+    """
+
+    _GIB = 1024**3
+
+    def __init__(self, max_concurrency: int, device: str = "cuda") -> None:
+        self._max_concurrency = min(max_concurrency, 16)
+        self._device = device if device.startswith("cuda") else None
+        self._reserve_bytes = int(
+            float(os.environ.get("VOXCPM_BATCH_MEMORY_RESERVE_GIB", "2.0"))
+            * self._GIB
+        )
+        self._bytes_per_item = int(
+            float(os.environ.get("VOXCPM_BATCH_MEMORY_PER_ITEM_GIB", "1.5"))
+            * self._GIB
+        )
+        self._minimum_bytes_per_item = int(
+            float(os.environ.get("VOXCPM_BATCH_MEMORY_MIN_PER_ITEM_GIB", "0.5"))
+            * self._GIB
+        )
+        if self._bytes_per_item <= 0:
+            raise ValueError("VOXCPM_BATCH_MEMORY_PER_ITEM_GIB must be > 0")
+        if self._minimum_bytes_per_item <= 0:
+            raise ValueError("VOXCPM_BATCH_MEMORY_MIN_PER_ITEM_GIB must be > 0")
+        self._last_available_bytes: int | None = None
+        self._best_size = 1
+        self._best_work_rate = 0.0
+        self._performance_cap = self._max_concurrency
+
+    @staticmethod
+    def _cgroup_headroom() -> int | None:
+        paths = (
+            (
+                Path("/sys/fs/cgroup/memory.max"),
+                Path("/sys/fs/cgroup/memory.current"),
+            ),
+            (
+                Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+                Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+            ),
+        )
+        for limit_path, current_path in paths:
+            try:
+                limit_raw = limit_path.read_text().strip()
+                if limit_raw == "max":
+                    continue
+                limit = int(limit_raw)
+                # cgroup v1 represents "unlimited" with a huge sentinel.
+                if limit >= 1 << 60:
+                    continue
+                current = int(current_path.read_text().strip())
+                return max(0, limit - current)
+            except (OSError, ValueError):
+                continue
+        return None
+
+    def _cuda_headroom(self) -> int | None:
+        try:
+            import torch
+
+            if self._device is None or not torch.cuda.is_available():
+                return None
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(self._device)
+            return int(free_bytes)
+        except (ImportError, RuntimeError):
+            return None
+
+    def _available_bytes(self) -> int | None:
+        headrooms = [
+            value
+            for value in (self._cuda_headroom(), self._cgroup_headroom())
+            if value is not None
+        ]
+        return min(headrooms) if headrooms else None
+
+    def recommend(self, pending_items: int) -> int:
+        available = self._available_bytes()
+        self._last_available_bytes = available
+        if available is None:
+            size = 1
+            available_bytes = 0
+        else:
+            available_bytes = available
+            usable_bytes = max(0, available_bytes - self._reserve_bytes)
+            size = max(1, usable_bytes // self._bytes_per_item)
+        selected = min(
+            pending_items,
+            self._max_concurrency,
+            self._performance_cap,
+            int(size),
+        )
+        logger.info(
+            "castvoice.batch stage=sized pending=%d selected=%d "
+            "available_gib=%.2f reserve_gib=%.2f estimated_item_gib=%.2f "
+            "performance_cap=%d max=%d",
+            pending_items,
+            selected,
+            available_bytes / self._GIB,
+            self._reserve_bytes / self._GIB,
+            self._bytes_per_item / self._GIB,
+            self._performance_cap,
+            self._max_concurrency,
+        )
+        return selected
+
+    def observe_success(self, size: int, elapsed: float, work_units: int) -> None:
+        """Learn marginal memory use and retain the best observed throughput."""
+        available_after = self._available_bytes()
+        if self._last_available_bytes is not None and available_after is not None:
+            consumed = max(0, self._last_available_bytes - available_after)
+            observed_per_item = consumed // max(1, size)
+            self._bytes_per_item = max(
+                self._minimum_bytes_per_item,
+                int(self._bytes_per_item * 0.75 + observed_per_item * 0.25),
+            )
+
+        work_rate = work_units / elapsed if elapsed > 0 else 0.0
+        if work_rate > self._best_work_rate * 1.05:
+            self._best_work_rate = work_rate
+            self._best_size = size
+        elif (
+            size > self._best_size
+            and self._best_work_rate > 0
+            and work_rate < self._best_work_rate * 0.85
+        ):
+            self._performance_cap = self._best_size
+        logger.info(
+            "castvoice.batch stage=learned size=%d work_rate=%.3f "
+            "best_size=%d estimated_item_gib=%.2f performance_cap=%d",
+            size,
+            work_rate,
+            self._best_size,
+            self._bytes_per_item / self._GIB,
+            self._performance_cap,
+        )
+
+    def observe_oom(self, size: int) -> None:
+        """Shrink future chunks after an OOM; callers may retry smaller halves."""
+        safe_size = max(1, size // 2)
+        self._performance_cap = min(self._performance_cap, safe_size)
+        self._bytes_per_item *= 2
+        logger.warning(
+            "castvoice.batch stage=oom size=%d new_cap=%d estimated_item_gib=%.2f",
+            size,
+            self._performance_cap,
+            self._bytes_per_item / self._GIB,
+        )
+
+
 class CastVoiceBatchManager:
     """batch 合成的 in-process job queue。
 
-    單顆 GPU 意味著真正的並行度就是 1，不管佇列多深，所以一個背景 worker
-    task 逐一消化 asyncio.Queue 就夠了，不需要外部 broker（Redis 等）。
+    只有一個背景 worker，但同一 VoxCPM2 模型會以小批次送入 nano-vLLM
+    做 continuous batching。這不會放寬全局 GPU gate：整個 chunk 仍只算一個
+    GPU job，不同模型和 Barbet 也不會與它同時執行。
     取捨：process 重啟會遺失還沒跑完的 job（in-memory），但已完成的 mp3
     在完成當下就落地到磁碟，重啟後仍可透過 batch_id 查到已完成的部分
     （除非連 _batches 這個索引本身也重建 —— 目前沒做跨重啟的索引還原，
@@ -779,13 +1047,18 @@ class CastVoiceBatchManager:
     def __init__(
         self,
         *,
-        synthesize: Callable[[str, str, float, str | None], Awaitable[tuple[bytes, str]]],
+        synthesize_many: Callable[
+            [list[_CastVoiceBatchItem]],
+            Awaitable[list[tuple[bytes, str] | _CastVoiceError]],
+        ],
         storage_dir: Path,
+        chunk_size: Callable[[int], int],
     ) -> None:
-        self._synthesize = synthesize
+        self._synthesize_many = synthesize_many
         self._storage_dir = storage_dir
+        self._chunk_size = chunk_size
         self._batches: dict[str, _CastVoiceBatch] = {}
-        self._queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -818,8 +1091,7 @@ class CastVoiceBatchManager:
         await asyncio.to_thread(
             (self._storage_dir / batch_id).mkdir, parents=True, exist_ok=True
         )
-        for item in items:
-            self._queue.put_nowait((batch_id, item.index))
+        self._queue.put_nowait(batch_id)
         return batch_id
 
     def get(self, batch_id: str) -> _CastVoiceBatch | None:
@@ -830,36 +1102,52 @@ class CastVoiceBatchManager:
 
     async def _run_worker(self) -> None:
         while True:
-            batch_id, index = await self._queue.get()
+            batch_id = await self._queue.get()
             try:
-                await self._process_item(batch_id, index)
+                await self._process_batch(batch_id)
             except Exception:
                 logger.exception(
-                    "castvoice.batch stage=worker_failed batch_id=%s index=%d",
+                    "castvoice.batch stage=worker_failed batch_id=%s",
                     batch_id,
-                    index,
                 )
             finally:
                 self._queue.task_done()
 
-    async def _process_item(self, batch_id: str, index: int) -> None:
+    async def _process_batch(self, batch_id: str) -> None:
         batch = self._batches.get(batch_id)
         if batch is None:
             return
-        item = batch.items[index]
-        item.status = "processing"
-        try:
-            mp3_bytes, _request_id = await self._synthesize(
-                item.text, item.voice_id, item.speed, item.model_id
+        offset = 0
+        while offset < len(batch.items):
+            selected_size = self._chunk_size(len(batch.items) - offset)
+            chunk = batch.items[offset : offset + selected_size]
+            for item in chunk:
+                item.status = "processing"
+            started_at = time.perf_counter()
+            results = await self._synthesize_many(chunk)
+            if len(results) != len(chunk):
+                raise RuntimeError("batch synthesizer returned an unexpected result count")
+            for item, result in zip(chunk, results, strict=True):
+                if isinstance(result, _CastVoiceError):
+                    item.status = "failed"
+                    item.error = result.message
+                    continue
+                mp3_bytes, _ = result
+                await asyncio.to_thread(
+                    self.audio_path(batch_id, item.index).write_bytes, mp3_bytes
+                )
+                item.status = "done"
+            elapsed = time.perf_counter() - started_at
+            logger.info(
+                "castvoice.batch stage=chunk_completed batch_id=%s offset=%d "
+                "size=%d elapsed_seconds=%.3f items_per_second=%.3f",
+                batch_id,
+                offset,
+                len(chunk),
+                elapsed,
+                len(chunk) / elapsed if elapsed else 0.0,
             )
-        except _CastVoiceError as exc:
-            item.status = "failed"
-            item.error = exc.message
-            return
-        await asyncio.to_thread(
-            self.audio_path(batch_id, index).write_bytes, mp3_bytes
-        )
-        item.status = "done"
+            offset += len(chunk)
 
 
 def create_app(
@@ -1089,6 +1377,12 @@ def create_app(
                     )
 
             if engine_id == "voxcpm2":
+                try:
+                    model_id = await asyncio.to_thread(
+                        gateway.resolve_native_model_id, model_id
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
                 # prompt cloning 與文字控制是兩條互斥路徑。VoxCPM2 並沒有獨立的
                 # instruction channel；app.py 會把 control 包成「(指令)正文」送進
                 # TSLM。若同時帶 prompt 音訊／逐字稿，部分微調模型會把指令當正文
@@ -1194,14 +1488,27 @@ def create_app(
             headers=headers or None,
         )
 
+    def _castvoice_error_from_http(exc: HTTPException) -> _CastVoiceError:
+        error_code = {429: "rate_limited", 503: "service_unavailable"}.get(
+            exc.status_code, "request_failed"
+        )
+        return _CastVoiceError(
+            exc.status_code,
+            error_code,
+            str(exc.detail),
+            **dict(exc.headers or {}),
+        )
+
     async def _resolve_native_model_override(model_id: str) -> str:
         """驗證使用者指定的 model_id 是否為合法的 voxcpm2 原生模型
-        （base / full checkpoint / lora）。合法就原樣回傳，否則拋
-        model_not_found。"""
-        native_models = await asyncio.to_thread(gateway._native_models)
-        if not any(model["id"] == model_id for model in native_models):
-            raise _CastVoiceError(400, "model_not_found", f"找不到模型 {model_id}")
-        return model_id
+        （base / full checkpoint / lora）。合法就回傳正式 namespaced id；
+        舊 ID 與裸 checkpoint 名稱仍可作為別名，否則拋 model_not_found。"""
+        try:
+            return await asyncio.to_thread(gateway.resolve_native_model_id, model_id)
+        except ValueError as exc:
+            raise _CastVoiceError(
+                400, "model_not_found", f"找不到模型 {model_id}"
+            ) from exc
 
     async def _resolve_barbet_model_override(model_id: str, speaker_id: str) -> str:
         """驗證使用者指定的 model_id 是可用的 Barbet checkpoint，且該
@@ -1249,7 +1556,7 @@ def create_app(
                 resolved_model_id = (
                     await _resolve_native_model_override(model_id)
                     if model_id
-                    else BASE_MODEL_KEY
+                    else PUBLIC_BASE_MODEL_ID
                 )
                 reference_path = _resolve_reference_audio(definition["reference_preset_id"])
                 wav, _ = await gateway.synthesize_native(
@@ -1292,13 +1599,7 @@ def create_app(
                     speed=speed,
                 )
         except HTTPException as exc:
-            headers = dict(exc.headers or {})
-            error_code = {429: "rate_limited", 503: "service_unavailable"}.get(
-                exc.status_code, "request_failed"
-            )
-            raise _CastVoiceError(
-                exc.status_code, error_code, str(exc.detail), **headers
-            ) from exc
+            raise _castvoice_error_from_http(exc) from exc
         except _CastVoiceError:
             raise
         except Exception as exc:
@@ -1319,10 +1620,155 @@ def create_app(
 
         return mp3_bytes, request_id
 
-    batch_manager = CastVoiceBatchManager(
-        synthesize=_synthesize_castvoice,
-        storage_dir=_CASTVOICE_BATCH_DIR,
+    batch_sizer = DynamicBatchSizer(
+        gateway._read_int_setting(
+            "VOXCPM_BATCH_MAX_CONCURRENCY",
+            default=16,
+            minimum=1,
+        ),
+        device=demo.device,
     )
+
+    def _is_out_of_memory(error: BaseException) -> bool:
+        current: BaseException | None = error
+        visited: set[int] = set()
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            message = str(current).lower()
+            if "out of memory" in message or "cuda oom" in message:
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    async def _synthesize_castvoice_many(
+        items: list[_CastVoiceBatchItem],
+    ) -> list[tuple[bytes, str] | _CastVoiceError]:
+        """Use true nano-vLLM batching when a chunk targets one native model.
+
+        Mixed engines/models and invalid items retain the single-item behavior,
+        including independent errors, by falling back to ordered serial calls.
+        """
+
+        async def synthesize_serially() -> list[tuple[bytes, str] | _CastVoiceError]:
+            serial_results: list[tuple[bytes, str] | _CastVoiceError] = []
+            for item in items:
+                try:
+                    serial_results.append(
+                        await _synthesize_castvoice(
+                            item.text, item.voice_id, item.speed, item.model_id
+                        )
+                    )
+                except _CastVoiceError as exc:
+                    serial_results.append(exc)
+            return serial_results
+
+        if len(items) < 2:
+            return await synthesize_serially()
+        definitions = [
+            _CASTVOICE_DEFINITIONS_BY_ID.get(item.voice_id) for item in items
+        ]
+        if any(
+            definition is None or definition["engine_id"] != "voxcpm2"
+            for definition in definitions
+        ):
+            return await synthesize_serially()
+
+        try:
+            resolved_models: list[str] = []
+            requests: list[dict[str, Any]] = []
+            for item, definition in zip(items, definitions, strict=True):
+                text = item.text.strip()
+                if not text:
+                    raise _CastVoiceError(400, "invalid_text", "text 不可為空白")
+                if not 0.5 <= item.speed <= 2.0:
+                    raise _CastVoiceError(
+                        400, "invalid_speed", "speed 必須介於 0.5 與 2.0"
+                    )
+                assert definition is not None
+                preset = _find_reference_preset(definition["reference_preset_id"])
+                if preset is None:
+                    raise _CastVoiceError(
+                        503,
+                        "voice_unavailable",
+                        f"語音 {item.voice_id} 目前無法使用",
+                    )
+                resolved_model_id = (
+                    await _resolve_native_model_override(item.model_id)
+                    if item.model_id
+                    else PUBLIC_BASE_MODEL_ID
+                )
+                resolved_models.append(resolved_model_id)
+                requests.append(
+                    {
+                        "text": text,
+                        "control_instruction": "",
+                        "reference_path": _resolve_reference_audio(
+                            definition["reference_preset_id"]
+                        ),
+                        "prompt_text": preset.get("prompt_text", ""),
+                        "cfg_value": 2.0,
+                        "normalize": True,
+                        "denoise": False,
+                        "inference_timesteps": 30,
+                        "speed": item.speed,
+                    }
+                )
+        except (_CastVoiceError, HTTPException):
+            return await synthesize_serially()
+
+        if len(set(resolved_models)) != 1:
+            return await synthesize_serially()
+
+        request_ids = [uuid.uuid4().hex for _ in items]
+        started_at = time.perf_counter()
+        try:
+            wavs, _ = await gateway.synthesize_native_batch(
+                request_id=f"batch-{request_ids[0]}",
+                model_id=resolved_models[0],
+                requests=requests,
+            )
+            mp3s = await asyncio.gather(
+                *(asyncio.to_thread(_wav_to_mp3, wav) for wav in wavs)
+            )
+            batch_sizer.observe_success(
+                len(items),
+                time.perf_counter() - started_at,
+                sum(max(1, len(item.text.strip())) for item in items),
+            )
+        except HTTPException as exc:
+            error = _castvoice_error_from_http(exc)
+            return [error for _ in items]
+        except Exception as exc:
+            if _is_out_of_memory(exc) and len(items) > 1:
+                batch_sizer.observe_oom(len(items))
+                midpoint = len(items) // 2
+                logger.warning(
+                    "castvoice.batch stage=retry_smaller model=%s old_size=%d "
+                    "new_sizes=%d,%d",
+                    resolved_models[0],
+                    len(items),
+                    midpoint,
+                    len(items) - midpoint,
+                )
+                first = await _synthesize_castvoice_many(items[:midpoint])
+                second = await _synthesize_castvoice_many(items[midpoint:])
+                return [*first, *second]
+            logger.exception(
+                "castvoice.batch stage=native_chunk_failed model=%s size=%d",
+                resolved_models[0],
+                len(items),
+            )
+            error = _CastVoiceError(500, "internal_error", "語音合成失敗")
+            return [error for _ in items]
+
+        return list(zip(mp3s, request_ids, strict=True))
+
+    batch_manager = CastVoiceBatchManager(
+        synthesize_many=_synthesize_castvoice_many,
+        storage_dir=_CASTVOICE_BATCH_DIR,
+        chunk_size=batch_sizer.recommend,
+    )
+    logger.info("CastVoice dynamic batching enabled (runtime maximum: 16)")
     app.state.castvoice_batch_manager = batch_manager
 
     @app.get("/api/v1/tts/health")

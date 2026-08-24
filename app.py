@@ -1,9 +1,12 @@
+import asyncio
+import inspect
 import logging
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -373,8 +376,12 @@ class VoxCPMDemo:
         )
         return res[0]["text"].split("|>")[-1]
 
-    def generate_tts_audio(
+    def _prepare_tts_generation(
         self,
+        server: Any,
+        temp_files: list[str],
+        latent_cache: dict[str, Any],
+        *,
         text_input: str,
         control_instruction: str = "",
         reference_wav_path_input: Optional[str] = None,
@@ -384,11 +391,9 @@ class VoxCPMDemo:
         denoise: bool = True,
         inference_timesteps: int = 10,
         model_selection: str = BASE_MODEL_KEY,
-    ) -> Tuple[int, np.ndarray]:
-        server = self.get_or_load_voxcpm()
-
+    ) -> dict[str, Any]:
         text = (text_input or "").strip()
-        if len(text) == 0:
+        if not text:
             raise ValueError("Please input text to synthesize.")
 
         lora_name = self.lora_registry.ensure_registered(server, model_selection)
@@ -420,90 +425,133 @@ class VoxCPMDemo:
             final_text = self.text_normalizer.normalize(final_text)
 
         # 2. Denoising reference audio
-        temp_files = []
-        actual_ref_path = reference_wav_path_input if reference_wav_path_input else None
-        try:
-            if denoise and actual_ref_path:
-                if self.denoiser is None:
-                    logger.info("Loading ZipEnhancer denoiser...")
-                    from voxcpm.zipenhancer import ZipEnhancer
-                    self.denoiser = ZipEnhancer(self.zipenhancer_model_path)
-                import tempfile
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                    temp_files.append(tmp.name)
-                logger.info(f"Denoising reference audio {actual_ref_path} -> {temp_files[-1]}")
-                self.denoiser.enhance(actual_ref_path, output_path=temp_files[-1])
-                actual_ref_path = temp_files[-1]
+        actual_ref_path = reference_wav_path_input or None
+        if denoise and actual_ref_path:
+            if self.denoiser is None:
+                logger.info("Loading ZipEnhancer denoiser...")
+                from voxcpm.zipenhancer import ZipEnhancer
+                self.denoiser = ZipEnhancer(self.zipenhancer_model_path)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                temp_files.append(tmp.name)
+            logger.info(f"Denoising reference audio {actual_ref_path} -> {temp_files[-1]}")
+            self.denoiser.enhance(actual_ref_path, output_path=temp_files[-1])
+            actual_ref_path = temp_files[-1]
 
-            # 3. Encode latents
-            ref_audio_latents = None
-            prompt_latents = None
-            if actual_ref_path:
+        # 3. Encode latents. Reuse them within one batch when every item uses
+        # the same built-in reference clip.
+        ref_audio_latents = None
+        prompt_latents = None
+        if actual_ref_path:
+            encoded = latent_cache.get(actual_ref_path)
+            if encoded is None:
                 with open(actual_ref_path, "rb") as f:
                     wav_bytes = f.read()
                 logger.info(f"Encoding latents for reference audio: {len(wav_bytes)} bytes")
                 ext = os.path.splitext(actual_ref_path)[1].lstrip('.') or "wav"
                 encoded = server.encode_latents(wav_bytes, ext)
-                
-                if prompt_text_clean:
-                    prompt_latents = encoded
-                    ref_audio_latents = encoded
-                else:
-                    ref_audio_latents = encoded
+                latent_cache[actual_ref_path] = encoded
+            if prompt_text_clean:
+                prompt_latents = encoded
+                ref_audio_latents = encoded
+            else:
+                ref_audio_latents = encoded
 
-            # 4. Generate audio via Server Pool
-            # The bundled PyTorch runtime limits generation to roughly six
-            # audio tokens per target text token.  nano-vLLM only applies the
-            # absolute 2000-token ceiling, so a missed EOS could occupy the GPU
-            # for 9-11 minutes.  Chinese text is deliberately tokenized one
-            # character at a time by VoxCPM2; len(final_text) is therefore the
-            # matching estimate here (and a conservative overestimate for most
-            # Latin text).
-            text_length = max(1, len(final_text))
-            length_from_text = int(
-                text_length * getattr(self, "max_audio_text_ratio", 6.0) + 10
-            )
-            max_generate_length = min(
-                getattr(self, "max_generate_length", 2000), length_from_text
-            )
-            logger.info(
-                "Generating audio with vLLM engine for text: '%s...' "
-                "(max_generate_length=%d)",
-                final_text[:80],
-                max_generate_length,
-            )
-            buf = []
-            
-            generate_kwargs = {
-                "target_text": final_text,
-                "prompt_latents": prompt_latents,
-                "prompt_text": prompt_text_clean if prompt_text_clean else "",
-                "cfg_value": float(cfg_value_input),
-                "max_generate_length": max_generate_length,
-                "temperature": 1.0,
-                "lora_name": lora_name,
-            }
-            
-            # Inspect signature to be safe & compatible with both VoxCPM versions
-            import inspect
-            sig = inspect.signature(server.generate)
-            if "ref_audio_latents" in sig.parameters:
-                generate_kwargs["ref_audio_latents"] = ref_audio_latents
-            if "inference_timesteps" in sig.parameters:
-                generate_kwargs["inference_timesteps"] = int(inference_timesteps)
-                
-            for chunk in server.generate(**generate_kwargs):
-                buf.append(chunk)
+        # 4. Prepare nano-vLLM request.
+        text_length = max(1, len(final_text))
+        length_from_text = int(
+            text_length * getattr(self, "max_audio_text_ratio", 6.0) + 10
+        )
+        max_generate_length = min(
+            getattr(self, "max_generate_length", 2000), length_from_text
+        )
+        logger.info(
+            "Generating audio with vLLM engine for text: '%s...' "
+            "(max_generate_length=%d)",
+            final_text[:80],
+            max_generate_length,
+        )
+        generate_kwargs = {
+            "target_text": final_text,
+            "prompt_latents": prompt_latents,
+            "prompt_text": prompt_text_clean if prompt_text_clean else "",
+            "cfg_value": float(cfg_value_input),
+            "max_generate_length": max_generate_length,
+            "temperature": 1.0,
+            "lora_name": lora_name,
+        }
 
-            if not buf:
+        # Inspect signature to be safe & compatible with both VoxCPM versions.
+        sig = inspect.signature(server.generate)
+        if "ref_audio_latents" in sig.parameters:
+            generate_kwargs["ref_audio_latents"] = ref_audio_latents
+        if "inference_timesteps" in sig.parameters:
+            generate_kwargs["inference_timesteps"] = int(inference_timesteps)
+        return generate_kwargs
+
+    @staticmethod
+    def _generate_tts_requests(
+        server: Any, requests: list[dict[str, Any]]
+    ) -> list[np.ndarray]:
+        async_pool = getattr(server, "server_pool", None)
+        server_loop = getattr(server, "loop", None)
+        if len(requests) > 1 and async_pool is not None and server_loop is not None:
+
+            async def collect(request: dict[str, Any]) -> np.ndarray:
+                chunks = [chunk async for chunk in async_pool.generate(**request)]
+                if not chunks:
+                    raise RuntimeError(
+                        "Failed to generate audio (empty stream from backend)"
+                    )
+                return np.concatenate(chunks, axis=0)
+
+            async def collect_all() -> list[np.ndarray]:
+                results = await asyncio.gather(
+                    *(collect(request) for request in requests),
+                    return_exceptions=True,
+                )
+                # Wait for every submitted backend request before surfacing an
+                # error. Returning early would release the API's GPU gate while
+                # another request from this batch could still be running.
+                errors = [
+                    result for result in results if isinstance(result, BaseException)
+                ]
+                if errors:
+                    raise RuntimeError(
+                        f"{len(errors)} of {len(requests)} batched generations failed"
+                    ) from errors[0]
+                return [result for result in results if isinstance(result, np.ndarray)]
+
+            return server_loop.run_until_complete(collect_all())
+
+        results = []
+        for request in requests:
+            chunks = list(server.generate(**request))
+            if not chunks:
                 raise RuntimeError("Failed to generate audio (empty stream from backend)")
-            
-            wav = np.concatenate(buf, axis=0)
+            results.append(np.concatenate(chunks, axis=0))
+        return results
 
-            model_info = server.get_model_info()
-            sample_rate = int(model_info["sample_rate"])
-            return (sample_rate, wav)
-
+    def generate_tts_audio_batch(
+        self, requests: list[dict[str, Any]]
+    ) -> list[Tuple[int, np.ndarray]]:
+        if not requests:
+            return []
+        server = self.get_or_load_voxcpm()
+        temp_files: list[str] = []
+        latent_cache: dict[str, Any] = {}
+        try:
+            prepared = [
+                self._prepare_tts_generation(
+                    server,
+                    temp_files,
+                    latent_cache,
+                    **request,
+                )
+                for request in requests
+            ]
+            audio_results = self._generate_tts_requests(server, prepared)
+            sample_rate = int(server.get_model_info()["sample_rate"])
+            return [(sample_rate, audio) for audio in audio_results]
         finally:
             for tmp_path in temp_files:
                 if tmp_path and os.path.exists(tmp_path):
@@ -511,6 +559,34 @@ class VoxCPMDemo:
                         os.unlink(tmp_path)
                     except OSError:
                         pass
+
+    def generate_tts_audio(
+        self,
+        text_input: str,
+        control_instruction: str = "",
+        reference_wav_path_input: Optional[str] = None,
+        prompt_text: str = "",
+        cfg_value_input: float = 2.0,
+        do_normalize: bool = True,
+        denoise: bool = True,
+        inference_timesteps: int = 10,
+        model_selection: str = BASE_MODEL_KEY,
+    ) -> Tuple[int, np.ndarray]:
+        return self.generate_tts_audio_batch(
+            [
+                {
+                    "text_input": text_input,
+                    "control_instruction": control_instruction,
+                    "reference_wav_path_input": reference_wav_path_input,
+                    "prompt_text": prompt_text,
+                    "cfg_value_input": cfg_value_input,
+                    "do_normalize": do_normalize,
+                    "denoise": denoise,
+                    "inference_timesteps": inference_timesteps,
+                    "model_selection": model_selection,
+                }
+            ]
+        )[0]
 
 
 # ---------- UI ----------

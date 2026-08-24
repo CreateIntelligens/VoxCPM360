@@ -19,10 +19,11 @@ def isolate_generation_history(monkeypatch, tmp_path):
 
 
 class FakeRegistry:
-    checkpoints = ()
+    def __init__(self, checkpoints=()):
+        self.checkpoints = tuple(checkpoints)
 
     def refresh(self):
-        return ()
+        return self.checkpoints
 
     def describe(self, selection):
         return selection
@@ -47,6 +48,43 @@ class FakeDemo:
     def generate_tts_audio(self, **kwargs):
         self.calls.append(kwargs)
         return 16_000, np.zeros(320, dtype=np.float32)
+
+
+class FakeBatchDemo(FakeDemo):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.batch_calls = []
+
+    def generate_tts_audio_batch(self, requests):
+        self.batch_calls.append(requests)
+        return [
+            (16_000, np.zeros(320, dtype=np.float32)) for _ in requests
+        ]
+
+
+class FakeOOMBatchDemo(FakeBatchDemo):
+    def generate_tts_audio_batch(self, requests):
+        self.batch_calls.append(requests)
+        if len(requests) > 2:
+            raise RuntimeError("CUDA out of memory")
+        return [
+            (16_000, np.zeros(320, dtype=np.float32)) for _ in requests
+        ]
+
+
+class FakeLoraCheckpoint:
+    run_name = "lora-test"
+    label = "LoRA test"
+
+
+def wait_for_batch(client: TestClient, batch_id: str) -> dict:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/v1/tts/synthesize/batch/{batch_id}").json()
+        if status["done"]:
+            return status
+        time.sleep(0.05)
+    raise AssertionError("batch did not finish in time")
 
 
 class FakeBarbetCheckpoint:
@@ -117,7 +155,21 @@ def test_catalog_exposes_native_engine(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert [engine["id"] for engine in payload["engines"]] == ["voxcpm2"]
-    assert payload["engines"][0]["models"][0]["id"] == "__base__"
+    assert payload["engines"][0]["models"][0]["id"] == "base::__base__"
+
+
+def test_catalog_namespaces_lora_and_accepts_legacy_alias(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    demo = FakeDemo()
+    demo.lora_registry = FakeRegistry((FakeLoraCheckpoint(),))
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    model_ids = [model["id"] for model in gateway.catalog()["engines"][0]["models"]]
+    _, runtime_selection, canonical_id = gateway._switch_native_runtime("lora-test")
+
+    assert "lora::lora-test" in model_ids
+    assert runtime_selection == "lora-test"
+    assert canonical_id == "lora::lora-test"
 
 
 def test_catalog_exposes_available_reference_presets(monkeypatch, tmp_path):
@@ -324,7 +376,8 @@ def test_full_native_checkpoint_switches_runtime(monkeypatch, tmp_path):
             "/api/v1/synthesize",
             data={
                 "engine_id": "voxcpm2",
-                "model_id": "full::tai8",
+                # Bare directory names remain accepted as a compatibility alias.
+                "model_id": "tai8",
                 "text": "全參模型測試",
             },
         )
@@ -334,6 +387,54 @@ def test_full_native_checkpoint_switches_runtime(monkeypatch, tmp_path):
         assert base_demo.stops == 1
         assert full_demo.loads == 1
         assert full_demo.calls[0]["model_selection"] == "__base__"
+
+
+def test_dynamic_batch_sizer_uses_cuda_and_cgroup_headroom(monkeypatch):
+    gib = 1024**3
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "_cuda_headroom", staticmethod(lambda: 10 * gib)
+    )
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "_cgroup_headroom", staticmethod(lambda: 20 * gib)
+    )
+    monkeypatch.setenv("VOXCPM_BATCH_MEMORY_RESERVE_GIB", "2")
+    monkeypatch.setenv("VOXCPM_BATCH_MEMORY_PER_ITEM_GIB", "1.5")
+
+    sizer = api.DynamicBatchSizer(max_concurrency=16)
+
+    assert sizer.recommend(20) == 5
+    assert sizer.recommend(3) == 3
+
+
+def test_dynamic_batch_sizer_falls_back_to_one_without_memory_signal(monkeypatch):
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "_cuda_headroom", staticmethod(lambda: None)
+    )
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "_cgroup_headroom", staticmethod(lambda: None)
+    )
+
+    assert api.DynamicBatchSizer(max_concurrency=16).recommend(20) == 1
+
+
+def test_dynamic_batch_sizer_learns_headroom_and_shrinks_after_oom(monkeypatch):
+    gib = 1024**3
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "_cuda_headroom", staticmethod(lambda: 10 * gib)
+    )
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "_cgroup_headroom", staticmethod(lambda: 20 * gib)
+    )
+    monkeypatch.setenv("VOXCPM_BATCH_MEMORY_RESERVE_GIB", "2")
+    monkeypatch.setenv("VOXCPM_BATCH_MEMORY_PER_ITEM_GIB", "1.5")
+    sizer = api.DynamicBatchSizer(max_concurrency=16)
+
+    assert sizer.recommend(20) == 5
+    sizer.observe_success(size=5, elapsed=5.0, work_units=50)
+    assert sizer.recommend(20) == 7
+
+    sizer.observe_oom(size=7)
+    assert sizer.recommend(20) == 3
 
 
 def test_local_barbet_catalog_and_synthesis(monkeypatch):
@@ -840,17 +941,73 @@ def test_castvoice_batch_item_supports_model_override(monkeypatch):
             },
         )
         assert submit.status_code == 202
-        batch_id = submit.json()["batch_id"]
-
-        deadline = time.monotonic() + 5.0
-        status = None
-        while time.monotonic() < deadline:
-            status = client.get(f"/api/v1/tts/synthesize/batch/{batch_id}").json()
-            if status["done"]:
-                break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("batch did not finish in time")
+        status = wait_for_batch(client, submit.json()["batch_id"])
 
     assert status["items"][0]["status"] == "done"
     assert runtime.calls[0]["model_id"] == "barbet::barbet-tw-v2"
+
+
+def test_castvoice_batch_submits_same_model_items_together(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "recommend", lambda self, pending: min(pending, 4)
+    )
+    demo = FakeBatchDemo()
+    app = api.create_app(
+        demo,
+        barbet_runtime=FakeBarbetRuntime(),
+        mount_legacy=False,
+    )
+
+    with TestClient(app) as client:
+        submit = client.post(
+            "/api/v1/tts/synthesize/batch",
+            json={
+                "items": [
+                    {
+                        "text": f"第 {index} 句",
+                        "voice_id": "voxcpm2-tai8-female-01",
+                        "model_id": "base::__base__",
+                    }
+                    for index in range(4)
+                ]
+            },
+        )
+        assert submit.status_code == 202
+        status = wait_for_batch(client, submit.json()["batch_id"])
+
+    assert [item["status"] for item in status["items"]] == ["done"] * 4
+    assert len(demo.batch_calls) == 1
+    assert len(demo.batch_calls[0]) == 4
+    assert demo.calls == []
+
+
+def test_castvoice_batch_retries_smaller_chunks_after_oom(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "recommend", lambda self, pending: min(pending, 4)
+    )
+    demo = FakeOOMBatchDemo()
+    app = api.create_app(
+        demo,
+        barbet_runtime=FakeBarbetRuntime(),
+        mount_legacy=False,
+    )
+
+    with TestClient(app) as client:
+        submit = client.post(
+            "/api/v1/tts/synthesize/batch",
+            json={
+                "items": [
+                    {
+                        "text": f"第 {index} 句",
+                        "voice_id": "voxcpm2-tai8-female-01",
+                    }
+                    for index in range(4)
+                ]
+            },
+        )
+        status = wait_for_batch(client, submit.json()["batch_id"])
+
+    assert [item["status"] for item in status["items"]] == ["done"] * 4
+    assert [len(requests) for requests in demo.batch_calls] == [4, 2, 2]
