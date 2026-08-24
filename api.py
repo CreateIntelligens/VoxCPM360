@@ -900,6 +900,7 @@ def create_app(
                 "id": preset["id"],
                 "label": preset["label"],
                 "description": preset["description"],
+                "language": preset["language"],
                 # 前端顯示用 —— 讓使用者看得到內建參考音的逐字稿，
                 # 也能理解「為什麼不用自己填」（未上傳時後端會自動帶入）。
                 "prompt_text": preset.get("prompt_text", ""),

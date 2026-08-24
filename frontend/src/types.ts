@@ -38,6 +38,8 @@ export interface ReferenceAudioPreset {
   id: string;
   label: string;
   description: string;
+  /** BCP 47 語言標籤：nan-TW 為台語，zh-TW 為台灣普通話。 */
+  language: "nan-TW" | "zh-TW";
   /** 內建參考音的逐字稿。未上傳自訂音檔時後端會自動帶入，使用者不必自己填。 */
   prompt_text: string;
 }

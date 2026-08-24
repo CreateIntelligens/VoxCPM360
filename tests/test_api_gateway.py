@@ -137,6 +137,11 @@ def test_catalog_exposes_available_reference_presets(monkeypatch, tmp_path):
         "中年男聲",
         "Hayley 開心說開場白",
     ]
+    assert [preset["language"] for preset in payload["reference_presets"]] == [
+        "nan-TW",
+        "nan-TW",
+        "zh-TW",
+    ]
     assert payload["default_reference_preset_id"] == "middle-aged-female"
 
 
