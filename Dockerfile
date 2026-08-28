@@ -54,7 +54,11 @@ ARG TORCH_ARCH_LIST="8.6;9.0;12.0"
 # exhaust RAM. Empty (default) = auto-detect at build time: one job per 6GB
 # of available RAM, capped at core count. Override: --build-arg MAX_JOBS=N.
 ARG MAX_JOBS=""
-ENV TORCH_CUDA_ARCH_LIST="${TORCH_ARCH_LIST}" \
+# 慢速線路（如 ARM 機到 pytorch CDN 僅 ~0.4MB/s）下載大 wheel 會觸發
+# uv 預設逾時，可用 --build-arg UV_HTTP_TIMEOUT=900 放寬。
+ARG UV_HTTP_TIMEOUT=300
+ENV UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT}" \
+    TORCH_CUDA_ARCH_LIST="${TORCH_ARCH_LIST}" \
     FLASH_ATTN_CUDA_ARCHS="${TORCH_ARCH_LIST}" \
     FLASH_ATTENTION_FORCE_BUILD=TRUE \
     NVCC_THREADS=1
