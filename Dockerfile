@@ -40,6 +40,11 @@ RUN python3.10 -m venv /opt/venv
 # 在編譯層之後才 COPY 進來）。
 COPY scripts/patch_flash_attention_arch.py ./scripts/patch_flash_attention_arch.py
 
+# wheels/ 內若已有本平台的 flash-attn wheel（從 GH Release 下載或先前編譯導出），
+# 直接安裝、整段編譯跳過（2.5h → 30s）。注意：走 wheel 時 TORCH_ARCH_LIST
+# 不影響 flash-attn（wheel 內含編譯時的架構），標準 wheel 應為三架構版。
+COPY wheels/ /tmp/wheels/
+
 # Target CUDA compute capabilities are configurable at build time so the same
 # Dockerfile works on Ampere (8.6), Hopper (9.0) and Blackwell (12.0) hosts.
 # Pass --build-arg TORCH_ARCH_LIST=12.0 to build for a single architecture only
@@ -63,14 +68,21 @@ RUN . /opt/venv/bin/activate && \
     echo "flash-attn build: MAX_JOBS=$MAX_JOBS (cores=$cores)" && \
     uv pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
-    python3 -c "import torch.utils.cpp_extension as c; p = c.__file__; content = open(p).read().replace('def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:', 'def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:\n    return'); open(p, 'w').write(content)" && \
-    git clone --branch v2.6.3 --single-branch https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
-    python3 scripts/patch_flash_attention_arch.py /tmp/flash-attention/setup.py --architectures "${TORCH_ARCH_LIST}" && \
-    sed -i 's/dprops->major == 9 \&\& dprops->minor == 0/(dprops->major == 9 \&\& dprops->minor == 0) || dprops->major >= 12/g' /tmp/flash-attention/csrc/flash_attn/flash_api.cpp && \
-    cd /tmp/flash-attention && \
-    uv pip install --no-build-isolation . && \
-    cd /app && \
-    rm -rf /tmp/flash-attention
+    if ls /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl >/dev/null 2>&1; then \
+        echo "flash-attn: installing prebuilt wheel, skipping compilation" && \
+        uv pip install --no-cache-dir /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl; \
+    else \
+        python3 -c "import torch.utils.cpp_extension as c; p = c.__file__; content = open(p).read().replace('def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:', 'def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:\n    return'); open(p, 'w').write(content)" && \
+        git clone --branch v2.6.3 --single-branch https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
+        python3 scripts/patch_flash_attention_arch.py /tmp/flash-attention/setup.py --architectures "${TORCH_ARCH_LIST}" && \
+        sed -i 's/dprops->major == 9 \&\& dprops->minor == 0/(dprops->major == 9 \&\& dprops->minor == 0) || dprops->major >= 12/g' /tmp/flash-attention/csrc/flash_attn/flash_api.cpp && \
+        cd /tmp/flash-attention && \
+        python3 -m pip wheel --no-build-isolation --no-deps -w /tmp/wheels . && \
+        uv pip install --no-cache-dir /tmp/wheels/flash_attn-*.whl && \
+        cd /app && \
+        rm -rf /tmp/flash-attention; \
+    fi
+
 
 # 應用層依賴（含測試依賴，讓容器內可直接跑 pytest）。位於編譯層之後，
 # 改 pyproject.toml 只會重跑這一層（約一分鐘），不會重編 flash-attn。
@@ -79,6 +91,11 @@ RUN . /opt/venv/bin/activate && \
     uv pip install --no-cache-dir -r pyproject.toml && \
     uv pip install --no-cache-dir nano-vllm-voxcpm && \
     uv pip install --no-cache-dir -r pyproject.toml --extra test
+
+# 編譯後把 wheel 導出保存（每個 CPU 架構跑一次即可，之後所有機器免編譯）：
+#   docker buildx build --target flash-wheel -o type=local,dest=wheels .
+FROM scratch AS flash-wheel
+COPY --from=builder /tmp/wheels/ /
 
 # ==========================================
 # Stage 3: Runner image (Production/Runtime)

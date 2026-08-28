@@ -55,3 +55,4 @@ frontend/vite.config.d.ts
 !/models/native/.gitkeep
 /models/barbet/*
 !/models/barbet/.gitkeep
+wheels/*.whl
