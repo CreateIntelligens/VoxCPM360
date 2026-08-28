@@ -185,16 +185,12 @@ def test_catalog_exposes_available_reference_presets(monkeypatch, tmp_path):
     assert response.status_code == 200
     payload = response.json()
     assert [preset["label"] for preset in payload["reference_presets"]] == [
-        "中年女聲",
-        "中年男聲",
-        "Hayley 開心說開場白",
+        preset["label"] for preset in api._REFERENCE_AUDIO_PRESETS
     ]
     assert [preset["language"] for preset in payload["reference_presets"]] == [
-        "nan-TW",
-        "nan-TW",
-        "zh-TW",
+        preset["language"] for preset in api._REFERENCE_AUDIO_PRESETS
     ]
-    assert payload["default_reference_preset_id"] == "middle-aged-female"
+    assert payload["default_reference_preset_id"] == "cosy-young-female-01"
 
 
 def test_model_registry_endpoint_returns_document(monkeypatch, tmp_path):
@@ -236,7 +232,7 @@ def test_native_synthesis_uses_selected_reference_preset(
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     monkeypatch.delenv("VOXCPM_DEFAULT_REFERENCE", raising=False)
     monkeypatch.setattr(api, "_REFERENCE_AUDIO_DIR", tmp_path)
-    selected_reference = tmp_path / "tai8_female_drama1_002.wav"
+    selected_reference = tmp_path / "cosy-young-female-01.mp3"
     selected_reference.write_bytes(b"RIFF")
     demo = FakeDemo()
     app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
@@ -248,13 +244,13 @@ def test_native_synthesis_uses_selected_reference_preset(
                 "engine_id": "voxcpm2",
                 "model_id": "__base__",
                 "text": "台語測試",
-                "reference_preset_id": "middle-aged-male",
+                "reference_preset_id": "cosy-young-female-01",
             },
         )
 
     assert response.status_code == 200
     assert demo.calls[0]["reference_wav_path_input"] == str(selected_reference)
-    assert demo.calls[0]["prompt_text"] == "只要一套比基尼這樣就夠了"
+    assert demo.calls[0]["prompt_text"] == api._COSY_PROMPT_TEXT
     assert demo.calls[0]["control_instruction"] == ""
 
 
@@ -630,10 +626,7 @@ def test_castvoice_voices_lists_available_voxcpm2_and_barbet_voices(monkeypatch)
     assert body["model_version"]
     voice_ids = {voice["voice_id"] for voice in body["voices"]}
     assert voice_ids == {
-        "voxcpm2-tai8-female-01",
-        "voxcpm2-tai8-male-01",
-        "voxcpm2-hayley-01",
-        "barbet-hung-yi-lee",
+        definition["voice_id"] for definition in api._CASTVOICE_DEFINITIONS
     }
     for voice in body["voices"]:
         assert voice["gender"] in {"male", "female", "unknown"}
@@ -645,10 +638,11 @@ def test_castvoice_voices_omits_barbet_when_speaker_unavailable(monkeypatch):
     app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
 
     with TestClient(app) as client:
-        voice_ids = {v["voice_id"] for v in client.get("/api/v1/tts/voices").json()["voices"]}
+        voices = client.get("/api/v1/tts/voices").json()["voices"]
+        voice_ids = {voice["voice_id"] for voice in voices}
 
     assert "barbet-hung-yi-lee" not in voice_ids
-    assert "voxcpm2-tai8-female-01" in voice_ids
+    assert "voxcpm2-cosy-young-female-01" in voice_ids
 
 
 def test_castvoice_synthesize_returns_mp3_for_voxcpm2_voice(monkeypatch):
@@ -659,7 +653,7 @@ def test_castvoice_synthesize_returns_mp3_for_voxcpm2_voice(monkeypatch):
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/tts/synthesize",
-            json={"text": "台語測試", "voice_id": "voxcpm2-tai8-female-01"},
+            json={"text": "台語測試", "voice_id": "voxcpm2-cosy-young-female-01"},
         )
 
     assert response.status_code == 200
@@ -698,7 +692,7 @@ def test_castvoice_synthesize_rejects_empty_text(monkeypatch):
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/tts/synthesize",
-            json={"text": "  ", "voice_id": "voxcpm2-tai8-female-01"},
+            json={"text": "  ", "voice_id": "voxcpm2-cosy-young-female-01"},
         )
 
     assert response.status_code == 400
@@ -726,7 +720,11 @@ def test_castvoice_synthesize_rejects_unsupported_format(monkeypatch):
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/tts/synthesize",
-            json={"text": "hi", "voice_id": "voxcpm2-tai8-female-01", "format": "wav"},
+            json={
+                "text": "hi",
+                "voice_id": "voxcpm2-cosy-young-female-01",
+                "format": "wav",
+            },
         )
 
     assert response.status_code == 400
@@ -741,11 +739,11 @@ def test_castvoice_synthesize_requires_bearer_token_when_configured(monkeypatch)
     with TestClient(app) as client:
         unauthorized = client.post(
             "/api/v1/tts/synthesize",
-            json={"text": "hi", "voice_id": "voxcpm2-tai8-female-01"},
+            json={"text": "hi", "voice_id": "voxcpm2-cosy-young-female-01"},
         )
         authorized = client.post(
             "/api/v1/tts/synthesize",
-            json={"text": "hi", "voice_id": "voxcpm2-tai8-female-01"},
+            json={"text": "hi", "voice_id": "voxcpm2-cosy-young-female-01"},
             headers={"Authorization": "Bearer secret-token"},
         )
 
@@ -774,12 +772,12 @@ def test_castvoice_synthesize_returns_429_with_retry_after_when_queue_full(monke
             first = pool.submit(
                 client.post,
                 "/api/v1/tts/synthesize",
-                json={"text": "第一筆", "voice_id": "voxcpm2-tai8-female-01"},
+                json={"text": "第一筆", "voice_id": "voxcpm2-cosy-young-female-01"},
             )
             assert native_started.wait(timeout=2)
             second = client.post(
                 "/api/v1/tts/synthesize",
-                json={"text": "第二筆", "voice_id": "voxcpm2-tai8-female-01"},
+                json={"text": "第二筆", "voice_id": "voxcpm2-cosy-young-female-01"},
             )
             release_native.set()
             first_response = first.result()
@@ -800,7 +798,7 @@ def test_castvoice_synthesize_accepts_valid_voxcpm2_model_override(monkeypatch):
             "/api/v1/tts/synthesize",
             json={
                 "text": "hi",
-                "voice_id": "voxcpm2-tai8-female-01",
+                "voice_id": "voxcpm2-cosy-young-female-01",
                 "model_id": "__base__",
             },
         )
@@ -818,7 +816,7 @@ def test_castvoice_synthesize_rejects_unknown_voxcpm2_model_override(monkeypatch
             "/api/v1/tts/synthesize",
             json={
                 "text": "hi",
-                "voice_id": "voxcpm2-tai8-female-01",
+                "voice_id": "voxcpm2-cosy-young-female-01",
                 "model_id": "does-not-exist",
             },
         )
@@ -966,7 +964,7 @@ def test_castvoice_batch_submits_same_model_items_together(monkeypatch):
                 "items": [
                     {
                         "text": f"第 {index} 句",
-                        "voice_id": "voxcpm2-tai8-female-01",
+                        "voice_id": "voxcpm2-cosy-young-female-01",
                         "model_id": "base::__base__",
                     }
                     for index in range(4)
@@ -1001,7 +999,7 @@ def test_castvoice_batch_retries_smaller_chunks_after_oom(monkeypatch):
                 "items": [
                     {
                         "text": f"第 {index} 句",
-                        "voice_id": "voxcpm2-tai8-female-01",
+                        "voice_id": "voxcpm2-cosy-young-female-01",
                     }
                     for index in range(4)
                 ]
