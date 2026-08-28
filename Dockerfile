@@ -70,7 +70,7 @@ RUN . /opt/venv/bin/activate && \
     [ "$jobs" -le "$cores" ] || jobs="$cores" && \
     export MAX_JOBS="$jobs" && \
     echo "flash-attn build: MAX_JOBS=$MAX_JOBS (cores=$cores)" && \
-    uv pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 && \
+    uv pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 --find-links /tmp/wheels && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
     if ls /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl >/dev/null 2>&1; then \
         echo "flash-attn: installing prebuilt wheel, skipping compilation" && \
