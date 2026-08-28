@@ -72,6 +72,12 @@ RUN . /opt/venv/bin/activate && \
     echo "flash-attn build: MAX_JOBS=$MAX_JOBS (cores=$cores)" && \
     uv pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 --find-links /tmp/wheels && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
+    WHEEL_NAME="flash_attn-2.6.3-cp310-cp310-linux_$(uname -m).whl" && \
+    if ! ls /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl >/dev/null 2>&1; then \
+        curl -fsSL --retry 3 -o "/tmp/wheels/${WHEEL_NAME}" \
+            "https://github.com/CreateIntelligens/VoxCPM360/releases/download/flash-attn-wheels/${WHEEL_NAME}" \
+            || rm -f "/tmp/wheels/${WHEEL_NAME}"; \
+    fi && \
     if ls /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl >/dev/null 2>&1; then \
         echo "flash-attn: installing prebuilt wheel, skipping compilation" && \
         uv pip install --no-cache-dir /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl; \
