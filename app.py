@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -552,6 +553,61 @@ class VoxCPMDemo:
             audio_results = self._generate_tts_requests(server, prepared)
             sample_rate = int(server.get_model_info()["sample_rate"])
             return [(sample_rate, audio) for audio in audio_results]
+        finally:
+            for tmp_path in temp_files:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+    def generate_tts_audio_stream(
+        self, request: dict[str, Any]
+    ) -> Iterator[np.ndarray]:
+        """逐段產生單一 nano-vLLM TTS 請求，並綁定暫存檔生命週期。"""
+        server = self.get_or_load_voxcpm()
+        temp_files: list[str] = []
+        latent_cache: dict[str, Any] = {}
+        try:
+            prepared = self._prepare_tts_generation(
+                server,
+                temp_files,
+                latent_cache,
+                **request,
+            )
+            yielded = False
+            async_pool = getattr(server, "server_pool", None)
+            server_loop = getattr(server, "loop", None)
+            if async_pool is not None and server_loop is not None:
+                async_generator = async_pool.generate(**prepared)
+                try:
+                    while True:
+                        try:
+                            chunk = server_loop.run_until_complete(
+                                async_generator.__anext__()
+                            )
+                        except StopAsyncIteration:
+                            break
+                        yielded = True
+                        yield np.asarray(chunk, dtype=np.float32)
+                finally:
+                    # sync wrapper 的 close 不保證會取消底層 async CUDA request。
+                    # 等 aclose 完成後 worker 才能離開，GPU gate 才可安全釋放。
+                    server_loop.run_until_complete(async_generator.aclose())
+            else:
+                generator = server.generate(**prepared)
+                try:
+                    for chunk in generator:
+                        yielded = True
+                        yield np.asarray(chunk, dtype=np.float32)
+                finally:
+                    close = getattr(generator, "close", None)
+                    if callable(close):
+                        close()
+            if not yielded:
+                raise RuntimeError(
+                    "Failed to generate audio (empty stream from backend)"
+                )
         finally:
             for tmp_path in temp_files:
                 if tmp_path and os.path.exists(tmp_path):

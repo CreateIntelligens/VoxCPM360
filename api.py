@@ -7,22 +7,27 @@ import json
 import logging
 import os
 import secrets
+import struct
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
+from collections.abc import AsyncIterator
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from anyio import CancelScope
 import librosa
 import numpy as np
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from app import VoxCPMDemo, create_demo_interface
@@ -375,13 +380,37 @@ def _save_generation_history(record: dict[str, Any], wav: bytes) -> None:
     metadata_path = _HISTORY_DIR / f"{history_id}.json"
     wav_temp = _HISTORY_DIR / f".{history_id}.wav.tmp"
     metadata_temp = _HISTORY_DIR / f".{history_id}.json.tmp"
-    wav_temp.write_bytes(wav)
-    metadata_temp.write_text(
-        json.dumps(record, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    os.replace(wav_temp, wav_path)
-    os.replace(metadata_temp, metadata_path)
+    try:
+        wav_temp.write_bytes(wav)
+        metadata_temp.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(wav_temp, wav_path)
+        os.replace(metadata_temp, metadata_path)
+    except BaseException:
+        # WAV 與 metadata 是同一筆紀錄；只成功 replace 其中一個時也要回滾。
+        for final_path in (wav_path, metadata_path):
+            try:
+                final_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        # 部分寫入失敗時不可留下會永遠累積的隱藏暫存檔。
+        for temp_path in (wav_temp, metadata_temp):
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _delete_generation_history(history_id: str) -> None:
+    for suffix in (".wav", ".json"):
+        try:
+            (_HISTORY_DIR / f"{history_id}{suffix}").unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _wav_to_mp3(wav_bytes: bytes) -> bytes:
@@ -448,6 +477,143 @@ def _load_generation_history(limit: int) -> list[dict[str, Any]]:
         records.append(record)
     records.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return records
+
+
+@dataclass(frozen=True)
+class _StreamingReady:
+    sample_rate: int
+
+
+@dataclass
+class _PreparedSynthesisRequest:
+    engine_id: str
+    model_id: str
+    text: str
+    control_instruction: str
+    prompt_text: str
+    speaker_id: str
+    cfg_value: float
+    inference_timesteps: int
+    normalize: bool
+    denoise: bool
+    speed: float
+    seed: int | None
+    active_reference: str | None
+    reference_label: str
+    temp_path: str | None
+
+
+_STREAMING_END = object()
+
+
+class _NativeSynthesisStream:
+    """已通過 admission 並持有 GPU gate 的非同步音訊 iterator。"""
+
+    def __init__(
+        self,
+        *,
+        queue: asyncio.Queue[Any],
+        stop_event: threading.Event,
+        worker_task: asyncio.Task[None],
+        cleanup_done: asyncio.Event,
+        sample_rate: int,
+    ) -> None:
+        self._queue = queue
+        self._stop_event = stop_event
+        self._worker_task = worker_task
+        self._cleanup_done = cleanup_done
+        self.sample_rate = sample_rate
+        self._closed = False
+
+    def __aiter__(self) -> _NativeSynthesisStream:
+        return self
+
+    async def __anext__(self) -> np.ndarray:
+        item = await self._queue.get()
+        if item is _STREAMING_END:
+            raise StopAsyncIteration
+        if isinstance(item, BaseException):
+            raise item
+        return np.asarray(item, dtype=np.float32)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            await self._cleanup_done.wait()
+            return
+        self._closed = True
+        self._stop_event.set()
+        try:
+            await asyncio.shield(self._worker_task)
+        except asyncio.CancelledError:
+            # CUDA worker 無法被 asyncio 取消；即使 client task 正在取消，仍須
+            # 等 thread 完整離開後才可讓下一筆取得 GPU gate。
+            await self._worker_task
+            raise
+        finally:
+            await self._cleanup_done.wait()
+
+
+class _ManagedStreamingResponse(StreamingResponse):
+    """先 commit 再送 ASGI final body；final send 失敗則 rollback。"""
+
+    def __init__(
+        self,
+        *args: Any,
+        on_complete: Callable[[], Awaitable[None]],
+        on_rollback: Callable[[], Awaitable[None]],
+        on_close: Callable[[], Awaitable[None]],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._on_complete = on_complete
+        self._on_rollback = on_rollback
+        self._on_close = on_close
+
+    async def stream_response(self, send: Callable[..., Awaitable[None]]) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": self.status_code,
+                "headers": self.raw_headers,
+            }
+        )
+        async for chunk in self.body_iterator:
+            if not isinstance(chunk, (bytes, memoryview)):
+                chunk = chunk.encode(self.charset)
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": chunk,
+                    "more_body": True,
+                }
+            )
+        try:
+            # ASGI 2.3 以 cancel scope 回報 client disconnect。history 寫入在
+            # thread 中不可取消，故必須讓 commit 完整落地後再 rollback；否則
+            # rollback 可能先找不到檔案，thread 隨後才把失敗串流寫進 history。
+            with CancelScope(shield=True):
+                await self._on_complete()
+            await send(
+                {"type": "http.response.body", "body": b"", "more_body": False}
+            )
+        except BaseException:
+            with CancelScope(shield=True):
+                await self._on_rollback()
+            raise
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Callable[..., Awaitable[dict[str, Any]]],
+        send: Callable[..., Awaitable[None]],
+    ) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette 的 ASGI 2.3 disconnect listener 會取消 streaming task；
+            # worker close 與 GPU gate 釋放仍須完成，不能繼承該 cancel scope。
+            with CancelScope(shield=True):
+                await self._on_close()
 
 
 class TTSGateway:
@@ -657,6 +823,154 @@ class TTSGateway:
             async with self._admission_lock:
                 self._inflight_jobs -= 1
 
+    async def _run_gpu_job_streaming(
+        self,
+        *,
+        request_id: str,
+        model_id: str,
+        work: Callable[
+            [asyncio.Queue[Any], threading.Event, asyncio.AbstractEventLoop],
+            None,
+        ],
+    ) -> _NativeSynthesisStream:
+        """建立已取得 GPU gate 的 streaming session。
+
+        Admission、排隊逾時與 worker 初始化都在回傳前完成，因此 429、503
+        與首段生成前的錯誤仍能成為正式 HTTP status，而非已送出 200 後才截斷。
+        """
+        engine_id = "voxcpm2"
+        queued_at = time.perf_counter()
+        async with self._admission_lock:
+            capacity = self._max_pending_jobs + 1
+            if self._inflight_jobs >= capacity:
+                logger.warning(
+                    "synthesis.request request_id=%s stage=rejected reason=queue_full "
+                    "engine=%s model=%s inflight=%d capacity=%d",
+                    request_id,
+                    engine_id,
+                    model_id,
+                    self._inflight_jobs,
+                    capacity,
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail="語音生成佇列已滿，請稍後再試",
+                    headers={"Retry-After": "30", "X-Request-ID": request_id},
+                )
+            self._inflight_jobs += 1
+            queue_position = self._inflight_jobs - 1
+
+        logger.info(
+            "synthesis.request request_id=%s stage=queued engine=%s model=%s "
+            "queue_position=%d inflight=%d",
+            request_id,
+            engine_id,
+            model_id,
+            queue_position,
+            self._inflight_jobs,
+        )
+
+        acquired = False
+        cleanup_owns_resources = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._gpu_lock.acquire(),
+                    timeout=self._queue_timeout_seconds,
+                )
+                acquired = True
+            except asyncio.TimeoutError as exc:
+                queue_wait = time.perf_counter() - queued_at
+                logger.warning(
+                    "synthesis.request request_id=%s stage=rejected "
+                    "reason=queue_timeout engine=%s model=%s "
+                    "queue_wait_seconds=%.3f",
+                    request_id,
+                    engine_id,
+                    model_id,
+                    queue_wait,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="等待語音生成資源逾時，請稍後再試",
+                    headers={"Retry-After": "30", "X-Request-ID": request_id},
+                ) from exc
+
+            started_at = time.perf_counter()
+            queue_wait = started_at - queued_at
+            logger.info(
+                "synthesis.request request_id=%s stage=started engine=%s model=%s "
+                "queue_wait_seconds=%.3f",
+                request_id,
+                engine_id,
+                model_id,
+                queue_wait,
+            )
+
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=8)
+            stop_event = threading.Event()
+            cleanup_done = asyncio.Event()
+            worker_task = asyncio.create_task(
+                asyncio.to_thread(work, queue, stop_event, loop)
+            )
+            cleanup_owns_resources = True
+
+            async def cleanup() -> None:
+                execution_time = time.perf_counter() - started_at
+                if acquired and self._gpu_lock.locked():
+                    self._gpu_lock.release()
+                async with self._admission_lock:
+                    self._inflight_jobs -= 1
+                logger.info(
+                    "synthesis.request request_id=%s stage=worker_finished "
+                    "engine=%s model=%s queue_wait_seconds=%.3f "
+                    "execution_seconds=%.3f",
+                    request_id,
+                    engine_id,
+                    model_id,
+                    queue_wait,
+                    execution_time,
+                )
+                cleanup_done.set()
+
+            def schedule_cleanup(_: asyncio.Task[None]) -> None:
+                loop.create_task(cleanup())
+
+            worker_task.add_done_callback(schedule_cleanup)
+
+            try:
+                ready = await queue.get()
+            except asyncio.CancelledError:
+                stop_event.set()
+                await asyncio.shield(worker_task)
+                await cleanup_done.wait()
+                raise
+            if isinstance(ready, BaseException):
+                stop_event.set()
+                await worker_task
+                await cleanup_done.wait()
+                raise ready
+            if not isinstance(ready, _StreamingReady):
+                stop_event.set()
+                await worker_task
+                await cleanup_done.wait()
+                raise RuntimeError("串流 worker 未回報取樣率")
+            return _NativeSynthesisStream(
+                queue=queue,
+                stop_event=stop_event,
+                worker_task=worker_task,
+                cleanup_done=cleanup_done,
+                sample_rate=ready.sample_rate,
+            )
+        except BaseException:
+            if not cleanup_owns_resources and acquired:
+                self._gpu_lock.release()
+            if not cleanup_owns_resources:
+                async with self._admission_lock:
+                    self._inflight_jobs -= 1
+            raise
+
     def _native_models(self) -> list[dict[str, Any]]:
         self.demo.lora_registry.refresh()
         self.full_model_registry.refresh()
@@ -815,6 +1129,7 @@ class TTSGateway:
                     "reference_audio": True,
                     "speaker_selection": False,
                     "seed": False,
+                    "streaming": True,
                 },
                 "models": self._native_models(),
             }
@@ -833,6 +1148,7 @@ class TTSGateway:
                         "reference_audio": True,
                         "speaker_selection": True,
                         "seed": True,
+                        "streaming": False,
                     },
                     "models": barbet_models,
                 }
@@ -875,6 +1191,26 @@ class TTSGateway:
         return buffer.getvalue()
 
     @staticmethod
+    def _streaming_wav_header(sample_rate: int) -> bytes:
+        """建立 unknown-length PCM16 mono WAV header。"""
+        return struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            0xFFFFFFFF,
+            b"WAVE",
+            b"fmt ",
+            16,
+            1,
+            1,
+            sample_rate,
+            sample_rate * 2,
+            2,
+            16,
+            b"data",
+            0xFFFFFFFF,
+        )
+
+    @staticmethod
     def _job_timing_headers(queue_wait: float, execution_time: float) -> dict[str, str]:
         return {
             "X-Queue-Wait": f"{queue_wait:.3f}s",
@@ -914,6 +1250,86 @@ class TTSGateway:
             ],
         )
         return wavs[0], headers
+
+    async def synthesize_native_stream(
+        self,
+        *,
+        request_id: str,
+        model_id: str,
+        text: str,
+        control_instruction: str,
+        reference_path: str | None,
+        prompt_text: str,
+        cfg_value: float,
+        normalize: bool,
+        denoise: bool,
+        inference_timesteps: int,
+    ) -> _NativeSynthesisStream:
+        generation_request = {
+            "text_input": text,
+            "control_instruction": control_instruction,
+            "reference_wav_path_input": reference_path,
+            "prompt_text": prompt_text,
+            "cfg_value_input": cfg_value,
+            "do_normalize": normalize,
+            "denoise": denoise,
+            "inference_timesteps": inference_timesteps,
+        }
+
+        def work(
+            queue: asyncio.Queue[Any],
+            stop_event: threading.Event,
+            loop: asyncio.AbstractEventLoop,
+        ) -> None:
+            generator: Any = None
+
+            def put(item: Any) -> bool:
+                future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+                while True:
+                    try:
+                        future.result(timeout=0.1)
+                        return True
+                    except FutureTimeoutError:
+                        if stop_event.is_set():
+                            future.cancel()
+                            return False
+
+            try:
+                selected_demo, runtime_selection, canonical_id = (
+                    self._switch_native_runtime(model_id)
+                )
+                server = selected_demo.get_or_load_voxcpm()
+                sample_rate = int(server.get_model_info()["sample_rate"])
+                generator = selected_demo.generate_tts_audio_stream(
+                    {**generation_request, "model_selection": runtime_selection}
+                )
+                # Python generator 的準備工作要到第一次 next() 才執行。先取首段，
+                # 可讓 reference encode／denoise／空串流等前置失敗在 200 headers
+                # 送出前被回報；TTFB 仍等同首段音訊實際可用的時間。
+                first_chunk = next(generator)
+                if not put(_StreamingReady(sample_rate=sample_rate)):
+                    return
+                if not put(first_chunk):
+                    return
+                for chunk in generator:
+                    if stop_event.is_set() or not put(chunk):
+                        break
+                else:
+                    self._active_native_selection = canonical_id
+                    put(_STREAMING_END)
+            except BaseException as exc:
+                if not stop_event.is_set():
+                    put(exc)
+            finally:
+                close = getattr(generator, "close", None)
+                if callable(close):
+                    close()
+
+        return await self._run_gpu_job_streaming(
+            request_id=request_id,
+            model_id=model_id,
+            work=work,
+        )
 
     async def synthesize_native_batch(
         self,
@@ -1389,6 +1805,17 @@ def create_app(
     app.state.tts_gateway = gateway
     history_lock = asyncio.Lock()
 
+    # 缺檔的 preset 會被 _available_reference_presets 靜默濾掉，
+    # 啟動時先記 warning，避免資產遺失只表現為「選單少一項」。
+    for preset in _REFERENCE_AUDIO_PRESETS:
+        preset_path = _REFERENCE_AUDIO_DIR / preset["filename"]
+        if not preset_path.is_file():
+            logger.warning(
+                "reference preset audio missing; hidden from catalog: id=%s path=%s",
+                preset["id"],
+                preset_path,
+            )
+
     def _available_reference_presets() -> list[dict[str, str]]:
         return [
             {
@@ -1506,6 +1933,166 @@ def create_app(
                 return str(path)
         return None
 
+    def _remove_temp_file(temp_path: str | None) -> None:
+        if not temp_path:
+            return
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+    async def _prepare_synthesis_request(
+        *,
+        engine_id: str,
+        model_id: str,
+        text: str,
+        control_instruction: str,
+        prompt_text: str,
+        reference_preset_id: str,
+        speaker_id: str,
+        cfg_value: float,
+        inference_timesteps: int,
+        normalize: bool,
+        denoise: bool,
+        speed: float,
+        seed: int | None,
+        reference_audio: UploadFile | None,
+        streaming: bool = False,
+    ) -> _PreparedSynthesisRequest:
+        text = text.strip()
+        if not text:
+            raise HTTPException(status_code=422, detail="請輸入要合成的文字")
+        if not 1.0 <= cfg_value <= 5.0:
+            raise HTTPException(status_code=422, detail="CFG 必須介於 1.0 與 5.0")
+        if not 1 <= inference_timesteps <= 50:
+            raise HTTPException(status_code=422, detail="取樣步數必須介於 1 與 50")
+        if not 0.5 <= speed <= 2.0:
+            raise HTTPException(status_code=422, detail="語速必須介於 0.5 與 2.0")
+        if streaming and engine_id != "voxcpm2":
+            raise HTTPException(
+                status_code=422,
+                detail="串流端點目前僅支援 voxcpm2 引擎",
+            )
+        if streaming and abs(speed - 1.0) >= 1e-3:
+            raise HTTPException(
+                status_code=422,
+                detail="串流端點不支援語速調整",
+            )
+
+        temp_path: str | None = None
+        active_reference: str | None = None
+        reference_label = "未指定參考音"
+        try:
+            if reference_audio is not None:
+                uploaded_name = reference_audio.filename or "reference.wav"
+                suffix = Path(uploaded_name).suffix or ".wav"
+                payload = await reference_audio.read()
+                reference_label = (
+                    f"自訂：{uploaded_name}（{len(payload) / 1024 / 1024:.2f} MB）"
+                )
+                with tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=suffix,
+                ) as temp_file:
+                    temp_file.write(payload)
+                    temp_path = temp_file.name
+                active_reference = temp_path
+            else:
+                active_reference = _resolve_reference_audio(reference_preset_id)
+                selected_preset = _find_reference_preset(reference_preset_id)
+                if selected_preset is not None:
+                    # preset 的逐字稿屬於 cloning 條件，不是可省略的顯示文案。
+                    if not prompt_text.strip():
+                        prompt_text = selected_preset.get("prompt_text", "")
+                    reference_label = (
+                        f"{selected_preset['label']} · "
+                        f"{selected_preset['description']}"
+                    )
+
+            if engine_id == "voxcpm2":
+                try:
+                    model_id = await asyncio.to_thread(
+                        gateway.resolve_native_model_id,
+                        model_id,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                # cloning 會把 reference + transcript 當成語音前綴；文字控制
+                # 會被直接接到正文，兩條路徑不可並用。
+                if active_reference and prompt_text.strip():
+                    control_instruction = ""
+                elif not control_instruction.strip():
+                    control_instruction = _DEFAULT_CONTROL_INSTRUCTION
+            elif engine_id != "barbet":
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"找不到推論引擎：{engine_id}",
+                )
+
+            return _PreparedSynthesisRequest(
+                engine_id=engine_id,
+                model_id=model_id,
+                text=text,
+                control_instruction=control_instruction,
+                prompt_text=prompt_text,
+                speaker_id=speaker_id,
+                cfg_value=cfg_value,
+                inference_timesteps=inference_timesteps,
+                normalize=normalize,
+                denoise=denoise,
+                speed=speed,
+                seed=seed,
+                active_reference=active_reference,
+                reference_label=reference_label,
+                temp_path=temp_path,
+            )
+        except BaseException:
+            _remove_temp_file(temp_path)
+            raise
+
+    async def _build_history_record(
+        prepared: _PreparedSynthesisRequest,
+        *,
+        history_id: str,
+        extra_headers: dict[str, str],
+    ) -> dict[str, Any]:
+        # catalog() 會 refresh registries 並掃 checkpoint 目錄，不可阻塞 event loop。
+        catalog_payload = await asyncio.to_thread(gateway.catalog)
+        selected_engine = _by_id(
+            catalog_payload["engines"],
+            prepared.engine_id,
+        )
+        selected_model = _by_id(
+            selected_engine.get("models", []),
+            prepared.model_id,
+        )
+        selected_speaker = _by_id(
+            selected_model.get("speakers", []),
+            prepared.speaker_id,
+        )
+        return {
+            "id": history_id,
+            "text": prepared.text,
+            "engine_id": prepared.engine_id,
+            "engine_label": selected_engine.get("label", prepared.engine_id),
+            "model_id": prepared.model_id,
+            "model_label": selected_model.get("label", prepared.model_id),
+            "reference_label": prepared.reference_label,
+            "speaker_label": selected_speaker.get("name"),
+            "seed": int(extra_headers["X-Random-Seed"])
+            if "X-Random-Seed" in extra_headers
+            else None,
+            "cfg_value": prepared.cfg_value,
+            "inference_timesteps": prepared.inference_timesteps,
+            "speed": prepared.speed,
+            "normalize": prepared.normalize,
+            "denoise": prepared.denoise,
+            "prompt_text": prepared.prompt_text.strip() or None,
+            "control_instruction": prepared.control_instruction.strip() or None,
+            "duration_label": extra_headers.get("X-Synthesis-Time"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     @app.post("/api/v1/synthesize")
     async def synthesize(
         request: Request,
@@ -1541,129 +2128,64 @@ def create_app(
             request.headers.get("content-type", ""),
             len(text),
         )
-        text = text.strip()
-        if not text:
-            raise HTTPException(status_code=422, detail="請輸入要合成的文字")
-        if not 1.0 <= cfg_value <= 5.0:
-            raise HTTPException(status_code=422, detail="CFG 必須介於 1.0 與 5.0")
-        if not 1 <= inference_timesteps <= 50:
-            raise HTTPException(status_code=422, detail="取樣步數必須介於 1 與 50")
-        if not 0.5 <= speed <= 2.0:
-            raise HTTPException(status_code=422, detail="語速必須介於 0.5 與 2.0")
-
-        temp_path: str | None = None
-        active_reference: str | None = None
-        reference_label = "未指定參考音"
+        prepared = await _prepare_synthesis_request(
+            engine_id=engine_id,
+            model_id=model_id,
+            text=text,
+            control_instruction=control_instruction,
+            prompt_text=prompt_text,
+            reference_preset_id=reference_preset_id,
+            speaker_id=speaker_id,
+            cfg_value=cfg_value,
+            inference_timesteps=inference_timesteps,
+            normalize=normalize,
+            denoise=denoise,
+            speed=speed,
+            seed=seed,
+            reference_audio=reference_audio,
+        )
         try:
-            if reference_audio is not None:
-                uploaded_name = reference_audio.filename or "reference.wav"
-                suffix = Path(uploaded_name).suffix or ".wav"
-                payload = await reference_audio.read()
-                reference_label = (
-                    f"自訂：{uploaded_name}（{len(payload) / 1024 / 1024:.2f} MB）"
-                )
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-                    temp_file.write(payload)
-                    temp_path = temp_file.name
-                active_reference = temp_path
-            else:
-                # 未上傳則採用預設台語參考音檔。不可寫進 temp_path ——
-                # 那個變數在 finally 會被 os.unlink，會刪掉預設檔本身。
-                active_reference = _resolve_reference_audio(reference_preset_id)
-                selected_preset = _find_reference_preset(reference_preset_id)
-                if selected_preset is not None:
-                    # 內建參考音的逐字稿我們自己知道，使用者沒填就自動帶入。
-                    # 不帶的話 barbet_runtime.py 會因 prompt_text 為空而把
-                    # prompt_wav_path 設成 ""，參考音整個被丟掉、克隆完全失效
-                    # （2026-08-05 實聽發現，見 AGENTS.md 7.6.1）。
-                    # 使用者上傳的音檔不在此列 —— 我們不知道它的逐字稿。
-                    if not prompt_text.strip():
-                        prompt_text = selected_preset.get("prompt_text", "")
-                    reference_label = (
-                        f"{selected_preset['label']} · {selected_preset['description']}"
-                    )
-
-            if engine_id == "voxcpm2":
-                try:
-                    model_id = await asyncio.to_thread(
-                        gateway.resolve_native_model_id, model_id
-                    )
-                except ValueError as exc:
-                    raise HTTPException(status_code=404, detail=str(exc)) from exc
-                # prompt cloning 與文字控制是兩條互斥路徑。VoxCPM2 並沒有獨立的
-                # instruction channel；app.py 會把 control 包成「(指令)正文」送進
-                # TSLM。若同時帶 prompt 音訊／逐字稿，部分微調模型會把指令當正文
-                # 朗讀出來。舊版 Gradio 也明確在 cloning 模式清空 control。
-                if active_reference and prompt_text.strip():
-                    control_instruction = ""
-                # 非 cloning 模式下，使用者沒指定才帶入預設語言指令。
-                elif not control_instruction.strip():
-                    control_instruction = _DEFAULT_CONTROL_INSTRUCTION
+            if prepared.engine_id == "voxcpm2":
                 wav, extra_headers = await gateway.synthesize_native(
                     request_id=request_id,
-                    model_id=model_id,
-                    text=text,
-                    control_instruction=control_instruction,
-                    reference_path=active_reference,
-                    prompt_text=prompt_text,
-                    cfg_value=cfg_value,
-                    normalize=normalize,
-                    denoise=denoise,
-                    inference_timesteps=inference_timesteps,
-                    speed=speed,
-                )
-            elif engine_id == "barbet":
-                wav, extra_headers = await gateway.synthesize_barbet(
-                    request_id=request_id,
-                    model_id=model_id,
-                    text=text,
-                    reference_path=active_reference,
-                    prompt_text=prompt_text,
-                    speaker_id=speaker_id,
-                    cfg_value=cfg_value,
-                    inference_timesteps=inference_timesteps,
-                    seed=seed,
-                    speed=speed,
+                    model_id=prepared.model_id,
+                    text=prepared.text,
+                    control_instruction=prepared.control_instruction,
+                    reference_path=prepared.active_reference,
+                    prompt_text=prepared.prompt_text,
+                    cfg_value=prepared.cfg_value,
+                    normalize=prepared.normalize,
+                    denoise=prepared.denoise,
+                    inference_timesteps=prepared.inference_timesteps,
+                    speed=prepared.speed,
                 )
             else:
-                raise HTTPException(status_code=404, detail=f"找不到推論引擎：{engine_id}")
+                wav, extra_headers = await gateway.synthesize_barbet(
+                    request_id=request_id,
+                    model_id=prepared.model_id,
+                    text=prepared.text,
+                    reference_path=prepared.active_reference,
+                    prompt_text=prepared.prompt_text,
+                    speaker_id=prepared.speaker_id,
+                    cfg_value=prepared.cfg_value,
+                    inference_timesteps=prepared.inference_timesteps,
+                    seed=prepared.seed,
+                    speed=prepared.speed,
+                )
 
             headers = {
                 "Content-Disposition": 'inline; filename="tts-output.wav"',
-                "X-Model-Engine": engine_id,
-                "X-Model-Version": model_id,
+                "X-Model-Engine": prepared.engine_id,
+                "X-Model-Version": prepared.model_id,
                 "X-Request-ID": request_id,
                 **extra_headers,
             }
             history_id = uuid.uuid4().hex
-            # catalog() 會 refresh 三個 registry 並掃過多 GB 的 checkpoint 目錄，
-            # 不能在 event loop 上跑 —— 與 /api/v1/catalog 端點的做法一致。
-            catalog = await asyncio.to_thread(gateway.catalog)
-            selected_engine = _by_id(catalog["engines"], engine_id)
-            selected_model = _by_id(selected_engine.get("models", []), model_id)
-            selected_speaker = _by_id(selected_model.get("speakers", []), speaker_id)
-            record = {
-                "id": history_id,
-                "text": text,
-                "engine_id": engine_id,
-                "engine_label": selected_engine.get("label", engine_id),
-                "model_id": model_id,
-                "model_label": selected_model.get("label", model_id),
-                "reference_label": reference_label,
-                "speaker_label": selected_speaker.get("name"),
-                "seed": int(extra_headers["X-Random-Seed"])
-                if "X-Random-Seed" in extra_headers
-                else None,
-                "cfg_value": cfg_value,
-                "inference_timesteps": inference_timesteps,
-                "speed": speed,
-                "normalize": normalize,
-                "denoise": denoise,
-                "prompt_text": prompt_text.strip() or None,
-                "control_instruction": control_instruction.strip() or None,
-                "duration_label": extra_headers.get("X-Synthesis-Time"),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+            record = await _build_history_record(
+                prepared,
+                history_id=history_id,
+                extra_headers=extra_headers,
+            )
             async with history_lock:
                 await asyncio.to_thread(_save_generation_history, record, wav)
             headers["X-History-ID"] = history_id
@@ -1672,11 +2194,143 @@ def create_app(
             )
             return Response(content=wav, media_type="audio/wav", headers=headers)
         finally:
-            if temp_path:
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
+            _remove_temp_file(prepared.temp_path)
+
+    @app.post("/api/v1/synthesize/stream")
+    async def synthesize_stream(
+        request: Request,
+        engine_id: str = Form(...),
+        model_id: str = Form(...),
+        text: str = Form(...),
+        control_instruction: str = Form(""),
+        prompt_text: str = Form(""),
+        reference_preset_id: str = Form(""),
+        speaker_id: str = Form(""),
+        cfg_value: float = Form(2.0),
+        inference_timesteps: int = Form(30),
+        normalize: bool = Form(True),
+        denoise: bool = Form(False),
+        speed: float = Form(1.0),
+        seed: int | None = Form(None),
+        reference_audio: UploadFile | None = File(None),
+    ) -> Response:
+        request_id = uuid.uuid4().hex
+        logger.info(
+            "synthesis.request request_id=%s stage=received engine=%s model=%s "
+            "content_type=%s text_chars=%d streaming=true",
+            request_id,
+            engine_id,
+            model_id,
+            request.headers.get("content-type", ""),
+            len(text),
+        )
+        prepared = await _prepare_synthesis_request(
+            engine_id=engine_id,
+            model_id=model_id,
+            text=text,
+            control_instruction=control_instruction,
+            prompt_text=prompt_text,
+            reference_preset_id=reference_preset_id,
+            speaker_id=speaker_id,
+            cfg_value=cfg_value,
+            inference_timesteps=inference_timesteps,
+            normalize=normalize,
+            denoise=denoise,
+            speed=speed,
+            seed=seed,
+            reference_audio=reference_audio,
+            streaming=True,
+        )
+        try:
+            stream = await gateway.synthesize_native_stream(
+                request_id=request_id,
+                model_id=prepared.model_id,
+                text=prepared.text,
+                control_instruction=prepared.control_instruction,
+                reference_path=prepared.active_reference,
+                prompt_text=prepared.prompt_text,
+                cfg_value=prepared.cfg_value,
+                normalize=prepared.normalize,
+                denoise=prepared.denoise,
+                inference_timesteps=prepared.inference_timesteps,
+            )
+        except BaseException:
+            _remove_temp_file(prepared.temp_path)
+            raise
+
+        history_id = uuid.uuid4().hex
+        audio_chunks: list[np.ndarray] = []
+
+        async def body() -> AsyncIterator[bytes]:
+            yield gateway._streaming_wav_header(stream.sample_rate)
+            try:
+                async for chunk in stream:
+                    normalized = gateway._peak_normalize(
+                        np.asarray(chunk, dtype=np.float32)
+                    )
+                    audio_chunks.append(normalized)
+                    yield (
+                        np.clip(normalized, -1.0, 1.0) * 32767
+                    ).astype("<i2").tobytes()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "synthesis.request request_id=%s stage=client_cancelled "
+                    "engine=voxcpm2 model=%s streaming=true",
+                    request_id,
+                    prepared.model_id,
+                )
+                raise
+            except Exception:
+                logger.exception(
+                    "synthesis.request request_id=%s stage=failed "
+                    "engine=voxcpm2 model=%s streaming=true",
+                    request_id,
+                    prepared.model_id,
+                )
+                # 已送出 200 時只能截斷 body；re-raise 可避免 ASGI 送出正常結尾。
+                raise
+
+        async def commit_history() -> None:
+            audio = np.concatenate(audio_chunks, axis=0)
+            wav = gateway._wav_response(stream.sample_rate, audio)
+            record = await _build_history_record(
+                prepared,
+                history_id=history_id,
+                extra_headers={},
+            )
+            async with history_lock:
+                await asyncio.to_thread(_save_generation_history, record, wav)
+
+        async def close_stream() -> None:
+            try:
+                await stream.aclose()
+            finally:
+                _remove_temp_file(prepared.temp_path)
+
+        async def rollback_history() -> None:
+            async with history_lock:
+                await asyncio.to_thread(
+                    _delete_generation_history,
+                    history_id,
+                )
+
+        headers = {
+            "Content-Disposition": 'inline; filename="tts-output.wav"',
+            "X-Accel-Buffering": "no",
+            "X-History-ID": history_id,
+            "X-Model-Engine": "voxcpm2",
+            "X-Model-Version": prepared.model_id,
+            "X-Request-ID": request_id,
+            "X-Sample-Rate": str(stream.sample_rate),
+        }
+        return _ManagedStreamingResponse(
+            body(),
+            media_type="audio/wav",
+            headers=headers,
+            on_complete=commit_history,
+            on_rollback=rollback_history,
+            on_close=close_stream,
+        )
 
     def _require_castvoice_auth(request: Request) -> None:
         """驗證 Authorization: Bearer <TTS_API_KEY>。未設定 TTS_API_KEY 時
