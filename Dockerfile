@@ -35,8 +35,9 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # Create a virtual environment to isolate dependencies
 RUN python3.10 -m venv /opt/venv
 
-# Copy dependency definition files
-COPY pyproject.toml uv.lock ./
+# flash-attn 編譯層刻意只 COPY patch 腳本、不碰 pyproject.toml ——
+# 依賴清單的改動才不會觸發近一小時的 flash-attn 重編（pyproject.toml
+# 在編譯層之後才 COPY 進來）。
 COPY scripts/patch_flash_attention_arch.py ./scripts/patch_flash_attention_arch.py
 
 # Target CUDA compute capabilities are configurable at build time so the same
@@ -44,14 +45,22 @@ COPY scripts/patch_flash_attention_arch.py ./scripts/patch_flash_attention_arch.
 # Pass --build-arg TORCH_ARCH_LIST=12.0 to build for a single architecture only
 # (faster, smaller image) when the target GPU is known ahead of time.
 ARG TORCH_ARCH_LIST="8.6;9.0;12.0"
-# MAX_JOBS caps parallel nvcc jobs so flash-attention compilation does not exhaust RAM (OOM).
+# MAX_JOBS caps parallel nvcc jobs so flash-attention compilation does not
+# exhaust RAM. Empty (default) = auto-detect at build time: one job per 6GB
+# of available RAM, capped at core count. Override: --build-arg MAX_JOBS=N.
+ARG MAX_JOBS=""
 ENV TORCH_CUDA_ARCH_LIST="${TORCH_ARCH_LIST}" \
     FLASH_ATTN_CUDA_ARCHS="${TORCH_ARCH_LIST}" \
     FLASH_ATTENTION_FORCE_BUILD=TRUE \
-    NVCC_THREADS=1 \
-    MAX_JOBS=2
+    NVCC_THREADS=1
 
 RUN . /opt/venv/bin/activate && \
+    jobs="${MAX_JOBS:-$(awk '/MemAvailable/{print int($2/1024/1024/6)}' /proc/meminfo)}" && \
+    cores="$(nproc)" && \
+    { [ -n "$jobs" ] && [ "$jobs" -ge 1 ]; } || jobs=1 && \
+    [ "$jobs" -le "$cores" ] || jobs="$cores" && \
+    export MAX_JOBS="$jobs" && \
+    echo "flash-attn build: MAX_JOBS=$MAX_JOBS (cores=$cores)" && \
     uv pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
     python3 -c "import torch.utils.cpp_extension as c; p = c.__file__; content = open(p).read().replace('def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:', 'def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:\n    return'); open(p, 'w').write(content)" && \
@@ -61,9 +70,15 @@ RUN . /opt/venv/bin/activate && \
     cd /tmp/flash-attention && \
     uv pip install --no-build-isolation . && \
     cd /app && \
-    rm -rf /tmp/flash-attention && \
+    rm -rf /tmp/flash-attention
+
+# 應用層依賴（含測試依賴，讓容器內可直接跑 pytest）。位於編譯層之後，
+# 改 pyproject.toml 只會重跑這一層（約一分鐘），不會重編 flash-attn。
+COPY pyproject.toml uv.lock ./
+RUN . /opt/venv/bin/activate && \
     uv pip install --no-cache-dir -r pyproject.toml && \
-    uv pip install --no-cache-dir nano-vllm-voxcpm
+    uv pip install --no-cache-dir nano-vllm-voxcpm && \
+    uv pip install --no-cache-dir -r pyproject.toml --extra test
 
 # ==========================================
 # Stage 3: Runner image (Production/Runtime)
