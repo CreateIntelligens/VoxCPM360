@@ -41,6 +41,14 @@ from voxcpm.training import (
 )
 
 
+def encode_text(tokenizer, text: str) -> list[int]:
+    """Encode text with either a Hugging Face tokenizer or VoxCPM callable."""
+    encode = getattr(tokenizer, "encode", None)
+    if callable(encode):
+        return encode(text, add_special_tokens=False)
+    return tokenizer(text)
+
+
 @argbind.bind(without_prefix=True)
 def train(
     pretrained_path: str,
@@ -145,16 +153,12 @@ def train(
             if _n.startswith(_unused_prefixes) or _n in _unused_names:
                 _p.requires_grad = False
                 _spk_frozen += 1
-        # 屬性名與 VoxCPM2 相同，但這裡是 HF tokenizer：直接呼叫會得到
-        # BatchEncoding 而非 id list，需取 .encode()（見 model.py _tokenize）。
+        # 屬性名與 VoxCPM2 相同，但這裡是 HF tokenizer；encode_text 會避免
+        # 直接呼叫時取得 BatchEncoding（見 model.py _tokenize）。
         _hf_tok = base_model.text_tokenizer
         if _hf_tok is None:
             raise ValueError(f"{pretrained_path} 缺少 tokenizer，無法訓練")
-        if hasattr(_hf_tok, "encode"):
-            def tokenizer(text, _t=_hf_tok):
-                return _t.encode(text, add_special_tokens=False)
-        else:
-            tokenizer = _hf_tok
+        tokenizer = _hf_tok
         if accelerator.rank == 0:
             _train_n = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
             _all_n = sum(p.numel() for p in base_model.parameters())
@@ -220,7 +224,7 @@ def train(
 
     def tokenize(batch):
         text_list = batch["text"]
-        text_ids = [tokenizer(text) for text in text_list]
+        text_ids = [encode_text(tokenizer, text) for text in text_list]
         return {"text_ids": text_ids}
 
     train_ds = train_ds.map(tokenize, batched=True, remove_columns=["text"])
