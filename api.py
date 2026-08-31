@@ -186,6 +186,10 @@ _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
     },
 )
 _DEFAULT_REFERENCE_PRESET_ID = "cosy-young-female-01"
+# voxcpm2 引擎實際生效的 diffusion 步數（nano-vLLM 建構時固定，
+# 與 app.py 讀同一個環境變數）；per-request 的 inference_timesteps
+# 對 voxcpm2 不生效，catalog capabilities 與回應 header 據此誠實揭露。
+_VOXCPM2_FIXED_TIMESTEPS = int(os.environ.get("VOXCPM_INFERENCE_TIMESTEPS", "10"))
 
 # CastAgent 自建 TTS API 規格採用固定的「演員聲音」清單，而不是把
 # engine/model/speaker 的排列組合整個攤平給外部服務。這裡手動選一小批
@@ -517,12 +521,14 @@ class _NativeSynthesisStream:
         worker_task: asyncio.Task[None],
         cleanup_done: asyncio.Event,
         sample_rate: int,
+        session_concurrency: int = 1,
     ) -> None:
         self._queue = queue
         self._stop_event = stop_event
         self._worker_task = worker_task
         self._cleanup_done = cleanup_done
         self.sample_rate = sample_rate
+        self.session_concurrency = session_concurrency
         self._closed = False
 
     def __aiter__(self) -> _NativeSynthesisStream:
@@ -616,6 +622,475 @@ class _ManagedStreamingResponse(StreamingResponse):
                 await self._on_close()
 
 
+@dataclass(eq=False)
+class _SessionWaiter:
+    engine_id: str
+    model_id: str
+    units: int
+    future: asyncio.Future[int]
+
+
+class _GPUSessionGate:
+    """模型親和的 GPU 容量控制閘門。
+
+    控制同時進入 GPU 的並發數（VOXCPM_ENGINE_CONCURRENCY）：
+    - 同引擎、同模型：只要 refcount + units <= capacity 且前面無不同模型排隊者即可並發進入。
+    - 不同模型/引擎（如 VoxCPM2 與 Barbet）：必須等待現有 session drain（refcount == 0）後才能切換。
+    - Barbet：容量強制為 1 且與 VoxCPM2 互斥。
+    - 嚴格維持跨模型/引擎的 FIFO 佇列順序，防止飢餓。
+    """
+
+    _EXCLUSIVE_ENGINES = frozenset({"barbet", "__exclusive__"})
+
+    def __init__(self, concurrency: int = 4) -> None:
+        self.concurrency = concurrency
+        self._active_engine: str | None = None
+        self._active_model_id: str | None = None
+        self._active_units: int = 0
+        self._waiters: list[_SessionWaiter] = []
+
+    @property
+    def active_units(self) -> int:
+        return self._active_units
+
+    @property
+    def active_engine(self) -> str | None:
+        return self._active_engine
+
+    @property
+    def active_model_id(self) -> str | None:
+        return self._active_model_id
+
+    def locked(self) -> bool:
+        return self._active_units > 0
+
+    def _effective_capacity(self, engine_id: str) -> int:
+        if engine_id in self._EXCLUSIVE_ENGINES:
+            return 1
+        return self.concurrency
+
+    def _can_join_active_session(
+        self,
+        engine_id: str,
+        model_id: str,
+        units: int,
+    ) -> bool:
+        return (
+            self._active_units > 0
+            and engine_id not in self._EXCLUSIVE_ENGINES
+            and self._active_engine == engine_id
+            and self._active_model_id == model_id
+            and self._active_units + units <= self._effective_capacity(engine_id)
+        )
+
+    async def acquire(
+        self,
+        *,
+        engine_id: str = "__exclusive__",
+        model_id: str = "__exclusive__",
+        units: int = 1,
+        timeout: float | None = None,
+    ) -> int:
+        units = max(1, units)
+        if not self._waiters:
+            if self._active_units == 0:
+                self._active_engine = engine_id
+                self._active_model_id = model_id
+                self._active_units = units
+                return self._active_units
+            if self._can_join_active_session(engine_id, model_id, units):
+                self._active_units += units
+                return self._active_units
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[int] = loop.create_future()
+        waiter = _SessionWaiter(
+            engine_id=engine_id,
+            model_id=model_id,
+            units=units,
+            future=future,
+        )
+        self._waiters.append(waiter)
+
+        try:
+            if timeout is not None:
+                refcount = await asyncio.wait_for(future, timeout=timeout)
+            else:
+                refcount = await future
+            return refcount
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
+            elif future.done() and not future.cancelled() and not future.exception():
+                self.release(units=units)
+            self._wake_waiters()
+            raise
+
+    def release(self, units: int = 1) -> int:
+        units = max(1, units)
+        self._active_units = max(0, self._active_units - units)
+        remaining = self._active_units
+        if self._active_units == 0:
+            self._active_engine = None
+            self._active_model_id = None
+        self._wake_waiters()
+        return remaining
+
+    def _wake_waiters(self) -> None:
+        while self._waiters:
+            waiter = self._waiters[0]
+            if waiter.future.done():
+                self._waiters.pop(0)
+                continue
+
+            if self._active_units == 0:
+                self._active_engine = waiter.engine_id
+                self._active_model_id = waiter.model_id
+                self._active_units = waiter.units
+            elif self._can_join_active_session(
+                waiter.engine_id,
+                waiter.model_id,
+                waiter.units,
+            ):
+                self._active_units += waiter.units
+            else:
+                return
+
+            self._waiters.pop(0)
+            waiter.future.set_result(self._active_units)
+
+
+@dataclass(eq=False)
+class _NativeCoalescedItem:
+    request_id: str
+    model_id: str
+    request: dict[str, Any]
+    queued_at: float
+    future: asyncio.Future[tuple[bytes, dict[str, str]]]
+
+
+class _NativeCoalescer:
+    """Collect queued interactive native requests without adding a time window."""
+
+    def __init__(self, gateway: TTSGateway, *, batch_max: int) -> None:
+        self._gateway = gateway
+        self._batch_max = batch_max
+        self._queue: list[_NativeCoalescedItem] = []
+        self._queue_lock = asyncio.Lock()
+        self._drain_task: asyncio.Task[None] | None = None
+        self._completion_tasks: dict[
+            asyncio.Task[None],
+            list[_NativeCoalescedItem],
+        ] = {}
+        self._closed = False
+
+    async def submit(
+        self,
+        *,
+        request_id: str,
+        model_id: str,
+        request: dict[str, Any],
+    ) -> tuple[bytes, dict[str, str]]:
+        loop = asyncio.get_running_loop()
+        async with self._queue_lock:
+            if self._closed:
+                raise RuntimeError("Native interactive coalescer is closed")
+            queued_at = await self._gateway._admit_gpu_job(
+                request_id=request_id,
+                engine_id="voxcpm2",
+                model_id=model_id,
+            )
+            item = _NativeCoalescedItem(
+                request_id=request_id,
+                model_id=model_id,
+                request=request,
+                queued_at=queued_at,
+                future=loop.create_future(),
+            )
+            self._queue.append(item)
+            if self._drain_task is None or self._drain_task.done():
+                self._drain_task = asyncio.create_task(self._drain())
+
+        try:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(item.future),
+                    timeout=self._gateway._queue_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                if not await self._remove_if_pending(item):
+                    return await asyncio.shield(item.future)
+                item.future.cancel()
+                await self._gateway._finish_gpu_jobs()
+                queue_wait = time.perf_counter() - queued_at
+                logger.warning(
+                    "synthesis.request request_id=%s stage=rejected "
+                    "reason=queue_timeout engine=voxcpm2 model=%s "
+                    "queue_wait_seconds=%.3f",
+                    request_id,
+                    model_id,
+                    queue_wait,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="等待語音生成資源逾時，請稍後再試",
+                    headers={"Retry-After": "30", "X-Request-ID": request_id},
+                ) from exc
+        except asyncio.CancelledError:
+            if await self._remove_if_pending(item):
+                item.future.cancel()
+                await self._gateway._finish_gpu_jobs()
+            else:
+                logger.warning(
+                    "synthesis.request request_id=%s stage=client_cancelled "
+                    "engine=voxcpm2 model=%s action=wait_for_batch",
+                    request_id,
+                    model_id,
+                )
+                try:
+                    await asyncio.shield(item.future)
+                except Exception as exc:  # noqa: BLE001 - client no longer receives this failure
+                    logger.debug(
+                        "synthesis.request request_id=%s stage=failed_after_cancel "
+                        "engine=voxcpm2 model=%s error=%r",
+                        request_id,
+                        model_id,
+                        exc,
+                    )
+            raise
+
+    async def _remove_if_pending(self, item: _NativeCoalescedItem) -> bool:
+        async with self._queue_lock:
+            try:
+                self._queue.remove(item)
+            except ValueError:
+                return False
+            return True
+
+    async def _take_batch(self) -> list[_NativeCoalescedItem]:
+        async with self._queue_lock:
+            if not self._queue:
+                return []
+            model_id = self._queue[0].model_id
+            batch: list[_NativeCoalescedItem] = []
+            while self._queue and len(batch) < self._batch_max and self._queue[0].model_id == model_id:
+                batch.append(self._queue.pop(0))
+            return batch
+
+    async def _release_batch(self, canonical_id: str, batch_size: int) -> None:
+        self._gateway._session_gate.release(batch_size)
+        await self._gateway._finish_gpu_jobs(batch_size)
+        logger.info(
+            "synthesis.request stage=session_leave engine=voxcpm2 model=%s "
+            "refcount=%d batch_size=%d",
+            canonical_id,
+            self._gateway._session_gate.active_units,
+            batch_size,
+        )
+
+    async def _drain(self) -> None:
+        while True:
+            async with self._queue_lock:
+                if not self._queue:
+                    self._drain_task = None
+                    return
+                first_model = self._queue[0].model_id
+                batch_count = 0
+                for item in self._queue:
+                    if item.model_id == first_model and batch_count < self._batch_max:
+                        batch_count += 1
+                    else:
+                        break
+
+            canonical_id = self._gateway.resolve_native_model_id(first_model)
+            session_concurrency = await self._gateway._session_gate.acquire(
+                engine_id="voxcpm2",
+                model_id=canonical_id,
+                units=batch_count,
+                timeout=self._gateway._queue_timeout_seconds,
+            )
+
+            batch = await self._take_batch()
+            if not batch:
+                self._gateway._session_gate.release(units=batch_count)
+                continue
+
+            model_id = batch[0].model_id
+            if len(batch) < batch_count:
+                self._gateway._session_gate.release(units=batch_count - len(batch))
+
+            logger.info(
+                "synthesis.request stage=session_join engine=voxcpm2 model=%s "
+                "refcount=%d capacity=%d batch_size=%d",
+                canonical_id,
+                session_concurrency,
+                self._gateway._engine_concurrency,
+                len(batch),
+            )
+
+            started_at = time.perf_counter()
+            queue_waits = [started_at - item.queued_at for item in batch]
+            logger.info(
+                "synthesis.request stage=coalesced batch_size=%d model=%s request_ids=%s",
+                len(batch),
+                model_id,
+                ",".join(item.request_id for item in batch),
+            )
+            for item, queue_wait in zip(batch, queue_waits, strict=True):
+                logger.info(
+                    "synthesis.request request_id=%s stage=started engine=voxcpm2 "
+                    "model=%s queue_wait_seconds=%.3f batch_size=%d",
+                    item.request_id,
+                    model_id,
+                    queue_wait,
+                    len(batch),
+                )
+
+            gate_held = True
+            try:
+                results = await asyncio.to_thread(
+                    self._gateway._generate_native_batch_results,
+                    model_id,
+                    [item.request for item in batch],
+                    isolate_errors=True,
+                )
+                execution_time = time.perf_counter() - started_at
+                await self._release_batch(canonical_id, len(batch))
+                gate_held = False
+                completion_task = asyncio.create_task(
+                    self._complete_batch(
+                        batch,
+                        results,
+                        queue_waits,
+                        execution_time,
+                        session_concurrency,
+                    )
+                )
+                self._completion_tasks[completion_task] = batch
+                completion_task.add_done_callback(self._finish_completion_task)
+            except Exception as exc:
+                logger.exception(
+                    "synthesis.request stage=batch_failed model=%s batch_size=%d",
+                    model_id,
+                    len(batch),
+                )
+                await self._release_batch(canonical_id, len(batch))
+                gate_held = False
+                for item in batch:
+                    if not item.future.done():
+                        item.future.set_exception(exc)
+            finally:
+                if gate_held:
+                    await self._release_batch(canonical_id, len(batch))
+
+    async def _complete_batch(
+        self,
+        batch: list[_NativeCoalescedItem],
+        results: list[tuple[int, np.ndarray] | Exception],
+        queue_waits: list[float],
+        execution_time: float,
+        session_concurrency: int = 1,
+    ) -> None:
+        model_id = batch[0].model_id
+        if len(results) != len(batch):
+            error = RuntimeError(f"Native batch returned {len(results)} results for {len(batch)} requests")
+            results = [error for _ in batch]
+        try:
+            rendered = await asyncio.to_thread(
+                self._gateway._render_native_batch_results,
+                results,
+                [item.request for item in batch],
+            )
+        except Exception as exc:
+            logger.exception(
+                "synthesis.request stage=batch_render_failed model=%s batch_size=%d",
+                model_id,
+                len(batch),
+            )
+            rendered = [exc for _ in batch]
+        for item, result, queue_wait in zip(
+            batch,
+            rendered,
+            queue_waits,
+            strict=True,
+        ):
+            if item.future.done():
+                continue
+            if isinstance(result, Exception):
+                item.future.set_exception(result)
+                stage = "failed"
+            else:
+                try:
+                    timing_headers = self._gateway._job_timing_headers(
+                        queue_wait,
+                        execution_time,
+                        concurrency=session_concurrency,
+                    )
+                except TypeError:
+                    timing_headers = self._gateway._job_timing_headers(
+                        queue_wait,
+                        execution_time,
+                    )
+                headers = {
+                    **timing_headers,
+                    "X-Batch-Size": str(len(batch)),
+                }
+                item.future.set_result((result, headers))
+                stage = "completed"
+            logger.info(
+                "synthesis.request request_id=%s stage=%s engine=voxcpm2 "
+                "model=%s queue_wait_seconds=%.3f execution_seconds=%.3f "
+                "batch_size=%d",
+                item.request_id,
+                stage,
+                model_id,
+                queue_wait,
+                execution_time,
+                len(batch),
+            )
+        logger.info(
+            "synthesis.request stage=batch_completed model=%s batch_size=%d elapsed_seconds=%.3f items_per_second=%.3f",
+            model_id,
+            len(batch),
+            execution_time,
+            len(batch) / execution_time if execution_time else 0.0,
+        )
+
+    def _finish_completion_task(self, task: asyncio.Task[None]) -> None:
+        batch = self._completion_tasks.pop(task, [])
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            error = RuntimeError("Native batch completion was cancelled")
+        except Exception as exc:  # noqa: BLE001 - resolve every request in the failed completion
+            logger.exception(
+                "synthesis.request stage=batch_completion_failed batch_size=%d",
+                len(batch),
+            )
+            error = exc
+        else:
+            return
+
+        for item in batch:
+            if not item.future.done():
+                item.future.set_exception(error)
+
+    async def close(self) -> None:
+        self._closed = True
+        async with self._queue_lock:
+            pending = list(self._queue)
+            self._queue.clear()
+            drain_task = self._drain_task
+        for item in pending:
+            if not item.future.done():
+                item.future.set_exception(RuntimeError("Native interactive coalescer is shutting down"))
+            await self._gateway._finish_gpu_jobs()
+        if drain_task is not None:
+            await asyncio.shield(drain_task)
+        if self._completion_tasks:
+            await asyncio.gather(*self._completion_tasks, return_exceptions=True)
+
+
 class TTSGateway:
     def __init__(
         self,
@@ -650,7 +1125,15 @@ class TTSGateway:
         # VoxCPM2 and Barbet share the same physical GPU.  Separate per-engine
         # locks allow both runtimes to enter CUDA concurrently, so all model
         # loading and inference must pass through one process-wide gate.
-        self._gpu_lock = asyncio.Lock()
+        self._engine_concurrency = self._read_int_setting(
+            "VOXCPM_ENGINE_CONCURRENCY",
+            default=4,
+            minimum=1,
+        )
+        self._session_gate = _GPUSessionGate(
+            concurrency=self._engine_concurrency,
+        )
+        self._gpu_lock = self._session_gate
         self._admission_lock = asyncio.Lock()
         self._inflight_jobs = 0
         self._max_pending_jobs = self._read_int_setting(
@@ -662,6 +1145,18 @@ class TTSGateway:
             "VOXCPM_QUEUE_TIMEOUT_SECONDS",
             default=120.0,
             minimum=0.001,
+        )
+        self._interactive_batch_max = min(
+            self._read_int_setting(
+                "VOXCPM_INTERACTIVE_BATCH_MAX",
+                default=4,
+                minimum=1,
+            ),
+            16,
+        )
+        self._native_coalescer = _NativeCoalescer(
+            self,
+            batch_max=self._interactive_batch_max,
         )
 
     @staticmethod
@@ -686,21 +1181,13 @@ class TTSGateway:
             raise ValueError(f"{name} must be >= {minimum}")
         return value
 
-    async def _run_gpu_job(
+    async def _admit_gpu_job(
         self,
         *,
         request_id: str,
         engine_id: str,
         model_id: str,
-        work: Callable[[], Any],
-    ) -> tuple[Any, float, float]:
-        """Run one non-cancellable CUDA job behind the shared bounded gate.
-
-        A thread already executing CUDA cannot be safely stopped by cancelling
-        its asyncio waiter.  If the HTTP task is cancelled, keep the gate held
-        until the worker thread exits so another model is never started on top
-        of the abandoned job.
-        """
+    ) -> float:
         queued_at = time.perf_counter()
         async with self._admission_lock:
             capacity = self._max_pending_jobs + 1
@@ -723,21 +1210,56 @@ class TTSGateway:
             queue_position = self._inflight_jobs - 1
 
         logger.info(
-            "synthesis.request request_id=%s stage=queued engine=%s model=%s "
-            "queue_position=%d inflight=%d",
+            "synthesis.request request_id=%s stage=queued engine=%s model=%s queue_position=%d inflight=%d",
             request_id,
             engine_id,
             model_id,
             queue_position,
             self._inflight_jobs,
         )
+        return queued_at
+
+    async def _finish_gpu_jobs(self, count: int = 1) -> None:
+        async with self._admission_lock:
+            self._inflight_jobs -= count
+
+    async def _run_gpu_job(
+        self,
+        *,
+        request_id: str,
+        engine_id: str,
+        model_id: str,
+        units: int = 1,
+        work: Callable[[], Any],
+    ) -> tuple[Any, float, float, int]:
+        """Run one non-cancellable CUDA job behind the shared bounded gate.
+
+        A thread already executing CUDA cannot be safely stopped by cancelling
+        its asyncio waiter.  If the HTTP task is cancelled, keep the gate held
+        until the worker thread exits so another model is never started on top
+        of the abandoned job.
+        """
+        queued_at = await self._admit_gpu_job(
+            request_id=request_id,
+            engine_id=engine_id,
+            model_id=model_id,
+        )
+
+        canonical_id = (
+            self.resolve_native_model_id(model_id)
+            if engine_id == "voxcpm2"
+            else model_id
+        )
 
         acquired = False
         started_at: float | None = None
+        session_concurrency = 1
         try:
             try:
-                await asyncio.wait_for(
-                    self._gpu_lock.acquire(),
+                session_concurrency = await self._session_gate.acquire(
+                    engine_id=engine_id,
+                    model_id=canonical_id,
+                    units=units,
                     timeout=self._queue_timeout_seconds,
                 )
                 acquired = True
@@ -759,6 +1281,15 @@ class TTSGateway:
 
             started_at = time.perf_counter()
             queue_wait = started_at - queued_at
+            logger.info(
+                "synthesis.request request_id=%s stage=session_join engine=%s model=%s "
+                "refcount=%d capacity=%d",
+                request_id,
+                engine_id,
+                canonical_id,
+                session_concurrency,
+                self._session_gate._effective_capacity(engine_id),
+            )
             logger.info(
                 "synthesis.request request_id=%s stage=started engine=%s model=%s "
                 "queue_wait_seconds=%.3f",
@@ -801,7 +1332,7 @@ class TTSGateway:
                 queue_wait,
                 execution_time,
             )
-            return result, queue_wait, execution_time
+            return result, queue_wait, execution_time, session_concurrency
         except (HTTPException, asyncio.CancelledError):
             raise
         except Exception:
@@ -819,9 +1350,16 @@ class TTSGateway:
             raise
         finally:
             if acquired:
-                self._gpu_lock.release()
-            async with self._admission_lock:
-                self._inflight_jobs -= 1
+                self._session_gate.release(units=units)
+                logger.info(
+                    "synthesis.request request_id=%s stage=session_leave engine=%s model=%s "
+                    "refcount=%d",
+                    request_id,
+                    engine_id,
+                    canonical_id,
+                    self._session_gate.active_units,
+                )
+            await self._finish_gpu_jobs(units)
 
     async def _run_gpu_job_streaming(
         self,
@@ -839,43 +1377,22 @@ class TTSGateway:
         與首段生成前的錯誤仍能成為正式 HTTP status，而非已送出 200 後才截斷。
         """
         engine_id = "voxcpm2"
-        queued_at = time.perf_counter()
-        async with self._admission_lock:
-            capacity = self._max_pending_jobs + 1
-            if self._inflight_jobs >= capacity:
-                logger.warning(
-                    "synthesis.request request_id=%s stage=rejected reason=queue_full "
-                    "engine=%s model=%s inflight=%d capacity=%d",
-                    request_id,
-                    engine_id,
-                    model_id,
-                    self._inflight_jobs,
-                    capacity,
-                )
-                raise HTTPException(
-                    status_code=429,
-                    detail="語音生成佇列已滿，請稍後再試",
-                    headers={"Retry-After": "30", "X-Request-ID": request_id},
-                )
-            self._inflight_jobs += 1
-            queue_position = self._inflight_jobs - 1
-
-        logger.info(
-            "synthesis.request request_id=%s stage=queued engine=%s model=%s "
-            "queue_position=%d inflight=%d",
-            request_id,
-            engine_id,
-            model_id,
-            queue_position,
-            self._inflight_jobs,
+        queued_at = await self._admit_gpu_job(
+            request_id=request_id,
+            engine_id=engine_id,
+            model_id=model_id,
         )
 
+        canonical_id = self.resolve_native_model_id(model_id)
         acquired = False
         cleanup_owns_resources = False
+        session_concurrency = 1
         try:
             try:
-                await asyncio.wait_for(
-                    self._gpu_lock.acquire(),
+                session_concurrency = await self._session_gate.acquire(
+                    engine_id=engine_id,
+                    model_id=canonical_id,
+                    units=1,
                     timeout=self._queue_timeout_seconds,
                 )
                 acquired = True
@@ -899,6 +1416,14 @@ class TTSGateway:
             started_at = time.perf_counter()
             queue_wait = started_at - queued_at
             logger.info(
+                "synthesis.request request_id=%s stage=session_join engine=voxcpm2 model=%s "
+                "refcount=%d capacity=%d",
+                request_id,
+                canonical_id,
+                session_concurrency,
+                self._session_gate.concurrency,
+            )
+            logger.info(
                 "synthesis.request request_id=%s stage=started engine=%s model=%s "
                 "queue_wait_seconds=%.3f",
                 request_id,
@@ -918,10 +1443,16 @@ class TTSGateway:
 
             async def cleanup() -> None:
                 execution_time = time.perf_counter() - started_at
-                if acquired and self._gpu_lock.locked():
-                    self._gpu_lock.release()
-                async with self._admission_lock:
-                    self._inflight_jobs -= 1
+                if acquired:
+                    self._session_gate.release(units=1)
+                    logger.info(
+                        "synthesis.request request_id=%s stage=session_leave engine=voxcpm2 model=%s "
+                        "refcount=%d",
+                        request_id,
+                        canonical_id,
+                        self._session_gate.active_units,
+                    )
+                await self._finish_gpu_jobs()
                 logger.info(
                     "synthesis.request request_id=%s stage=worker_finished "
                     "engine=%s model=%s queue_wait_seconds=%.3f "
@@ -962,13 +1493,20 @@ class TTSGateway:
                 worker_task=worker_task,
                 cleanup_done=cleanup_done,
                 sample_rate=ready.sample_rate,
+                session_concurrency=session_concurrency,
             )
         except BaseException:
             if not cleanup_owns_resources and acquired:
-                self._gpu_lock.release()
+                self._session_gate.release(units=1)
+                logger.info(
+                    "synthesis.request request_id=%s stage=session_leave engine=voxcpm2 model=%s "
+                    "refcount=%d",
+                    request_id,
+                    canonical_id,
+                    self._session_gate.active_units,
+                )
             if not cleanup_owns_resources:
-                async with self._admission_lock:
-                    self._inflight_jobs -= 1
+                await self._finish_gpu_jobs()
             raise
 
     def _native_models(self) -> list[dict[str, Any]]:
@@ -1098,6 +1636,9 @@ class TTSGateway:
             stop()
         self.barbet_runtime.close()
 
+    async def close_coalescer(self) -> None:
+        await self._native_coalescer.close()
+
     def _barbet_models(self) -> list[dict[str, Any]]:
         checkpoints = self.barbet_runtime.registry.refresh()
         return [
@@ -1130,6 +1671,10 @@ class TTSGateway:
                     "speaker_selection": False,
                     "seed": False,
                     "streaming": True,
+                    # nano-vLLM 引擎在建構時固定 diffusion 步數
+                    # （VOXCPM_INFERENCE_TIMESTEPS），per-request 的
+                    # inference_timesteps 參數不生效 —— 前端據此隱藏該欄位。
+                    "inference_timesteps": False,
                 },
                 "models": self._native_models(),
             }
@@ -1149,6 +1694,8 @@ class TTSGateway:
                         "speaker_selection": True,
                         "seed": True,
                         "streaming": False,
+                        # Barbet 路徑每次請求真的會套用 inference_timesteps。
+                        "inference_timesteps": True,
                     },
                     "models": barbet_models,
                 }
@@ -1211,11 +1758,18 @@ class TTSGateway:
         )
 
     @staticmethod
-    def _job_timing_headers(queue_wait: float, execution_time: float) -> dict[str, str]:
-        return {
+    def _job_timing_headers(
+        queue_wait: float,
+        execution_time: float,
+        concurrency: int | None = None,
+    ) -> dict[str, str]:
+        headers = {
             "X-Queue-Wait": f"{queue_wait:.3f}s",
             "X-GPU-Job-Time": f"{execution_time:.3f}s",
         }
+        if concurrency is not None:
+            headers["X-Engine-Concurrency"] = str(concurrency)
+        return headers
 
     async def synthesize_native(
         self,
@@ -1250,6 +1804,37 @@ class TTSGateway:
             ],
         )
         return wavs[0], headers
+
+    async def synthesize_native_coalesced(
+        self,
+        *,
+        request_id: str,
+        model_id: str,
+        text: str,
+        control_instruction: str,
+        reference_path: str | None,
+        prompt_text: str,
+        cfg_value: float,
+        normalize: bool,
+        denoise: bool,
+        inference_timesteps: int,
+        speed: float = 1.0,
+    ) -> tuple[bytes, dict[str, str]]:
+        return await self._native_coalescer.submit(
+            request_id=request_id,
+            model_id=model_id,
+            request={
+                "text": text,
+                "control_instruction": control_instruction,
+                "reference_path": reference_path,
+                "prompt_text": prompt_text,
+                "cfg_value": cfg_value,
+                "normalize": normalize,
+                "denoise": denoise,
+                "inference_timesteps": inference_timesteps,
+                "speed": speed,
+            },
+        )
 
     async def synthesize_native_stream(
         self,
@@ -1295,11 +1880,13 @@ class TTSGateway:
                             return False
 
             try:
-                selected_demo, runtime_selection, canonical_id = (
-                    self._switch_native_runtime(model_id)
-                )
+                selected_demo, runtime_selection, canonical_id = self._switch_native_runtime(model_id)
                 server = selected_demo.get_or_load_voxcpm()
-                sample_rate = int(server.get_model_info()["sample_rate"])
+                if hasattr(selected_demo, "_call_engine_sync"):
+                    info = selected_demo._call_engine_sync(server, "get_model_info")
+                else:
+                    info = server.get_model_info()
+                sample_rate = int(info["sample_rate"])
                 generator = selected_demo.generate_tts_audio_stream(
                     {**generation_request, "model_selection": runtime_selection}
                 )
@@ -1349,38 +1936,21 @@ class TTSGateway:
             return [], self._job_timing_headers(0.0, 0.0)
 
         def generate() -> list[tuple[int, np.ndarray]]:
-            selected_demo, runtime_selection, canonical_id = (
-                self._switch_native_runtime(model_id)
+            results = self._generate_native_batch_results(
+                model_id,
+                requests,
+                isolate_errors=False,
             )
-            generation_requests = [
-                {
-                    "text_input": request["text"],
-                    "control_instruction": request.get("control_instruction", ""),
-                    "reference_wav_path_input": request.get("reference_path"),
-                    "prompt_text": request.get("prompt_text", ""),
-                    "cfg_value_input": request.get("cfg_value", 2.0),
-                    "do_normalize": request.get("normalize", True),
-                    "denoise": request.get("denoise", True),
-                    "inference_timesteps": request.get("inference_timesteps", 10),
-                    "model_selection": runtime_selection,
-                }
-                for request in requests
-            ]
-            batch_generate = getattr(selected_demo, "generate_tts_audio_batch", None)
-            if callable(batch_generate):
-                results = batch_generate(generation_requests)
-            else:
-                results = [
-                    selected_demo.generate_tts_audio(**generation_request)
-                    for generation_request in generation_requests
-                ]
-            self._active_native_selection = canonical_id
-            return results
+            for result in results:
+                if isinstance(result, Exception):
+                    raise result
+            return [result for result in results if not isinstance(result, Exception)]
 
-        results, queue_wait, execution_time = await self._run_gpu_job(
+        results, queue_wait, execution_time, session_concurrency = await self._run_gpu_job(
             request_id=request_id,
             engine_id="voxcpm2",
             model_id=model_id,
+            units=len(requests),
             work=generate,
         )
         wavs = [
@@ -1391,7 +1961,79 @@ class TTSGateway:
             )
             for (sample_rate, audio), request in zip(results, requests, strict=True)
         ]
-        return wavs, self._job_timing_headers(queue_wait, execution_time)
+        return wavs, self._job_timing_headers(
+            queue_wait,
+            execution_time,
+            concurrency=session_concurrency,
+        )
+
+    def _generate_native_batch_results(
+        self,
+        model_id: str,
+        requests: list[dict[str, Any]],
+        *,
+        isolate_errors: bool,
+    ) -> list[tuple[int, np.ndarray] | Exception]:
+        selected_demo, runtime_selection, canonical_id = self._switch_native_runtime(model_id)
+        generation_requests = [
+            {
+                "text_input": request["text"],
+                "control_instruction": request.get("control_instruction", ""),
+                "reference_wav_path_input": request.get("reference_path"),
+                "prompt_text": request.get("prompt_text", ""),
+                "cfg_value_input": request.get("cfg_value", 2.0),
+                "do_normalize": request.get("normalize", True),
+                "denoise": request.get("denoise", True),
+                "inference_timesteps": request.get("inference_timesteps", 10),
+                "model_selection": runtime_selection,
+            }
+            for request in requests
+        ]
+        batch_generate = getattr(selected_demo, "generate_tts_audio_batch", None)
+        if callable(batch_generate):
+            if isolate_errors:
+                results = batch_generate(
+                    generation_requests,
+                    return_exceptions=True,
+                )
+            else:
+                results = batch_generate(generation_requests)
+        elif isolate_errors:
+            results = []
+            for generation_request in generation_requests:
+                try:
+                    results.append(selected_demo.generate_tts_audio(**generation_request))
+                except Exception as exc:  # noqa: BLE001 - isolate this request from its batch
+                    results.append(exc)
+        else:
+            results = [
+                selected_demo.generate_tts_audio(**generation_request) for generation_request in generation_requests
+            ]
+        self._active_native_selection = canonical_id
+        return results
+
+    def _render_native_batch_results(
+        self,
+        results: list[tuple[int, np.ndarray] | Exception],
+        requests: list[dict[str, Any]],
+    ) -> list[bytes | Exception]:
+        rendered: list[bytes | Exception] = []
+        for result, request in zip(results, requests, strict=True):
+            if isinstance(result, Exception):
+                rendered.append(result)
+                continue
+            try:
+                sample_rate, audio = result
+                rendered.append(
+                    self._wav_response(
+                        sample_rate,
+                        audio,
+                        float(request.get("speed", 1.0)),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate WAV post-processing failures
+                rendered.append(exc)
+        return rendered
 
     async def synthesize_barbet(
         self,
@@ -1426,17 +2068,22 @@ class TTSGateway:
                 seed=actual_seed,
             )
 
-        result, queue_wait, execution_time = await self._run_gpu_job(
+        result, queue_wait, execution_time, session_concurrency = await self._run_gpu_job(
             request_id=request_id,
             engine_id="barbet",
             model_id=model_id,
+            units=1,
             work=generate,
         )
         sample_rate, audio, elapsed = result
         headers = {
             "X-Synthesis-Time": f"{elapsed:.2f}s",
             "X-Random-Seed": str(actual_seed),
-            **self._job_timing_headers(queue_wait, execution_time),
+            **self._job_timing_headers(
+                queue_wait,
+                execution_time,
+                concurrency=session_concurrency,
+            ),
         }
         return self._wav_response(sample_rate, audio, speed), headers
 
@@ -1795,6 +2442,7 @@ def create_app(
             yield
         finally:
             await app.state.castvoice_batch_manager.stop()
+            await gateway.close_coalescer()
             await asyncio.to_thread(gateway.close)
 
     app = FastAPI(
@@ -2146,7 +2794,7 @@ def create_app(
         )
         try:
             if prepared.engine_id == "voxcpm2":
-                wav, extra_headers = await gateway.synthesize_native(
+                wav, extra_headers = await gateway.synthesize_native_coalesced(
                     request_id=request_id,
                     model_id=prepared.model_id,
                     text=prepared.text,
@@ -2180,6 +2828,12 @@ def create_app(
                 "X-Request-ID": request_id,
                 **extra_headers,
             }
+            # voxcpm2 引擎的 diffusion 步數在建構時固定，請求參數不生效；
+            # 誠實回報實際生效值，客戶端不必猜（見 catalog capabilities）。
+            if prepared.engine_id == "voxcpm2":
+                headers["X-Inference-Timesteps-Effective"] = str(
+                    _VOXCPM2_FIXED_TIMESTEPS
+                )
             history_id = uuid.uuid4().hex
             record = await _build_history_record(
                 prepared,
@@ -2189,9 +2843,7 @@ def create_app(
             async with history_lock:
                 await asyncio.to_thread(_save_generation_history, record, wav)
             headers["X-History-ID"] = history_id
-            headers["X-Total-Time"] = (
-                f"{time.perf_counter() - request_started_at:.3f}s"
-            )
+            headers["X-Total-Time"] = f"{time.perf_counter() - request_started_at:.3f}s"
             return Response(content=wav, media_type="audio/wav", headers=headers)
         finally:
             _remove_temp_file(prepared.temp_path)
@@ -2322,6 +2974,7 @@ def create_app(
             "X-Model-Version": prepared.model_id,
             "X-Request-ID": request_id,
             "X-Sample-Rate": str(stream.sample_rate),
+            "X-Engine-Concurrency": str(stream.session_concurrency),
         }
         return _ManagedStreamingResponse(
             body(),

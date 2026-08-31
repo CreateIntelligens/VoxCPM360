@@ -2,11 +2,12 @@ import asyncio
 import inspect
 import logging
 import os
+from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any, Optional, Tuple
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -290,13 +291,64 @@ class VoxCPMDemo:
         logger.info("Discovered %d LoRA checkpoints.", len(self.lora_registry.checkpoints))
 
         self.voxcpm_server = None
+        self._server_loop_thread: Optional[threading.Thread] = None
+        self._server_loop_lock = threading.Lock()
         self._model_id = model_id
         self.denoiser = None
         self.text_normalizer = None
         self.zipenhancer_model_path = "iic/speech_zipenhancer_ans_multiloss_16k_base"
 
+    def _call_engine_sync(self, server: Any, method_name: str, *args: Any) -> Any:
+        """同步呼叫引擎方法，與專屬 loop 執行緒相容。
+
+        loop 執行緒啟動後，nano-vLLM 的同步包裝（內部 run_until_complete）
+        會撞上運轉中的 loop 直接拋錯——此處改以 run_coroutine_threadsafe
+        提交對應的 async pool 方法。loop 未運轉（舊 runtime）則走原同步路徑。
+        """
+        server_loop = getattr(server, "loop", None)
+        pool = getattr(server, "server_pool", None)
+        if (
+            server_loop is not None
+            and server_loop.is_running()
+            and pool is not None
+        ):
+            future = asyncio.run_coroutine_threadsafe(
+                getattr(pool, method_name)(*args), server_loop
+            )
+            return future.result(timeout=300)
+        return getattr(server, method_name)(*args)
+
+    def _ensure_server_loop_running(self) -> None:
+        server = getattr(self, "voxcpm_server", None)
+        if server is None:
+            try:
+                server = self.get_or_load_voxcpm()
+            except Exception:
+                return
+        if server is None:
+            return
+        server_loop = getattr(server, "loop", None)
+        if server_loop is None:
+            return
+        loop_lock = getattr(self, "_server_loop_lock", None)
+        if loop_lock is None:
+            self._server_loop_lock = threading.Lock()
+            loop_lock = self._server_loop_lock
+        with loop_lock:
+            loop_thread = getattr(self, "_server_loop_thread", None)
+            if not server_loop.is_running() and (
+                loop_thread is None or not loop_thread.is_alive()
+            ):
+                self._server_loop_thread = threading.Thread(
+                    target=server_loop.run_forever,
+                    daemon=True,
+                    name="voxcpm-loop",
+                )
+                self._server_loop_thread.start()
+
     def get_or_load_voxcpm(self):
         if self.voxcpm_server is not None:
+            self._ensure_server_loop_running()
             return self.voxcpm_server
         logger.info(f"Loading nano-vllm model: {self._model_id}")
         devices = [0]
@@ -306,7 +358,7 @@ class VoxCPMDemo:
                     devices = [int(self.device.split(":")[-1])]
                 except ValueError:
                     devices = [0]
-        
+
         enforce_eager = not self.optimize
         runtime_lora_config = build_nano_lora_config(
             self.lora_registry.checkpoints
@@ -322,7 +374,12 @@ class VoxCPMDemo:
         lora_config = LoRAConfig(**runtime_lora_config)
         self.voxcpm_server = VoxCPM.from_pretrained(
             self._model_id,
-            inference_timesteps=10,
+            # nano-vLLM 只在建構時接受 diffusion 步數；per-request 的
+            # inference_timesteps 到不了引擎（generate 簽名沒有它），
+            # 所以真正的控制點是這個部署層環境變數。
+            inference_timesteps=int(
+                os.environ.get("VOXCPM_INFERENCE_TIMESTEPS", "10")
+            ),
             max_num_batched_tokens=8192,
             max_num_seqs=16,
             max_model_len=4096,
@@ -332,16 +389,28 @@ class VoxCPMDemo:
             lora_config=lora_config,
         )
         logger.info("nano-vllm model loaded successfully.")
+        self._ensure_server_loop_running()
         return self.voxcpm_server
 
     def stop_voxcpm(self) -> None:
         """Stop nano-vLLM worker processes and release their GPU allocation."""
-        server = self.voxcpm_server
+        server = getattr(self, "voxcpm_server", None)
         self.voxcpm_server = None
-        self.lora_registry.reset_registrations()
+        lora_registry = getattr(self, "lora_registry", None)
+        if lora_registry is not None:
+            lora_registry.reset_registrations()
         if server is None:
             return
-        logger.info("Stopping nano-vllm model: %s", self._model_id)
+        server_loop = getattr(server, "loop", None)
+        if server_loop is not None and server_loop.is_running():
+            server_loop.call_soon_threadsafe(server_loop.stop)
+            with self._server_loop_lock:
+                loop_thread = self._server_loop_thread
+                if loop_thread is not None and loop_thread.is_alive():
+                    loop_thread.join(timeout=5.0)
+                self._server_loop_thread = None
+        model_id = getattr(self, "_model_id", "unknown")
+        logger.info("Stopping nano-vllm model: %s", model_id)
         try:
             stop = getattr(server, "stop", None)
             if callable(stop):
@@ -449,7 +518,9 @@ class VoxCPMDemo:
                     wav_bytes = f.read()
                 logger.info(f"Encoding latents for reference audio: {len(wav_bytes)} bytes")
                 ext = os.path.splitext(actual_ref_path)[1].lstrip('.') or "wav"
-                encoded = server.encode_latents(wav_bytes, ext)
+                encoded = self._call_engine_sync(
+                    server, "encode_latents", wav_bytes, ext
+                )
                 latent_cache[actual_ref_path] = encoded
             if prompt_text_clean:
                 prompt_latents = encoded
@@ -491,68 +562,127 @@ class VoxCPMDemo:
 
     @staticmethod
     def _generate_tts_requests(
-        server: Any, requests: list[dict[str, Any]]
-    ) -> list[np.ndarray]:
+        server: Any,
+        requests: list[dict[str, Any]],
+        *,
+        return_exceptions: bool = False,
+    ) -> list[np.ndarray | Exception]:
+        def concatenate_chunks(chunks: list[np.ndarray]) -> np.ndarray:
+            if not chunks:
+                raise RuntimeError(
+                    "Failed to generate audio (empty stream from backend)"
+                )
+            return np.concatenate(chunks, axis=0)
+
         async_pool = getattr(server, "server_pool", None)
         server_loop = getattr(server, "loop", None)
-        if len(requests) > 1 and async_pool is not None and server_loop is not None:
+        # 單一請求也必須走 async pool：專屬 loop 執行緒啟動後，同步包裝
+        # generate 的 run_until_complete 會撞上運轉中的 loop 直接拋錯。
+        if async_pool is not None and server_loop is not None:
 
             async def collect(request: dict[str, Any]) -> np.ndarray:
                 chunks = [chunk async for chunk in async_pool.generate(**request)]
-                if not chunks:
-                    raise RuntimeError(
-                        "Failed to generate audio (empty stream from backend)"
-                    )
-                return np.concatenate(chunks, axis=0)
+                return concatenate_chunks(chunks)
 
-            async def collect_all() -> list[np.ndarray]:
+            async def collect_all() -> list[np.ndarray | Exception]:
                 results = await asyncio.gather(
                     *(collect(request) for request in requests),
                     return_exceptions=True,
                 )
+                if return_exceptions:
+                    isolated_results: list[np.ndarray | Exception] = []
+                    for result in results:
+                        if isinstance(result, asyncio.CancelledError):
+                            error = RuntimeError("Batched generation was cancelled")
+                            error.__cause__ = result
+                            isolated_results.append(error)
+                        else:
+                            isolated_results.append(result)
+                    return isolated_results
                 # Wait for every submitted backend request before surfacing an
                 # error. Returning early would release the API's GPU gate while
                 # another request from this batch could still be running.
-                errors = [
-                    result for result in results if isinstance(result, BaseException)
-                ]
+                errors = [result for result in results if isinstance(result, BaseException)]
                 if errors:
-                    raise RuntimeError(
-                        f"{len(errors)} of {len(requests)} batched generations failed"
-                    ) from errors[0]
+                    raise RuntimeError(f"{len(errors)} of {len(requests)} batched generations failed") from errors[0]
                 return [result for result in results if isinstance(result, np.ndarray)]
 
+            # 引擎互動一律透過 run_coroutine_threadsafe 提交至專屬 loop 執行緒。
+            # 禁令：禁止在併發路徑使用 server_loop.run_until_complete。
+            if server_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(collect_all(), server_loop)
+                return future.result()
             return server_loop.run_until_complete(collect_all())
 
         results = []
         for request in requests:
-            chunks = list(server.generate(**request))
-            if not chunks:
-                raise RuntimeError("Failed to generate audio (empty stream from backend)")
-            results.append(np.concatenate(chunks, axis=0))
+            try:
+                chunks = list(server.generate(**request))
+                results.append(concatenate_chunks(chunks))
+            except Exception as exc:
+                if not return_exceptions:
+                    raise
+                results.append(exc)
         return results
 
     def generate_tts_audio_batch(
-        self, requests: list[dict[str, Any]]
-    ) -> list[Tuple[int, np.ndarray]]:
+        self,
+        requests: list[dict[str, Any]],
+        *,
+        return_exceptions: bool = False,
+    ) -> list[tuple[int, np.ndarray] | Exception]:
         if not requests:
             return []
         server = self.get_or_load_voxcpm()
         temp_files: list[str] = []
         latent_cache: dict[str, Any] = {}
         try:
-            prepared = [
-                self._prepare_tts_generation(
-                    server,
-                    temp_files,
-                    latent_cache,
-                    **request,
+            if not return_exceptions:
+                prepared = [
+                    self._prepare_tts_generation(
+                        server,
+                        temp_files,
+                        latent_cache,
+                        **request,
+                    )
+                    for request in requests
+                ]
+                audio_results = self._generate_tts_requests(server, prepared)
+                sample_rate = int(self._call_engine_sync(server, "get_model_info")["sample_rate"])
+                return [(sample_rate, audio) for audio in audio_results]
+
+            prepared: list[dict[str, Any]] = []
+            prepared_indices: list[int] = []
+            indexed_results: dict[int, tuple[int, np.ndarray] | Exception] = {}
+            for index, request in enumerate(requests):
+                try:
+                    prepared.append(
+                        self._prepare_tts_generation(
+                            server,
+                            temp_files,
+                            latent_cache,
+                            **request,
+                        )
+                    )
+                    prepared_indices.append(index)
+                except Exception as exc:  # noqa: BLE001 - preserve per-request failure
+                    indexed_results[index] = exc
+
+            audio_results = self._generate_tts_requests(
+                server,
+                prepared,
+                return_exceptions=True,
+            )
+            sample_rate = int(self._call_engine_sync(server, "get_model_info")["sample_rate"])
+            for index, result in zip(
+                prepared_indices,
+                audio_results,
+                strict=True,
+            ):
+                indexed_results[index] = (
+                    result if isinstance(result, Exception) else (sample_rate, result)
                 )
-                for request in requests
-            ]
-            audio_results = self._generate_tts_requests(server, prepared)
-            sample_rate = int(server.get_model_info()["sample_rate"])
-            return [(sample_rate, audio) for audio in audio_results]
+            return [indexed_results[index] for index in range(len(requests))]
         finally:
             for tmp_path in temp_files:
                 if tmp_path and os.path.exists(tmp_path):
@@ -579,21 +709,42 @@ class VoxCPMDemo:
             async_pool = getattr(server, "server_pool", None)
             server_loop = getattr(server, "loop", None)
             if async_pool is not None and server_loop is not None:
+                self._ensure_server_loop_running()
                 async_generator = async_pool.generate(**prepared)
                 try:
                     while True:
-                        try:
-                            chunk = server_loop.run_until_complete(
-                                async_generator.__anext__()
+                        if server_loop.is_running():
+                            future = asyncio.run_coroutine_threadsafe(
+                                async_generator.__anext__(),
+                                server_loop,
                             )
-                        except StopAsyncIteration:
-                            break
+                            try:
+                                chunk = future.result()
+                            except StopAsyncIteration:
+                                break
+                        else:
+                            try:
+                                chunk = server_loop.run_until_complete(
+                                    async_generator.__anext__()
+                                )
+                            except StopAsyncIteration:
+                                break
                         yielded = True
                         yield np.asarray(chunk, dtype=np.float32)
                 finally:
                     # sync wrapper 的 close 不保證會取消底層 async CUDA request。
                     # 等 aclose 完成後 worker 才能離開，GPU gate 才可安全釋放。
-                    server_loop.run_until_complete(async_generator.aclose())
+                    if server_loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(
+                            async_generator.aclose(),
+                            server_loop,
+                        )
+                        try:
+                            future.result(timeout=10.0)
+                        except Exception:
+                            pass
+                    else:
+                        server_loop.run_until_complete(async_generator.aclose())
             else:
                 generator = server.generate(**prepared)
                 try:

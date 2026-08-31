@@ -92,21 +92,17 @@ class FakeBatchDemo(FakeDemo):
         super().__init__(*args, **kwargs)
         self.batch_calls = []
 
-    def generate_tts_audio_batch(self, requests):
+    def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
         self.batch_calls.append(requests)
-        return [
-            (16_000, np.zeros(320, dtype=np.float32)) for _ in requests
-        ]
+        return [(16_000, np.zeros(320, dtype=np.float32)) for _ in requests]
 
 
 class FakeOOMBatchDemo(FakeBatchDemo):
-    def generate_tts_audio_batch(self, requests):
+    def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
         self.batch_calls.append(requests)
         if len(requests) > 2:
             raise RuntimeError("CUDA out of memory")
-        return [
-            (16_000, np.zeros(320, dtype=np.float32)) for _ in requests
-        ]
+        return [(16_000, np.zeros(320, dtype=np.float32)) for _ in requests]
 
 
 class FakeLoraCheckpoint:
@@ -122,6 +118,26 @@ def wait_for_batch(client: TestClient, batch_id: str) -> dict:
             return status
         time.sleep(0.05)
     raise AssertionError("batch did not finish in time")
+
+
+def synthesize_coalesced(
+    gateway: api.TTSGateway,
+    request_id: str,
+    text: str,
+    model_id: str = api.PUBLIC_BASE_MODEL_ID,
+):
+    return gateway.synthesize_native_coalesced(
+        request_id=request_id,
+        model_id=model_id,
+        text=text,
+        control_instruction="",
+        reference_path=None,
+        prompt_text="",
+        cfg_value=2.0,
+        normalize=False,
+        denoise=False,
+        inference_timesteps=10,
+    )
 
 
 def test_generation_history_partial_replace_is_rolled_back(monkeypatch):
@@ -214,6 +230,9 @@ def test_catalog_exposes_native_engine(monkeypatch):
     assert [engine["id"] for engine in payload["engines"]] == ["voxcpm2"]
     assert payload["engines"][0]["models"][0]["id"] == "base::__base__"
     assert payload["engines"][0]["capabilities"]["streaming"] is True
+    # voxcpm2 的 per-request inference_timesteps 不生效（引擎建構時固定），
+    # catalog 必須誠實揭露讓前端隱藏該欄位。
+    assert payload["engines"][0]["capabilities"]["inference_timesteps"] is False
 
 
 def test_catalog_namespaces_lora_and_accepts_legacy_alias(monkeypatch):
@@ -406,7 +425,425 @@ def test_native_synthesis_returns_wav(monkeypatch):
     assert response.headers["x-queue-wait"].endswith("s")
     assert response.headers["x-gpu-job-time"].endswith("s")
     assert response.headers["x-total-time"].endswith("s")
+    assert response.headers["x-batch-size"] == "1"
     assert demo.calls[0]["inference_timesteps"] == 8
+
+
+def test_native_interactive_coalesces_requests_already_waiting(monkeypatch):
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "5")
+    monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "4")
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class BlockingBatchDemo(FakeBatchDemo):
+        def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
+            self.batch_calls.append(requests)
+            if len(self.batch_calls) == 1:
+                first_started.set()
+                assert release_first.wait(timeout=2)
+            return [(16_000, np.zeros(320, dtype=np.float32)) for _ in requests]
+
+    gateway = api.TTSGateway(
+        BlockingBatchDemo(),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    async def run_scenario():
+        first = asyncio.create_task(synthesize_coalesced(gateway, "request-0", "第零筆"))
+        assert await asyncio.to_thread(first_started.wait, 1)
+        waiting = [
+            asyncio.create_task(synthesize_coalesced(gateway, f"request-{index}", f"第 {index} 筆"))
+            for index in range(1, 6)
+        ]
+        for _ in range(100):
+            if gateway._inflight_jobs == 6:
+                break
+            await asyncio.sleep(0.01)
+        assert gateway._inflight_jobs == 6
+
+        release_first.set()
+        results = await asyncio.gather(first, *waiting)
+        await gateway.close_coalescer()
+        return results
+
+    results = asyncio.run(run_scenario())
+
+    assert [len(requests) for requests in gateway.demo.batch_calls] == [1, 4, 1]
+    assert [headers["X-Batch-Size"] for _, headers in results] == ["1", "4", "4", "4", "4", "1"]
+    assert all(wav.startswith(b"RIFF") for wav, _ in results)
+    assert gateway._inflight_jobs == 0
+
+
+def test_native_interactive_batch_max_one_is_rollback(monkeypatch):
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "3")
+    monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "1")
+    gateway = api.TTSGateway(
+        FakeBatchDemo(),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    async def run_scenario():
+        await gateway._gpu_lock.acquire()
+        tasks = [
+            asyncio.create_task(synthesize_coalesced(gateway, f"request-{index}", f"第 {index} 筆"))
+            for index in range(4)
+        ]
+        for _ in range(100):
+            if gateway._inflight_jobs == 4:
+                break
+            await asyncio.sleep(0.01)
+        gateway._gpu_lock.release()
+        results = await asyncio.gather(*tasks)
+        await gateway.close_coalescer()
+        return results
+
+    results = asyncio.run(run_scenario())
+
+    assert [len(requests) for requests in gateway.demo.batch_calls] == [1, 1, 1, 1]
+    assert all(headers["X-Batch-Size"] == "1" for _, headers in results)
+
+
+def test_native_interactive_batch_max_is_clamped_to_engine_limit(monkeypatch):
+    monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "99")
+
+    gateway = api.TTSGateway(
+        FakeBatchDemo(),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    assert gateway._interactive_batch_max == 16
+
+
+def test_native_interactive_preserves_fifo_across_models(monkeypatch):
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "3")
+    monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "4")
+
+    class LoraCheckpoint:
+        def __init__(self, run_name):
+            self.run_name = run_name
+            self.label = run_name
+
+    demo = FakeBatchDemo()
+    demo.lora_registry = FakeRegistry((LoraCheckpoint("model-a"), LoraCheckpoint("model-b")))
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        await gateway._gpu_lock.acquire()
+        model_ids = ["lora::model-a", "lora::model-a", "lora::model-b", "lora::model-a"]
+        tasks = [
+            asyncio.create_task(
+                synthesize_coalesced(
+                    gateway,
+                    f"request-{index}",
+                    f"第 {index} 筆",
+                    model_id,
+                )
+            )
+            for index, model_id in enumerate(model_ids)
+        ]
+        for _ in range(100):
+            if gateway._inflight_jobs == 4:
+                break
+            await asyncio.sleep(0.01)
+        gateway._gpu_lock.release()
+        await asyncio.gather(*tasks)
+        await gateway.close_coalescer()
+
+    asyncio.run(run_scenario())
+
+    assert [len(requests) for requests in demo.batch_calls] == [2, 1, 1]
+    assert [requests[0]["model_selection"] for requests in demo.batch_calls] == [
+        "model-a",
+        "model-b",
+        "model-a",
+    ]
+
+
+def test_native_interactive_queue_timeout_removes_pending_item(monkeypatch):
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "1")
+    monkeypatch.setenv("VOXCPM_QUEUE_TIMEOUT_SECONDS", "0.02")
+    gateway = api.TTSGateway(
+        FakeBatchDemo(),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    async def run_scenario():
+        await gateway._gpu_lock.acquire()
+        with pytest.raises(api.HTTPException) as exc_info:
+            await synthesize_coalesced(gateway, "timed-out", "逾時請求")
+        assert exc_info.value.status_code == 503
+        assert gateway._inflight_jobs == 0
+        assert gateway.demo.batch_calls == []
+
+        gateway._gpu_lock.release()
+        for _ in range(100):
+            drain_task = gateway._native_coalescer._drain_task
+            if drain_task is None or drain_task.done():
+                break
+            await asyncio.sleep(0.01)
+        result = await synthesize_coalesced(gateway, "recovered", "恢復請求")
+        await gateway.close_coalescer()
+        return result
+
+    wav, headers = asyncio.run(run_scenario())
+
+    assert wav.startswith(b"RIFF")
+    assert headers["X-Batch-Size"] == "1"
+    assert len(gateway.demo.batch_calls) == 1
+
+
+def test_native_interactive_claimed_item_does_not_timeout_during_generation(
+    monkeypatch,
+):
+    monkeypatch.setenv("VOXCPM_QUEUE_TIMEOUT_SECONDS", "0.02")
+    generation_started = threading.Event()
+    release_generation = threading.Event()
+
+    class SlowBatchDemo(FakeBatchDemo):
+        def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
+            self.batch_calls.append(requests)
+            generation_started.set()
+            assert release_generation.wait(timeout=2)
+            return [(16_000, np.zeros(320, dtype=np.float32)) for _ in requests]
+
+    gateway = api.TTSGateway(
+        SlowBatchDemo(),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    async def run_scenario():
+        task = asyncio.create_task(synthesize_coalesced(gateway, "claimed", "已開始生成"))
+        assert await asyncio.to_thread(generation_started.wait, 1)
+        await asyncio.sleep(0.04)
+        assert not task.done()
+
+        release_generation.set()
+        result = await task
+        await gateway.close_coalescer()
+        return result
+
+    wav, headers = asyncio.run(run_scenario())
+
+    assert wav.startswith(b"RIFF")
+    assert headers["X-Batch-Size"] == "1"
+    assert gateway._inflight_jobs == 0
+
+
+def test_native_interactive_rejects_submit_after_shutdown_without_admission(
+    monkeypatch,
+):
+    gateway = api.TTSGateway(
+        FakeBatchDemo(),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    async def run_scenario():
+        await gateway.close_coalescer()
+        with pytest.raises(
+            RuntimeError,
+            match="Native interactive coalescer is closed",
+        ):
+            await synthesize_coalesced(gateway, "after-close", "關閉後送入")
+
+    asyncio.run(run_scenario())
+
+    assert gateway._inflight_jobs == 0
+    assert gateway.demo.batch_calls == []
+
+
+def test_native_interactive_completion_failure_resolves_request(monkeypatch):
+    gateway = api.TTSGateway(
+        FakeBatchDemo(),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    def fail_timing_headers(queue_wait, execution_time):
+        raise RuntimeError("header failure")
+
+    monkeypatch.setattr(gateway, "_job_timing_headers", fail_timing_headers)
+
+    async def run_scenario():
+        with pytest.raises(RuntimeError, match="header failure"):
+            await asyncio.wait_for(
+                synthesize_coalesced(gateway, "completion-failure", "完成階段失敗"),
+                timeout=1,
+            )
+        await gateway.close_coalescer()
+
+    asyncio.run(run_scenario())
+
+    assert gateway._inflight_jobs == 0
+    assert len(gateway.demo.batch_calls) == 1
+
+
+def test_native_interactive_queue_full_keeps_global_capacity(monkeypatch):
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "0")
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class BlockingBatchDemo(FakeBatchDemo):
+        def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
+            self.batch_calls.append(requests)
+            first_started.set()
+            assert release_first.wait(timeout=2)
+            return [(16_000, np.zeros(320, dtype=np.float32)) for _ in requests]
+
+    gateway = api.TTSGateway(
+        BlockingBatchDemo(),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    async def run_scenario():
+        active = asyncio.create_task(synthesize_coalesced(gateway, "active", "第一筆"))
+        assert await asyncio.to_thread(first_started.wait, 1)
+        with pytest.raises(api.HTTPException) as exc_info:
+            await synthesize_coalesced(gateway, "rejected", "第二筆")
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.headers["Retry-After"] == "30"
+        assert exc_info.value.headers["X-Request-ID"] == "rejected"
+        release_first.set()
+        await active
+        await gateway.close_coalescer()
+
+    asyncio.run(run_scenario())
+    assert gateway._inflight_jobs == 0
+
+
+def test_native_interactive_waits_for_streaming_gate_then_batches(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "1")
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "2")
+    monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "4")
+    stream_blocked = threading.Event()
+    release_stream = threading.Event()
+
+    class StreamingBatchDemo(FakeStreamingDemo):
+        def __init__(self):
+            super().__init__()
+            self.batch_calls = []
+
+        def generate_tts_audio_stream(self, request):
+            yield np.array([0.1], dtype=np.float32)
+            stream_blocked.set()
+            assert release_stream.wait(timeout=2)
+            yield np.array([0.2], dtype=np.float32)
+
+        def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
+            self.batch_calls.append(requests)
+            return [(16_000, np.zeros(320, dtype=np.float32)) for _ in requests]
+
+    demo = StreamingBatchDemo()
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        stream = await gateway.synthesize_native_stream(
+            request_id="streaming",
+            model_id="__base__",
+            text="串流請求",
+            control_instruction="",
+            reference_path=None,
+            prompt_text="",
+            cfg_value=2.0,
+            normalize=False,
+            denoise=False,
+            inference_timesteps=10,
+        )
+        assert await asyncio.to_thread(stream_blocked.wait, 1)
+        tasks = [
+            asyncio.create_task(synthesize_coalesced(gateway, f"queued-{index}", f"排隊 {index}")) for index in range(2)
+        ]
+        for _ in range(100):
+            if gateway._inflight_jobs == 3:
+                break
+            await asyncio.sleep(0.01)
+        assert gateway._inflight_jobs == 3
+        assert demo.batch_calls == []
+
+        release_stream.set()
+        assert [chunk async for chunk in stream]
+        await stream.aclose()
+        results = await asyncio.gather(*tasks)
+        await gateway.close_coalescer()
+        return results
+
+    results = asyncio.run(run_scenario())
+
+    assert [len(requests) for requests in demo.batch_calls] == [2]
+    assert all(headers["X-Batch-Size"] == "2" for _, headers in results)
+    assert gateway._inflight_jobs == 0
+    assert not gateway._gpu_lock.locked()
+
+
+def test_native_interactive_batch_isolates_http_errors_and_history(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "3")
+    monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "4")
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class IsolatedFailureDemo(FakeBatchDemo):
+        def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
+            self.batch_calls.append(requests)
+            if len(self.batch_calls) == 1:
+                first_started.set()
+                assert release_first.wait(timeout=2)
+            results = [
+                RuntimeError("one item failed")
+                if request["text_input"] == "失敗"
+                else (16_000, np.zeros(320, dtype=np.float32))
+                for request in requests
+            ]
+            if not return_exceptions:
+                error = next(
+                    (result for result in results if isinstance(result, Exception)),
+                    None,
+                )
+                if error is not None:
+                    raise error
+            return results
+
+    demo = IsolatedFailureDemo()
+    app = api.create_app(
+        demo,
+        barbet_runtime=FakeBarbetRuntime(),
+        mount_legacy=False,
+    )
+    payload = {
+        "engine_id": "voxcpm2",
+        "model_id": "__base__",
+    }
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            blocker = pool.submit(
+                client.post,
+                "/api/v1/synthesize",
+                data={**payload, "text": "先佔住 GPU"},
+            )
+            assert first_started.wait(timeout=2)
+            futures = [
+                pool.submit(
+                    client.post,
+                    "/api/v1/synthesize",
+                    data={**payload, "text": text},
+                )
+                for text in ("成功一", "失敗", "成功二")
+            ]
+            for _ in range(100):
+                if app.state.tts_gateway._inflight_jobs == 4:
+                    break
+                time.sleep(0.01)
+            release_first.set()
+            blocker_response = blocker.result()
+            responses = [future.result() for future in futures]
+        history = client.get("/api/v1/history?limit=10").json()["items"]
+
+    assert blocker_response.status_code == 200
+    assert [response.status_code for response in responses] == [200, 500, 200]
+    assert responses[0].headers["x-batch-size"] == "3"
+    assert responses[2].headers["x-batch-size"] == "3"
+    assert "x-history-id" not in responses[1].headers
+    assert len(history) == 3
+    assert {item["text"] for item in history} == {"先佔住 GPU", "成功一", "成功二"}
 
 
 def test_native_streaming_synthesis_returns_unknown_length_wav_and_history(
@@ -637,6 +1074,7 @@ def test_native_streaming_queue_full_is_rejected_before_response_start(monkeypat
 
 
 def test_native_streaming_queue_timeout_returns_503_and_recovers(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "1")
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     monkeypatch.setenv("VOXCPM_DEFAULT_REFERENCE", "")
     monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "1")
@@ -1227,7 +1665,76 @@ def test_demo_streaming_close_acloses_async_backend_generator():
     stream.close()
 
     assert backend_closed.is_set()
+    if server.loop.is_running():
+        server.loop.call_soon_threadsafe(server.loop.stop)
+        loop_thread = getattr(demo, "_server_loop_thread", None)
+        if loop_thread is not None:
+            loop_thread.join(timeout=2.0)
     server.loop.close()
+
+
+def test_demo_batch_can_return_backend_exceptions_per_item():
+    completed = []
+
+    class AsyncPool:
+        async def generate(self, **request):
+            try:
+                if request["index"] == 1:
+                    raise RuntimeError("item failed")
+                yield np.array([request["index"]], dtype=np.float32)
+            finally:
+                completed.append(request["index"])
+
+    class Server:
+        def __init__(self):
+            self.server_pool = AsyncPool()
+            self.loop = asyncio.new_event_loop()
+
+    server = Server()
+    requests = [{"index": index} for index in range(3)]
+    results = api.VoxCPMDemo._generate_tts_requests(
+        server,
+        requests,
+        return_exceptions=True,
+    )
+
+    assert np.array_equal(results[0], np.array([0], dtype=np.float32))
+    assert isinstance(results[1], RuntimeError)
+    assert np.array_equal(results[2], np.array([2], dtype=np.float32))
+    assert sorted(completed) == [0, 1, 2]
+
+    with pytest.raises(RuntimeError, match="1 of 3 batched generations failed"):
+        api.VoxCPMDemo._generate_tts_requests(server, requests)
+    assert sorted(completed) == [0, 0, 1, 1, 2, 2]
+    server.loop.close()
+
+
+def test_demo_batch_isolates_request_preparation_errors():
+    class Server:
+        @staticmethod
+        def get_model_info():
+            return {"sample_rate": 16_000}
+
+    demo = object.__new__(api.VoxCPMDemo)
+    demo.get_or_load_voxcpm = lambda: Server()
+
+    def prepare(server, temp_files, latent_cache, **request):
+        if request["index"] == 1:
+            raise ValueError("bad reference")
+        return request
+
+    demo._prepare_tts_generation = prepare
+    demo._generate_tts_requests = lambda server, requests, return_exceptions=False: [
+        np.array([request["index"]], dtype=np.float32) for request in requests
+    ]
+    results = demo.generate_tts_audio_batch(
+        [{"index": index} for index in range(3)],
+        return_exceptions=True,
+    )
+
+    assert results[0][0] == 16_000
+    assert isinstance(results[1], ValueError)
+    assert results[2][0] == 16_000
 
 
 def test_full_native_checkpoint_switches_runtime(monkeypatch, tmp_path):
@@ -1889,3 +2396,448 @@ def test_castvoice_batch_retries_smaller_chunks_after_oom(monkeypatch):
 
     assert [item["status"] for item in status["items"]] == ["done"] * 4
     assert [len(requests) for requests in demo.batch_calls] == [4, 2, 2]
+
+
+def test_concurrent_streaming_two_streams_ttfb_unblocked(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "2")
+    stream1_first_sent = threading.Event()
+    stream2_first_sent = threading.Event()
+
+    class ConcurrentStreamingDemo(FakeDemo):
+        def __init__(self):
+            super().__init__()
+            self.server = FakeStreamingServer()
+
+        def get_or_load_voxcpm(self):
+            return self.server
+
+        def generate_tts_audio_stream(self, request):
+            text = request["text_input"]
+            if text == "stream-1":
+                yield np.array([0.1], dtype=np.float32)
+                stream1_first_sent.set()
+                assert stream2_first_sent.wait(timeout=2.0)
+                yield np.array([0.2], dtype=np.float32)
+            else:
+                yield np.array([0.5], dtype=np.float32)
+                stream2_first_sent.set()
+                assert stream1_first_sent.wait(timeout=2.0)
+                yield np.array([0.6], dtype=np.float32)
+
+    demo = ConcurrentStreamingDemo()
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        s1 = await gateway.synthesize_native_stream(
+            request_id="req-1",
+            model_id="__base__",
+            text="stream-1",
+            control_instruction="",
+            reference_path=None,
+            prompt_text="",
+            cfg_value=2.0,
+            normalize=False,
+            denoise=False,
+            inference_timesteps=10,
+        )
+        s2 = await gateway.synthesize_native_stream(
+            request_id="req-2",
+            model_id="__base__",
+            text="stream-2",
+            control_instruction="",
+            reference_path=None,
+            prompt_text="",
+            cfg_value=2.0,
+            normalize=False,
+            denoise=False,
+            inference_timesteps=10,
+        )
+        assert s1.session_concurrency == 1
+        assert s2.session_concurrency == 2
+
+        chunks1 = [c async for c in s1]
+        chunks2 = [c async for c in s2]
+        return chunks1, chunks2
+
+    c1, c2 = asyncio.run(run_scenario())
+    assert len(c1) == 2
+    assert len(c2) == 2
+    assert np.array_equal(c1[0], np.array([0.1], dtype=np.float32))
+    assert np.array_equal(c2[0], np.array([0.5], dtype=np.float32))
+
+
+def test_concurrent_streaming_and_batch_coexist(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "4")
+    stream_running = threading.Event()
+    batch_running = threading.Event()
+    release_all = threading.Event()
+
+    class MixedDemo(FakeDemo):
+        def __init__(self):
+            super().__init__()
+            self.server = FakeStreamingServer()
+            self.batch_calls = []
+
+        def get_or_load_voxcpm(self):
+            return self.server
+
+        def generate_tts_audio_stream(self, request):
+            stream_running.set()
+            assert batch_running.wait(timeout=2.0)
+            yield np.array([0.1], dtype=np.float32)
+            assert release_all.wait(timeout=2.0)
+            yield np.array([0.2], dtype=np.float32)
+
+        def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
+            self.batch_calls.append(requests)
+            batch_running.set()
+            assert stream_running.wait(timeout=2.0)
+            assert release_all.wait(timeout=2.0)
+            return [(16000, np.zeros(160, dtype=np.float32)) for _ in requests]
+
+    demo = MixedDemo()
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        stream_task = asyncio.create_task(
+            gateway.synthesize_native_stream(
+                request_id="req-stream",
+                model_id="__base__",
+                text="streaming-request",
+                control_instruction="",
+                reference_path=None,
+                prompt_text="",
+                cfg_value=2.0,
+                normalize=False,
+                denoise=False,
+                inference_timesteps=10,
+            )
+        )
+        batch_task = asyncio.create_task(
+            gateway.synthesize_native_batch(
+                request_id="req-batch",
+                model_id="__base__",
+                requests=[{"text": "batch-1"}, {"text": "batch-2"}],
+            )
+        )
+        assert await asyncio.to_thread(stream_running.wait, 2.0)
+        assert await asyncio.to_thread(batch_running.wait, 2.0)
+        release_all.set()
+
+        stream, (batch_wavs, batch_headers) = await asyncio.gather(stream_task, batch_task)
+        chunks = [c async for c in stream]
+        return chunks, batch_wavs, batch_headers
+
+    chunks, batch_wavs, batch_headers = asyncio.run(run_scenario())
+    assert len(chunks) == 2
+    assert len(batch_wavs) == 2
+    assert gateway._session_gate.active_units == 0
+
+
+def test_engine_concurrency_one_is_strictly_exclusive(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "1")
+    stream1_started = threading.Event()
+    release_stream1 = threading.Event()
+
+    class ExclDemo(FakeDemo):
+        def __init__(self):
+            super().__init__()
+            self.server = FakeStreamingServer()
+
+        def get_or_load_voxcpm(self):
+            return self.server
+
+        def generate_tts_audio_stream(self, request):
+            if request["text_input"] == "stream-1":
+                stream1_started.set()
+                yield np.array([0.1], dtype=np.float32)
+                assert release_stream1.wait(timeout=2.0)
+                yield np.array([0.2], dtype=np.float32)
+            else:
+                yield np.array([0.9], dtype=np.float32)
+
+    demo = ExclDemo()
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        s1 = await gateway.synthesize_native_stream(
+            request_id="req-1",
+            model_id="__base__",
+            text="stream-1",
+            control_instruction="",
+            reference_path=None,
+            prompt_text="",
+            cfg_value=2.0,
+            normalize=False,
+            denoise=False,
+            inference_timesteps=10,
+        )
+        s2_task = asyncio.create_task(
+            gateway.synthesize_native_stream(
+                request_id="req-2",
+                model_id="__base__",
+                text="stream-2",
+                control_instruction="",
+                reference_path=None,
+                prompt_text="",
+                cfg_value=2.0,
+                normalize=False,
+                denoise=False,
+                inference_timesteps=10,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not s2_task.done()
+
+        release_stream1.set()
+        c1 = [c async for c in s1]
+        await s1.aclose()
+
+        s2 = await s2_task
+        c2 = [c async for c in s2]
+        return c1, c2
+
+    c1, c2 = asyncio.run(run_scenario())
+    assert len(c1) == 2
+    assert len(c2) == 1
+    assert gateway._session_gate.active_units == 0
+
+
+def test_session_gate_capacity_full_queues_and_admit_rejects_429(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "2")
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "2")
+    hold_gate = threading.Event()
+
+    class GateDemo(FakeDemo):
+        def __init__(self):
+            super().__init__()
+            self.server = FakeStreamingServer()
+
+        def get_or_load_voxcpm(self):
+            return self.server
+
+        def generate_tts_audio_stream(self, request):
+            yield np.array([0.1], dtype=np.float32)
+            assert hold_gate.wait(timeout=2.0)
+            yield np.array([0.2], dtype=np.float32)
+
+    demo = GateDemo()
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        s1 = await gateway.synthesize_native_stream(
+            request_id="req-1", model_id="__base__", text="1",
+            control_instruction="", reference_path=None, prompt_text="",
+            cfg_value=2.0, normalize=False, denoise=False, inference_timesteps=10,
+        )
+        s2 = await gateway.synthesize_native_stream(
+            request_id="req-2", model_id="__base__", text="2",
+            control_instruction="", reference_path=None, prompt_text="",
+            cfg_value=2.0, normalize=False, denoise=False, inference_timesteps=10,
+        )
+        s3_task = asyncio.create_task(
+            gateway.synthesize_native_stream(
+                request_id="req-3", model_id="__base__", text="3",
+                control_instruction="", reference_path=None, prompt_text="",
+                cfg_value=2.0, normalize=False, denoise=False, inference_timesteps=10,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not s3_task.done()
+
+        with pytest.raises(api.HTTPException) as exc_info:
+            await gateway.synthesize_native_stream(
+                request_id="req-4", model_id="__base__", text="4",
+                control_instruction="", reference_path=None, prompt_text="",
+                cfg_value=2.0, normalize=False, denoise=False, inference_timesteps=10,
+            )
+        assert exc_info.value.status_code == 429
+
+        hold_gate.set()
+        await s1.aclose()
+        await s2.aclose()
+        s3 = await s3_task
+        await s3.aclose()
+
+    asyncio.run(run_scenario())
+    assert gateway._inflight_jobs == 0
+    assert gateway._session_gate.active_units == 0
+
+
+def test_session_gate_model_switch_drains_and_preserves_fifo(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "2")
+    gate = api._GPUSessionGate(concurrency=2)
+    order = []
+
+    async def run_scenario():
+        c1 = await gate.acquire(engine_id="voxcpm2", model_id="model-A", units=1)
+        c2 = await gate.acquire(engine_id="voxcpm2", model_id="model-A", units=1)
+        assert c1 == 1 and c2 == 2
+        assert gate.active_units == 2
+
+        async def wait_b():
+            await gate.acquire(engine_id="voxcpm2", model_id="model-B", units=1)
+            order.append("B")
+            gate.release(units=1)
+
+        async def wait_a2():
+            await gate.acquire(engine_id="voxcpm2", model_id="model-A", units=1)
+            order.append("A2")
+            gate.release(units=1)
+
+        task_b = asyncio.create_task(wait_b())
+        task_a2 = asyncio.create_task(wait_a2())
+        await asyncio.sleep(0.02)
+
+        gate.release(units=1)
+        await asyncio.sleep(0.02)
+        assert order == []
+
+        gate.release(units=1)
+        await asyncio.gather(task_b, task_a2)
+        assert order == ["B", "A2"]
+
+    asyncio.run(run_scenario())
+    assert gate.active_units == 0
+
+
+def test_concurrent_streaming_client_disconnect_isolation(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "2")
+    stream1_closed = threading.Event()
+    release_stream2 = threading.Event()
+
+    class DisconnectDemo(FakeDemo):
+        def __init__(self):
+            super().__init__()
+            self.server = FakeStreamingServer()
+
+        def get_or_load_voxcpm(self):
+            return self.server
+
+        def generate_tts_audio_stream(self, request):
+            if request["text_input"] == "stream-1":
+                try:
+                    yield np.array([0.1], dtype=np.float32)
+                    for idx in range(100):
+                        yield np.array([0.1 * (idx + 2)], dtype=np.float32)
+                finally:
+                    stream1_closed.set()
+            else:
+                yield np.array([0.8], dtype=np.float32)
+                assert stream1_closed.wait(timeout=2.0)
+                assert release_stream2.wait(timeout=2.0)
+                yield np.array([0.9], dtype=np.float32)
+
+    demo = DisconnectDemo()
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        s1 = await gateway.synthesize_native_stream(
+            request_id="req-1", model_id="__base__", text="stream-1",
+            control_instruction="", reference_path=None, prompt_text="",
+            cfg_value=2.0, normalize=False, denoise=False, inference_timesteps=10,
+        )
+        s2 = await gateway.synthesize_native_stream(
+            request_id="req-2", model_id="__base__", text="stream-2",
+            control_instruction="", reference_path=None, prompt_text="",
+            cfg_value=2.0, normalize=False, denoise=False, inference_timesteps=10,
+        )
+        assert gateway._session_gate.active_units == 2
+
+        _ = await s1.__anext__()
+        await s1.aclose()
+        assert await asyncio.to_thread(stream1_closed.wait, 2.0)
+
+        assert gateway._session_gate.active_units == 1
+
+        release_stream2.set()
+        c2 = [c async for c in s2]
+        await s2.aclose()
+        return c2
+
+    c2 = asyncio.run(run_scenario())
+    assert len(c2) == 2
+    assert gateway._session_gate.active_units == 0
+
+
+def test_barbet_and_voxcpm2_mutual_exclusion_with_drain(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "2")
+    stream_running = threading.Event()
+    release_stream = threading.Event()
+
+    class StreamDemo(FakeDemo):
+        def __init__(self):
+            super().__init__()
+            self.server = FakeStreamingServer()
+
+        def get_or_load_voxcpm(self):
+            return self.server
+
+        def generate_tts_audio_stream(self, request):
+            stream_running.set()
+            yield np.array([0.1], dtype=np.float32)
+            assert release_stream.wait(timeout=2.0)
+            yield np.array([0.2], dtype=np.float32)
+
+    demo = StreamDemo()
+    barbet = FakeBarbetRuntime(checkpoints=(FakeBarbetCheckpoint(),))
+    gateway = api.TTSGateway(demo, barbet_runtime=barbet)
+
+    async def run_scenario():
+        s1 = await gateway.synthesize_native_stream(
+            request_id="voxcpm-1", model_id="__base__", text="voxcpm",
+            control_instruction="", reference_path=None, prompt_text="",
+            cfg_value=2.0, normalize=False, denoise=False, inference_timesteps=10,
+        )
+        assert await asyncio.to_thread(stream_running.wait, 2.0)
+
+        barbet_task = asyncio.create_task(
+            gateway.synthesize_barbet(
+                request_id="barbet-1",
+                model_id="barbet::barbet-tw-v1",
+                text="barbet text",
+                reference_path=None,
+                prompt_text="",
+                speaker_id="voice-a",
+                cfg_value=2.0,
+                inference_timesteps=10,
+                seed=42,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not barbet_task.done()
+
+        release_stream.set()
+        _ = [c async for c in s1]
+        await s1.aclose()
+
+        wav, headers = await barbet_task
+        return wav, headers
+
+    wav, headers = asyncio.run(run_scenario())
+    assert wav.startswith(b"RIFF")
+    assert headers["X-Engine-Concurrency"] == "1"
+    assert gateway._session_gate.active_units == 0
+
+
+def test_voxcpm_loop_thread_lifecycle_and_no_run_until_complete():
+    class DummyServer:
+        def __init__(self):
+            self.loop = asyncio.new_event_loop()
+
+    server = DummyServer()
+    demo = api.VoxCPMDemo.__new__(api.VoxCPMDemo)
+    demo._server_loop_thread = None
+    demo._server_loop_lock = threading.Lock()
+    demo.voxcpm_server = server
+
+    demo._ensure_server_loop_running()
+    assert demo._server_loop_thread is not None
+    assert demo._server_loop_thread.is_alive()
+    assert server.loop.is_running()
+
+    thread = demo._server_loop_thread
+    demo.stop_voxcpm()
+    assert not server.loop.is_running()
+    assert demo._server_loop_thread is None
+    assert not thread.is_alive()

@@ -31,8 +31,15 @@ services:
       # leaving HTTP connections hanging until nginx's 900-second timeout.
       - VOXCPM_MAX_PENDING_SYNTHESIS=${VOXCPM_MAX_PENDING_SYNTHESIS:-2}
       - VOXCPM_QUEUE_TIMEOUT_SECONDS=${VOXCPM_QUEUE_TIMEOUT_SECONDS:-120}
+      - VOXCPM_INTERACTIVE_BATCH_MAX=${VOXCPM_INTERACTIVE_BATCH_MAX:-4}
+      # 併發 session 總量池；loop 專屬執行緒前置完成前必須為 1
+      # （否則併發觸發 "event loop is already running" 崩潰）。
+      - VOXCPM_ENGINE_CONCURRENCY=${VOXCPM_ENGINE_CONCURRENCY:-1}
       # Match the upstream VoxCPM bad-case guard: cap audio generation relative
       # to target text length so a missed EOS cannot always run to 2000 tokens.
+      # voxcpm2 的 diffusion 步數只能在引擎建構時設定（per-request 參數
+      # 不生效），這裡是唯一真正的控制點。
+      - VOXCPM_INFERENCE_TIMESTEPS=${VOXCPM_INFERENCE_TIMESTEPS:-10}
       - VOXCPM_MAX_GENERATE_LENGTH=${VOXCPM_MAX_GENERATE_LENGTH:-2000}
       - VOXCPM_MAX_AUDIO_TEXT_RATIO=${VOXCPM_MAX_AUDIO_TEXT_RATIO:-6.0}
       # Batch chunks are selected at runtime from CUDA and container memory
