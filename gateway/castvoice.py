@@ -577,7 +577,13 @@ def _compute_castvoice_model_version() -> str:
 
             parts.append(torch.__version__)  # 含 +cu128／+cu130
             if torch.cuda.is_available():
-                parts.append("sm%d%d" % torch.cuda.get_device_capability())
+                # 明確指定 device index：多卡節點若行程綁到非 0 號卡，
+                # 預設值會回報錯的架構。分隔 major/minor 是必要的——
+                # 連寫在 minor 破 10 時會碰撞（(12,10) 與 (1,210) 同字串）。
+                major, minor = torch.cuda.get_device_capability(
+                    torch.cuda.current_device()
+                )
+                parts.append(f"sm{major}.{minor}")
         except Exception:
             parts.append("notorch")
         try:
