@@ -1,7 +1,11 @@
 # ==========================================
 # Stage 1: Base image with CUDA and python dependencies
 # ==========================================
-FROM nvidia/cuda:12.8.0-devel-ubuntu22.04 AS base
+# CUDA 世代可切換（GB10/sm_121 需 CUDA 13 才有瘦長 GEMM 調優，
+# 見 docs/plans/2026-08-31-gb10-cuda13-upgrade-design.md）。
+# 預設維持 cu128 —— x86 機器行為完全不變。
+ARG CUDA_BASE_IMAGE=nvidia/cuda:12.8.0-devel-ubuntu22.04
+FROM ${CUDA_BASE_IMAGE} AS base
 
 # Prevent Python from writing pyc files and buffering stdout/stderr
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -57,6 +61,13 @@ ARG MAX_JOBS=""
 # 慢速線路（如 ARM 機到 pytorch CDN 僅 ~0.4MB/s）下載大 wheel 會觸發
 # uv 預設逾時，可用 --build-arg UV_HTTP_TIMEOUT=900 放寬。
 ARG UV_HTTP_TIMEOUT=300
+# torch 的 CUDA variant（cu128/cu130...），須與 CUDA_BASE_IMAGE 配對。
+ARG TORCH_CUDA_VARIANT=cu128
+# flash-attn 版本：2.6.3（cu128 現行，需手工 Blackwell patch）或
+# 2.8.3+（官方支援 Blackwell/CUDA 13，免 patch）。wheel 的 Release tag
+# 依 CUDA variant 分流（flash-attn-wheels-cu128 / -cu130），因為不同
+# CUDA ABI 編出的 wheel 檔名相同但不相容。
+ARG FLASH_ATTN_VERSION=2.6.3
 ENV UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT}" \
     TORCH_CUDA_ARCH_LIST="${TORCH_ARCH_LIST}" \
     FLASH_ATTN_CUDA_ARCHS="${TORCH_ARCH_LIST}" \
@@ -70,12 +81,12 @@ RUN . /opt/venv/bin/activate && \
     [ "$jobs" -le "$cores" ] || jobs="$cores" && \
     export MAX_JOBS="$jobs" && \
     echo "flash-attn build: MAX_JOBS=$MAX_JOBS (cores=$cores)" && \
-    uv pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 --find-links /tmp/wheels && \
+    uv pip install --no-cache-dir torch torchaudio --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT}" --find-links /tmp/wheels && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
-    WHEEL_NAME="flash_attn-2.6.3-cp310-cp310-linux_$(uname -m).whl" && \
+    WHEEL_NAME="flash_attn-${FLASH_ATTN_VERSION}-cp310-cp310-linux_$(uname -m).whl" && \
     if ! ls /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl >/dev/null 2>&1; then \
         curl -fsSL --retry 3 -o "/tmp/wheels/${WHEEL_NAME}" \
-            "https://github.com/CreateIntelligens/VoxCPM360/releases/download/flash-attn-wheels/${WHEEL_NAME}" \
+            "https://github.com/CreateIntelligens/VoxCPM360/releases/download/flash-attn-wheels-${TORCH_CUDA_VARIANT}/${WHEEL_NAME}" \
             || rm -f "/tmp/wheels/${WHEEL_NAME}"; \
     fi && \
     if ls /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl >/dev/null 2>&1; then \
@@ -83,9 +94,12 @@ RUN . /opt/venv/bin/activate && \
         uv pip install --no-cache-dir /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl; \
     else \
         python3 -c "import torch.utils.cpp_extension as c; p = c.__file__; content = open(p).read().replace('def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:', 'def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:\n    return'); open(p, 'w').write(content)" && \
-        git clone --branch v2.6.3 --single-branch https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
-        python3 scripts/patch_flash_attention_arch.py /tmp/flash-attention/setup.py --architectures "${TORCH_ARCH_LIST}" && \
-        sed -i 's/dprops->major == 9 \&\& dprops->minor == 0/(dprops->major == 9 \&\& dprops->minor == 0) || dprops->major >= 12/g' /tmp/flash-attention/csrc/flash_attn/flash_api.cpp && \
+        git clone --branch "v${FLASH_ATTN_VERSION}" --single-branch https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
+        if [ "${FLASH_ATTN_VERSION}" = "2.6.3" ]; then \
+            # 2.6.3 不認得 Blackwell，需要手工 patch；2.7.4+ 官方支援、免 patch。
+            python3 scripts/patch_flash_attention_arch.py /tmp/flash-attention/setup.py --architectures "${TORCH_ARCH_LIST}" && \
+            sed -i 's/dprops->major == 9 \&\& dprops->minor == 0/(dprops->major == 9 \&\& dprops->minor == 0) || dprops->major >= 12/g' /tmp/flash-attention/csrc/flash_attn/flash_api.cpp; \
+        fi && \
         cd /tmp/flash-attention && \
         python3 -m pip wheel --no-build-isolation --no-deps -w /tmp/wheels . && \
         uv pip install --no-cache-dir /tmp/wheels/flash_attn-*.whl && \
