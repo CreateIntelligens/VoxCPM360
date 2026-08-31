@@ -580,6 +580,16 @@ class VoxCPMDemo:
 
         async_pool = getattr(server, "server_pool", None)
         server_loop = getattr(server, "loop", None)
+        if async_pool is None or server_loop is None:
+            # 落到同步 fallback 前先記錄實情：某些 runtime 版本的 server
+            # 物件不帶 server_pool/loop，其 generate 卻是 async generator，
+            # 同步迭代會拋 "'async_generator' object is not iterable"。
+            logger.warning(
+                "engine bridge fallback: server=%s pool=%s loop=%s",
+                type(server).__name__,
+                type(async_pool).__name__ if async_pool is not None else None,
+                type(server_loop).__name__ if server_loop is not None else None,
+            )
         # 單一請求也必須走 async pool：專屬 loop 執行緒啟動後，同步包裝
         # generate 的 run_until_complete 會撞上運轉中的 loop 直接拋錯。
         if async_pool is not None and server_loop is not None:
