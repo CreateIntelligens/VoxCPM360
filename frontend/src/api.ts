@@ -29,11 +29,23 @@ interface GenerationHistoryRecord {
 }
 
 async function errorMessage(response: Response): Promise<string> {
+  // body stream 只能讀一次：先取原文，再嘗試解析。
+  // 原本先 json() 後在 catch 裡 text()，會拋
+  // "body stream already read" 把真正的錯誤訊息蓋掉。
+  let raw: string;
   try {
-    const payload = (await response.json()) as { detail?: string };
-    return payload.detail || `請求失敗（${response.status}）`;
+    raw = await response.text();
   } catch {
-    return (await response.text()) || `請求失敗（${response.status}）`;
+    return `請求失敗（${response.status}）`;
+  }
+  if (!raw) {
+    return `請求失敗（${response.status}）`;
+  }
+  try {
+    const payload = JSON.parse(raw) as { detail?: string; message?: string };
+    return payload.detail || payload.message || raw;
+  } catch {
+    return raw;
   }
 }
 
