@@ -13,12 +13,17 @@ from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
 
 import api
+import gateway.castvoice
+import gateway.history
+import gateway.presets
 
 
 @pytest.fixture(autouse=True)
 def isolate_generation_history(monkeypatch, tmp_path):
     monkeypatch.setattr(api, "_HISTORY_DIR", tmp_path / "generation_history")
+    monkeypatch.setattr(gateway.history, "_HISTORY_DIR", tmp_path / "generation_history")
     monkeypatch.setattr(api, "_CASTVOICE_BATCH_DIR", tmp_path / "castvoice_batches")
+    monkeypatch.setattr(gateway.castvoice, "_CASTVOICE_BATCH_DIR", tmp_path / "castvoice_batches")
 
 
 class FakeRegistry:
@@ -252,6 +257,7 @@ def test_catalog_namespaces_lora_and_accepts_legacy_alias(monkeypatch):
 def test_catalog_exposes_available_reference_presets(monkeypatch, tmp_path):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     monkeypatch.setattr(api, "_REFERENCE_AUDIO_DIR", tmp_path)
+    monkeypatch.setattr(gateway.presets, "_REFERENCE_AUDIO_DIR", tmp_path)
     for preset in api._REFERENCE_AUDIO_PRESETS:
         (tmp_path / preset["filename"]).write_bytes(b"audio")
     app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
@@ -277,6 +283,7 @@ def test_model_registry_endpoint_returns_document(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     monkeypatch.setattr(api, "_MODEL_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(gateway.presets, "_MODEL_REGISTRY_PATH", registry_path)
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
 
@@ -292,6 +299,7 @@ def test_model_registry_endpoint_returns_document(monkeypatch, tmp_path):
 
 def test_model_registry_endpoint_returns_empty_document_when_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(api, "_MODEL_REGISTRY_PATH", tmp_path / "missing.json")
+    monkeypatch.setattr(gateway.presets, "_MODEL_REGISTRY_PATH", tmp_path / "missing.json")
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
 
@@ -309,6 +317,7 @@ def test_native_synthesis_uses_selected_reference_preset(
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     monkeypatch.delenv("VOXCPM_DEFAULT_REFERENCE", raising=False)
     monkeypatch.setattr(api, "_REFERENCE_AUDIO_DIR", tmp_path)
+    monkeypatch.setattr(gateway.presets, "_REFERENCE_AUDIO_DIR", tmp_path)
     selected_reference = tmp_path / "cosy-young-female-01.mp3"
     selected_reference.write_bytes(b"RIFF")
     demo = FakeDemo()
@@ -908,6 +917,7 @@ def test_native_streaming_synthesis_returns_unknown_length_wav_and_history(
 def test_native_streaming_preserves_preset_cloning_rules(monkeypatch, tmp_path):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     monkeypatch.setattr(api, "_REFERENCE_AUDIO_DIR", tmp_path)
+    monkeypatch.setattr(gateway.presets, "_REFERENCE_AUDIO_DIR", tmp_path)
     reference = tmp_path / "cosy-young-female-01.mp3"
     reference.write_bytes(b"RIFF")
     demo = FakeStreamingDemo()
@@ -1336,6 +1346,8 @@ def test_native_streaming_asgi23_disconnect_during_commit_rolls_back_history(
         original_save(record, wav)
 
     monkeypatch.setattr(api, "_save_generation_history", blocking_save)
+
+    monkeypatch.setattr(gateway.history, "_save_generation_history", blocking_save)
     app = api.create_app(
         FakeStreamingDemo(),
         barbet_runtime=FakeBarbetRuntime(),
@@ -2125,6 +2137,7 @@ def test_castvoice_synthesize_rejects_unsupported_format(monkeypatch):
 def test_castvoice_synthesize_requires_bearer_token_when_configured(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     monkeypatch.setattr(api, "_TTS_API_KEY", "secret-token")
+    monkeypatch.setattr(gateway.castvoice, "_TTS_API_KEY", "secret-token")
     app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
 
     with TestClient(app) as client:

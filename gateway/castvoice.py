@@ -363,3 +363,171 @@ class CastVoiceBatchManager:
             offset += len(chunk)
 
 
+
+
+# ── castvoice 端點常數（2a 自 api.py 移入）──
+from gateway.presets import _LANG_NAN_TW, _LANG_ZH_TW, _DEFAULT_REFERENCE_PRESET_ID, _REFERENCE_AUDIO_PRESETS
+
+# CastAgent 自建 TTS API 規格採用固定的「演員聲音」清單，而不是把
+# engine/model/speaker 的排列組合整個攤平給外部服務。這裡手動選一小批
+# 品質確認過的聲音出來，voice_id 是外部合約的一部分、不可隨便改名。
+_CASTVOICE_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    {
+        "voice_id": "barbet-hung-yi-lee",
+        "label": "李宏毅老師（華語・男）",
+        "gender": "male",
+        "language": _LANG_ZH_TW,
+        "desc": "Barbet TSLM 固定語者音色",
+        "engine_id": "barbet",
+        "speaker_id": "hung_yi_lee",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-child-female-01",
+        "label": "孩童女聲 01（臺灣台語）",
+        "gender": "female",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 340 Hz，音色高亢，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-child-female-01",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-teen-female-01",
+        "label": "少女聲 01（臺灣台語）",
+        "gender": "female",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 320 Hz，音色清亮，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-teen-female-01",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-teen-female-02",
+        "label": "少女聲 02（臺灣台語）",
+        "gender": "female",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 320 Hz，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-teen-female-02",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-teen-female-03",
+        "label": "少女聲 03（臺灣台語）",
+        "gender": "female",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 314 Hz，音色清亮，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-teen-female-03",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-young-female-01",
+        "label": "青年女聲 01（臺灣台語）",
+        "gender": "female",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 256 Hz，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-young-female-01",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-senior-female-01",
+        "label": "年長女聲 01（臺灣台語）",
+        "gender": "female",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 216 Hz，音色偏低沉，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-senior-female-01",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-child-male-01",
+        "label": "孩童男聲 01（臺灣台語）",
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 276 Hz，音色高亢，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-child-male-01",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-child-male-02",
+        "label": "孩童男聲 02（臺灣台語）",
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 278 Hz，音色高亢，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-child-male-02",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-teen-male-01",
+        "label": "少年聲 01（臺灣台語）",
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 246 Hz，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-teen-male-01",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-teen-male-02",
+        "label": "少年聲 02（臺灣台語）",
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 262 Hz，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-teen-male-02",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-young-male-01",
+        "label": "青年男聲 01（臺灣台語）",
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 160 Hz，音域約 107–282 Hz，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-young-male-01",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-young-male-02",
+        "label": "青年男聲 02（臺灣台語）",
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 162 Hz，音域較集中、語調平穩，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-young-male-02",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-young-male-03",
+        "label": "青年男聲 03（臺灣台語）",
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 113 Hz，音色低沉，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-young-male-03",
+    },
+    {
+        "voice_id": "voxcpm2-cosy-senior-male-01",
+        "label": "年長男聲 01（臺灣台語）",
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+        "desc": "基頻約 118 Hz，音域約 91–158 Hz，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-senior-male-01",
+    },
+)
+_CASTVOICE_DEFINITIONS_BY_ID = {
+    definition["voice_id"]: definition for definition in _CASTVOICE_DEFINITIONS
+}
+_CASTVOICE_MODEL_VERSION = os.environ.get(
+    "VOXCPM_CASTVOICE_MODEL_VERSION", "voxcpm360-castvoice-1.0"
+)
+_TTS_API_KEY = os.environ.get("TTS_API_KEY", "").strip()
+_CASTVOICE_BATCH_DIR = Path(
+    os.environ.get(
+        "VOXCPM_CASTVOICE_BATCH_DIR",
+        Path(__file__).resolve().parent.parent / "data" / "castvoice_batches",
+    )
+)
+_CASTVOICE_BATCH_MAX_ITEMS = int(os.environ.get("VOXCPM_CASTVOICE_BATCH_MAX_ITEMS", "500"))
+
+# 訓練資料的文字全是華語漢字（例：「我跟他的感情真的很好」而非台語漢字
+# 「我佮伊的感情真正好」），模型學到的是「華語漢字 -> 台語發音」。但底模
+# VoxCPM2 在大量華語上預訓練，同一批漢字有很強的「唸成華語」先驗，微調
+# 兩個 epoch 蓋不過去 —— 實聽就是「全都講中文」。
+# 這裡於使用者未填 control_instruction 時自動帶入語言指令，把台語這個
+# 條件明確給模型。空字串可停用。
+# ⚠️ 僅 voxcpm2 有效：barbet 的 capabilities.control_instruction 為 False，
+# api.py 的 barbet 呼叫端根本不傳這個參數。
