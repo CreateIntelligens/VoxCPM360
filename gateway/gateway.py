@@ -750,7 +750,14 @@ class TTSGateway:
         多個 item 併發呼叫時，引擎以 continuous batching 自然合流。
         不得直呼 demo 私有方法——測試替身只保證公開介面。
         """
-        selected_demo, runtime_selection, canonical_id = self._switch_native_runtime(model_id)
+        # 切換（含載入）必須在乾淨執行緒執行：nano-vLLM from_pretrained
+        # 偵測到呼叫端有運轉中的 event loop 就回傳「裸 async pool」
+        # （llm.py 以 asyncio.get_running_loop() 分歧），整套同步橋接隨之
+        # 崩潰——這是 full checkpoint 切換五連炸的結構性根因。
+        # to_thread 同時讓 60–80 秒的切換不再凍結 event loop。
+        selected_demo, runtime_selection, canonical_id = await asyncio.to_thread(
+            self._switch_native_runtime, model_id
+        )
 
         def run_single() -> tuple[int, np.ndarray]:
             if hasattr(selected_demo, "generate_tts_audio_batch"):

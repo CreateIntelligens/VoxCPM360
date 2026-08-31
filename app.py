@@ -410,6 +410,31 @@ class VoxCPMDemo:
         if self.voxcpm_server is not None:
             self._ensure_server_loop_running()
             return self.voxcpm_server
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # 縱深防禦：呼叫端若在 event loop 上，from_pretrained 會偵測到
+            # running loop 而回傳「裸 async pool」（無 .loop／.server_pool），
+            # 同步橋接全滅。改到乾淨執行緒載入，保證 Sync 包裝。
+            box: list[Any] = []
+
+            def _load_off_loop() -> None:
+                try:
+                    box.append(self.get_or_load_voxcpm())
+                except BaseException as exc:  # noqa: BLE001
+                    box.append(exc)
+
+            loader = threading.Thread(
+                target=_load_off_loop, name="voxcpm-model-load"
+            )
+            loader.start()
+            loader.join()
+            outcome = box[0]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
         logger.info(f"Loading nano-vllm model: {self._model_id}")
         devices = [0]
         if "cuda" in self.device:
