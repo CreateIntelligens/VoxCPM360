@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import asyncio
 import io
 import json
@@ -532,9 +533,79 @@ _CASTVOICE_DEFINITIONS: tuple[dict[str, Any], ...] = (
 _CASTVOICE_DEFINITIONS_BY_ID = {
     definition["voice_id"]: definition for definition in _CASTVOICE_DEFINITIONS
 }
-_CASTVOICE_MODEL_VERSION = os.environ.get(
-    "VOXCPM_CASTVOICE_MODEL_VERSION", "voxcpm360-castvoice-1.0"
-)
+# castvoice 端點未指定合成參數時沿用的預設值（單一真相來源）。
+# 與互動端點的 Form 預設一致，也是加上選填欄位之前寫死的那組值。
+# 這些值改變會讓相同輸入產生不同輸出，故納入 model_version 指紋。
+_CASTVOICE_DEFAULT_CFG_VALUE = 2.0
+_CASTVOICE_DEFAULT_TIMESTEPS = 30
+_CASTVOICE_DEFAULT_NORMALIZE = True
+_CASTVOICE_DEFAULT_DENOISE = False
+_CASTVOICE_DEFAULT_TARGET_PEAK = 0.35
+
+
+def _compute_castvoice_model_version() -> str:
+    """組出能反映「本節點實際合成行為」的版本字串。
+
+    CastAgent 以此值作為快取 key 的一部分（客戶端自動吃，無需手動同步）。
+    納入三個維度，任一改變都應使既有快取失效：
+      1. 程式碼版本（git 短 hash）——合成路徑的邏輯變更
+      2. 影響輸出的預設值——cfg／timesteps／normalize／denoise／目標峰值
+      3. 執行環境——torch 版本與 CUDA 棧、GPU 架構、flash-attn 版本
+    第 3 點特別重要：同一份程式碼在 cu128 與 cu130 節點上的數值路徑不同
+    （2026-08-31 GB10 遷移實證），版本字串必須能區分，否則跨節點的
+    快取判斷會失去依據。
+    """
+    override = os.environ.get("VOXCPM_CASTVOICE_MODEL_VERSION", "").strip()
+    if override:
+        return override
+
+    def _git_hash() -> str:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(Path(__file__).resolve().parent.parent),
+                 "rev-parse", "--short=8", "HEAD"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            return out.stdout.strip() or "nogit"
+        except Exception:
+            return "nogit"
+
+    def _runtime_fingerprint() -> str:
+        parts: list[str] = []
+        try:
+            import torch
+
+            parts.append(torch.__version__)  # 含 +cu128／+cu130
+            if torch.cuda.is_available():
+                parts.append("sm%d%d" % torch.cuda.get_device_capability())
+        except Exception:
+            parts.append("notorch")
+        try:
+            import flash_attn
+
+            parts.append("fa" + flash_attn.__version__)
+        except Exception:
+            parts.append("nofa")
+        return "|".join(parts)
+
+    # 預設值指紋：這些值變動會改變相同輸入的輸出，必須進版本號。
+    defaults = "|".join(
+        str(value)
+        for value in (
+            _CASTVOICE_DEFAULT_CFG_VALUE,
+            _CASTVOICE_DEFAULT_TIMESTEPS,
+            _CASTVOICE_DEFAULT_NORMALIZE,
+            _CASTVOICE_DEFAULT_DENOISE,
+            _CASTVOICE_DEFAULT_TARGET_PEAK,
+        )
+    )
+    digest = hashlib.sha256(
+        (defaults + "||" + _runtime_fingerprint()).encode("utf-8")
+    ).hexdigest()[:8]
+    return f"voxcpm360-castvoice-{_git_hash()}-{digest}"
+
+
+_CASTVOICE_MODEL_VERSION = _compute_castvoice_model_version()
 _TTS_API_KEY = os.environ.get("TTS_API_KEY", "").strip()
 _CASTVOICE_BATCH_DIR = Path(
     os.environ.get(

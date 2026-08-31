@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # ── 自 gateway 套件 re-export（拆分相容層，2026-08-31）──
 from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_FIXED_TIMESTEPS, _by_id, _find_reference_preset
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
-from gateway.castvoice import _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
+from gateway.castvoice import _CASTVOICE_DEFAULT_CFG_VALUE, _CASTVOICE_DEFAULT_DENOISE, _CASTVOICE_DEFAULT_NORMALIZE, _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
 from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
@@ -109,11 +109,6 @@ def register_castvoice_routes(app, gateway, demo, helpers):
             )
         return model_id
 
-    # castvoice 端點未指定合成參數時沿用的預設值。與互動端點的 Form 預設
-    # 一致，也是加上選填欄位之前 castvoice 寫死的那組值。
-    _CASTVOICE_DEFAULT_CFG_VALUE = 2.0
-    _CASTVOICE_DEFAULT_NORMALIZE = True
-    _CASTVOICE_DEFAULT_DENOISE = False
 
     def _castvoice_synthesis_params(
         *,

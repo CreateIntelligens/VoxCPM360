@@ -3277,3 +3277,25 @@ def test_per_request_completion_single_item_failure_isolation(monkeypatch):
     assert res2[0].startswith(b"RIFF")
     assert gateway._session_gate.active_units == 0
 
+
+
+def test_castvoice_model_version_reflects_runtime(monkeypatch):
+    """model_version 必須含 git hash 與執行環境指紋，且可被環境變數覆寫。
+
+    CastAgent 以此值作為快取 key 的一部分；同一份程式碼在不同 CUDA 棧
+    （cu128／cu130）的節點上必須算出不同字串，否則跨節點的快取判斷失去依據。
+    """
+    import gateway.castvoice as gc
+
+    version = gc._compute_castvoice_model_version()
+    assert version.startswith("voxcpm360-castvoice-")
+    parts = version.rsplit("-", 2)
+    assert len(parts[-2]) == 8 and len(parts[-1]) == 8
+
+    # 預設值改變 → 版本字串改變（相同輸入會產生不同輸出，快取必須失效）
+    monkeypatch.setattr(gc, "_CASTVOICE_DEFAULT_CFG_VALUE", 3.0)
+    assert gc._compute_castvoice_model_version() != version
+
+    # 明確覆寫優先
+    monkeypatch.setenv("VOXCPM_CASTVOICE_MODEL_VERSION", "pinned-1.0")
+    assert gc._compute_castvoice_model_version() == "pinned-1.0"
