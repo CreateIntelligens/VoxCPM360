@@ -778,10 +778,7 @@ class _NativeCoalescer:
         self._queue: list[_NativeCoalescedItem] = []
         self._queue_lock = asyncio.Lock()
         self._drain_task: asyncio.Task[None] | None = None
-        self._completion_tasks: dict[
-            asyncio.Task[None],
-            list[_NativeCoalescedItem],
-        ] = {}
+        self._completion_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
 
     async def submit(
@@ -915,7 +912,6 @@ class _NativeCoalescer:
                 self._gateway._session_gate.release(units=batch_count)
                 continue
 
-            model_id = batch[0].model_id
             if len(batch) < batch_count:
                 self._gateway._session_gate.release(units=batch_count - len(batch))
 
@@ -923,157 +919,102 @@ class _NativeCoalescer:
                 "synthesis.request stage=session_join engine=voxcpm2 model=%s "
                 "refcount=%d capacity=%d batch_size=%d",
                 canonical_id,
-                session_concurrency,
+                self._gateway._session_gate.active_units,
                 self._gateway._engine_concurrency,
                 len(batch),
             )
-
-            started_at = time.perf_counter()
-            queue_waits = [started_at - item.queued_at for item in batch]
             logger.info(
                 "synthesis.request stage=coalesced batch_size=%d model=%s request_ids=%s",
                 len(batch),
-                model_id,
+                first_model,
                 ",".join(item.request_id for item in batch),
             )
-            for item, queue_wait in zip(batch, queue_waits, strict=True):
-                logger.info(
-                    "synthesis.request request_id=%s stage=started engine=voxcpm2 "
-                    "model=%s queue_wait_seconds=%.3f batch_size=%d",
-                    item.request_id,
-                    model_id,
-                    queue_wait,
-                    len(batch),
-                )
 
-            gate_held = True
-            try:
-                results = await asyncio.to_thread(
-                    self._gateway._generate_native_batch_results,
-                    model_id,
-                    [item.request for item in batch],
-                    isolate_errors=True,
-                )
-                execution_time = time.perf_counter() - started_at
-                await self._release_batch(canonical_id, len(batch))
-                gate_held = False
-                completion_task = asyncio.create_task(
-                    self._complete_batch(
-                        batch,
-                        results,
-                        queue_waits,
-                        execution_time,
-                        session_concurrency,
+            for item in batch:
+                task = asyncio.create_task(
+                    self._process_single_item(
+                        item=item,
+                        canonical_id=canonical_id,
+                        submitted_batch_size=len(batch),
                     )
                 )
-                self._completion_tasks[completion_task] = batch
-                completion_task.add_done_callback(self._finish_completion_task)
-            except Exception as exc:
-                logger.exception(
-                    "synthesis.request stage=batch_failed model=%s batch_size=%d",
-                    model_id,
-                    len(batch),
-                )
-                await self._release_batch(canonical_id, len(batch))
-                gate_held = False
-                for item in batch:
-                    if not item.future.done():
-                        item.future.set_exception(exc)
-            finally:
-                if gate_held:
-                    await self._release_batch(canonical_id, len(batch))
+                self._completion_tasks.add(task)
+                task.add_done_callback(self._completion_tasks.discard)
 
-    async def _complete_batch(
+    async def _process_single_item(
         self,
-        batch: list[_NativeCoalescedItem],
-        results: list[tuple[int, np.ndarray] | Exception],
-        queue_waits: list[float],
-        execution_time: float,
-        session_concurrency: int = 1,
+        item: _NativeCoalescedItem,
+        canonical_id: str,
+        submitted_batch_size: int,
     ) -> None:
-        model_id = batch[0].model_id
-        if len(results) != len(batch):
-            error = RuntimeError(f"Native batch returned {len(results)} results for {len(batch)} requests")
-            results = [error for _ in batch]
+        started_at = time.perf_counter()
+        queue_wait = started_at - item.queued_at
+        model_id = item.model_id
+        request_id = item.request_id
+
+        logger.info(
+            "synthesis.request request_id=%s stage=started engine=voxcpm2 "
+            "model=%s queue_wait_seconds=%.3f batch_size=%d",
+            request_id,
+            model_id,
+            queue_wait,
+            submitted_batch_size,
+        )
+
+        stage = "failed"
         try:
-            rendered = await asyncio.to_thread(
-                self._gateway._render_native_batch_results,
-                results,
-                [item.request for item in batch],
+            sample_rate, audio = await self._gateway._generate_native_item_audio(
+                model_id,
+                item.request,
             )
+            rendered_wav = await asyncio.to_thread(
+                self._gateway._render_native_single_result,
+                sample_rate,
+                audio,
+                item.request,
+            )
+            execution_time = time.perf_counter() - started_at
+            try:
+                timing_headers = self._gateway._job_timing_headers(
+                    queue_wait,
+                    execution_time,
+                    concurrency=self._gateway._session_gate.active_units,
+                )
+            except TypeError:
+                timing_headers = self._gateway._job_timing_headers(
+                    queue_wait,
+                    execution_time,
+                )
+            headers = {
+                **timing_headers,
+                "X-Batch-Size": str(submitted_batch_size),
+            }
+            if not item.future.done():
+                item.future.set_result((rendered_wav, headers))
+            stage = "completed"
         except Exception as exc:
             logger.exception(
-                "synthesis.request stage=batch_render_failed model=%s batch_size=%d",
+                "synthesis.request request_id=%s stage=failed engine=voxcpm2 model=%s",
+                request_id,
                 model_id,
-                len(batch),
             )
-            rendered = [exc for _ in batch]
-        for item, result, queue_wait in zip(
-            batch,
-            rendered,
-            queue_waits,
-            strict=True,
-        ):
-            if item.future.done():
-                continue
-            if isinstance(result, Exception):
-                item.future.set_exception(result)
-                stage = "failed"
-            else:
-                try:
-                    timing_headers = self._gateway._job_timing_headers(
-                        queue_wait,
-                        execution_time,
-                        concurrency=session_concurrency,
-                    )
-                except TypeError:
-                    timing_headers = self._gateway._job_timing_headers(
-                        queue_wait,
-                        execution_time,
-                    )
-                headers = {
-                    **timing_headers,
-                    "X-Batch-Size": str(len(batch)),
-                }
-                item.future.set_result((result, headers))
-                stage = "completed"
+            if not item.future.done():
+                item.future.set_exception(exc)
+        finally:
+            self._gateway._session_gate.release(units=1)
+            await self._gateway._finish_gpu_jobs(1)
             logger.info(
                 "synthesis.request request_id=%s stage=%s engine=voxcpm2 "
                 "model=%s queue_wait_seconds=%.3f execution_seconds=%.3f "
-                "batch_size=%d",
-                item.request_id,
+                "batch_size=%d active_units=%d",
+                request_id,
                 stage,
                 model_id,
                 queue_wait,
-                execution_time,
-                len(batch),
+                time.perf_counter() - started_at,
+                submitted_batch_size,
+                self._gateway._session_gate.active_units,
             )
-        logger.info(
-            "synthesis.request stage=batch_completed model=%s batch_size=%d elapsed_seconds=%.3f items_per_second=%.3f",
-            model_id,
-            len(batch),
-            execution_time,
-            len(batch) / execution_time if execution_time else 0.0,
-        )
-
-    def _finish_completion_task(self, task: asyncio.Task[None]) -> None:
-        batch = self._completion_tasks.pop(task, [])
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            error = RuntimeError("Native batch completion was cancelled")
-        except Exception as exc:  # noqa: BLE001 - resolve every request in the failed completion
-            logger.exception(
-                "synthesis.request stage=batch_completion_failed batch_size=%d",
-                len(batch),
-            )
-            error = exc
-        else:
-            return
-
-        for item in batch:
-            if not item.future.done():
-                item.future.set_exception(error)
 
     async def close(self) -> None:
         self._closed = True
@@ -1553,6 +1494,11 @@ class TTSGateway:
         accepted as unambiguous input aliases.
         """
         requested_id = model_id.strip()
+        # 未指定模型 → 沿用當前已載入的模型，絕不觸發引擎切換（full↔base
+        # 切換實測 ~80 秒，期間所有請求陪等）。尚未載入任何模型時落到
+        # base。實際使用的模型由回應的 X-Model-Version 回報。
+        if not requested_id:
+            return self._active_native_selection or PUBLIC_BASE_MODEL_ID
         self.demo.lora_registry.refresh()
         self.full_model_registry.refresh()
 
@@ -1770,6 +1716,70 @@ class TTSGateway:
         if concurrency is not None:
             headers["X-Engine-Concurrency"] = str(concurrency)
         return headers
+
+    def _render_native_single_result(
+        self,
+        sample_rate: int,
+        audio: np.ndarray,
+        request: dict[str, Any],
+    ) -> bytes:
+        return self._wav_response(
+            sample_rate,
+            audio,
+            speed=float(request.get("speed", 1.0)),
+        )
+
+    async def _generate_native_item_audio(
+        self,
+        model_id: str,
+        request: dict[str, Any],
+    ) -> tuple[int, np.ndarray]:
+        """單一請求走 demo 公開批次 API（單元素批）。
+
+        prep（reference encode／denoise／暫存檔生命週期）由 demo 層自理；
+        多個 item 併發呼叫時，引擎以 continuous batching 自然合流。
+        不得直呼 demo 私有方法——測試替身只保證公開介面。
+        """
+        selected_demo, runtime_selection, canonical_id = self._switch_native_runtime(model_id)
+
+        def run_single() -> tuple[int, np.ndarray]:
+            if hasattr(selected_demo, "generate_tts_audio_batch"):
+                results = selected_demo.generate_tts_audio_batch(
+                    [
+                        {
+                            "text_input": request.get("text", ""),
+                            "control_instruction": request.get("control_instruction", ""),
+                            "reference_wav_path_input": request.get("reference_path"),
+                            "prompt_text": request.get("prompt_text", ""),
+                            "cfg_value_input": float(request.get("cfg_value", 2.0)),
+                            "do_normalize": bool(request.get("normalize", True)),
+                            "denoise": bool(request.get("denoise", False)),
+                            "inference_timesteps": int(request.get("inference_timesteps", 10)),
+                            "model_selection": runtime_selection,
+                        }
+                    ]
+                )
+                sample_rate, audio = results[0]
+                return int(sample_rate), audio
+
+            if hasattr(selected_demo, "generate_tts_audio"):
+                sample_rate, audio = selected_demo.generate_tts_audio(
+                    text_input=request.get("text", ""),
+                    control_instruction=request.get("control_instruction", ""),
+                    reference_wav_path_input=request.get("reference_path"),
+                    prompt_text=request.get("prompt_text", ""),
+                    cfg_value_input=float(request.get("cfg_value", 2.0)),
+                    inference_timesteps=int(request.get("inference_timesteps", 10)),
+                    model_selection=runtime_selection,
+                    speed=float(request.get("speed", 1.0)),
+                )
+                return int(sample_rate), audio
+
+            raise NotImplementedError("Demo has no generate_tts_audio_batch or generate_tts_audio")
+
+        result = await asyncio.to_thread(run_single)
+        self._active_native_selection = canonical_id
+        return result
 
     async def synthesize_native(
         self,
@@ -2745,7 +2755,7 @@ def create_app(
     async def synthesize(
         request: Request,
         engine_id: str = Form(...),
-        model_id: str = Form(...),
+        model_id: str = Form(""),  # 留空 = 沿用當前已載入模型（不觸發切換）
         text: str = Form(...),
         control_instruction: str = Form(""),
         prompt_text: str = Form(""),
@@ -2852,7 +2862,7 @@ def create_app(
     async def synthesize_stream(
         request: Request,
         engine_id: str = Form(...),
-        model_id: str = Form(...),
+        model_id: str = Form(""),  # 留空 = 沿用當前已載入模型（不觸發切換）
         text: str = Form(...),
         control_instruction: str = Form(""),
         prompt_text: str = Form(""),

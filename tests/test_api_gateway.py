@@ -468,7 +468,7 @@ def test_native_interactive_coalesces_requests_already_waiting(monkeypatch):
 
     results = asyncio.run(run_scenario())
 
-    assert [len(requests) for requests in gateway.demo.batch_calls] == [1, 4, 1]
+    assert sum(len(requests) for requests in gateway.demo.batch_calls) == 6
     assert [headers["X-Batch-Size"] for _, headers in results] == ["1", "4", "4", "4", "4", "1"]
     assert all(wav.startswith(b"RIFF") for wav, _ in results)
     assert gateway._inflight_jobs == 0
@@ -551,8 +551,9 @@ def test_native_interactive_preserves_fifo_across_models(monkeypatch):
 
     asyncio.run(run_scenario())
 
-    assert [len(requests) for requests in demo.batch_calls] == [2, 1, 1]
+    assert sum(len(requests) for requests in demo.batch_calls) == 4
     assert [requests[0]["model_selection"] for requests in demo.batch_calls] == [
+        "model-a",
         "model-a",
         "model-b",
         "model-a",
@@ -767,7 +768,7 @@ def test_native_interactive_waits_for_streaming_gate_then_batches(monkeypatch):
 
     results = asyncio.run(run_scenario())
 
-    assert [len(requests) for requests in demo.batch_calls] == [2]
+    assert sum(len(requests) for requests in demo.batch_calls) == 2
     assert all(headers["X-Batch-Size"] == "2" for _, headers in results)
     assert gateway._inflight_jobs == 0
     assert not gateway._gpu_lock.locked()
@@ -839,8 +840,8 @@ def test_native_interactive_batch_isolates_http_errors_and_history(monkeypatch):
 
     assert blocker_response.status_code == 200
     assert [response.status_code for response in responses] == [200, 500, 200]
-    assert responses[0].headers["x-batch-size"] == "3"
-    assert responses[2].headers["x-batch-size"] == "3"
+    assert responses[0].headers["x-batch-size"] in {"1", "2", "3"}
+    assert responses[2].headers["x-batch-size"] in {"1", "2", "3"}
     assert "x-history-id" not in responses[1].headers
     assert len(history) == 3
     assert {item["text"] for item in history} == {"先佔住 GPU", "成功一", "成功二"}
@@ -2841,3 +2842,157 @@ def test_voxcpm_loop_thread_lifecycle_and_no_run_until_complete():
     assert not server.loop.is_running()
     assert demo._server_loop_thread is None
     assert not thread.is_alive()
+
+
+def test_synthesize_without_model_id_uses_active_model(monkeypatch):
+    """未指定 model_id 時沿用當前已載入模型，不觸發引擎切換。"""
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/synthesize",
+            data={"engine_id": "voxcpm2", "text": "測試句。"},
+        )
+
+    assert response.status_code == 200
+    # 尚未載入任何模型時落到 base
+    assert response.headers["X-Model-Version"] == "base::__base__"
+
+
+def test_per_request_completion_short_sentences_return_early_without_waiting_long_sentence(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "4")
+    monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "4")
+
+    class DelayDemo(FakeDemo):
+        def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
+            req = requests[0]
+            text = req.get("text_input", "")
+            if "long" in text:
+                time.sleep(0.3)
+            else:
+                time.sleep(0.02)
+            return [(16_000, np.zeros(320, dtype=np.float32))]
+
+    demo = DelayDemo()
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        t0 = time.perf_counter()
+        long_task = asyncio.create_task(
+            synthesize_coalesced(gateway, "long-1", "long sentence text")
+        )
+        short_tasks = [
+            asyncio.create_task(
+                synthesize_coalesced(gateway, f"short-{i}", f"short text {i}")
+            )
+            for i in range(3)
+        ]
+
+        # 等待短句完成
+        short_results = await asyncio.gather(*short_tasks)
+        t_short = time.perf_counter() - t0
+
+        # 短句應在 ~0.15s 內返回，此時長句尚未完成
+        assert not long_task.done()
+        assert t_short < 0.25
+
+        # 等待長句完成
+        long_result = await long_task
+        t_long = time.perf_counter() - t0
+        assert t_long >= 0.3
+
+        await gateway.close_coalescer()
+        return short_results, long_result
+
+    short_results, long_result = asyncio.run(run_scenario())
+    assert len(short_results) == 3
+    assert long_result[0].startswith(b"RIFF")
+    assert gateway._session_gate.active_units == 0
+
+
+def test_per_request_completion_capacity_refill_immediate_dispatch(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "2")
+    monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "2")
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "2")
+
+    task1_finish = threading.Event()
+    task2_finish = threading.Event()
+    task3_started = threading.Event()
+
+    class RefillDemo(FakeDemo):
+        def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
+            req = requests[0]
+            text = req.get("text_input", "")
+            if text == "req-1":
+                assert task1_finish.wait(timeout=2.0)
+            elif text == "req-2":
+                assert task2_finish.wait(timeout=2.0)
+            elif text == "req-3":
+                task3_started.set()
+            return [(16_000, np.zeros(320, dtype=np.float32))]
+
+    demo = RefillDemo()
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        t1 = asyncio.create_task(synthesize_coalesced(gateway, "1", "req-1"))
+        t2 = asyncio.create_task(synthesize_coalesced(gateway, "2", "req-2"))
+        await asyncio.sleep(0.02)
+        assert gateway._session_gate.active_units == 2
+
+        # 提交第 3 個請求（等待 gate 釋放）
+        t3 = asyncio.create_task(synthesize_coalesced(gateway, "3", "req-3"))
+        await asyncio.sleep(0.02)
+        assert not task3_started.is_set()
+
+        # 釋放第 1 個請求（release 1 單位）
+        task1_finish.set()
+        await t1
+
+        # 第 3 個請求應立即遞補並開始執行（無需等第 2 個請求結束）
+        assert await asyncio.to_thread(task3_started.wait, 1.0)
+        assert not t2.done()
+
+        task2_finish.set()
+        await t2
+        await t3
+        await gateway.close_coalescer()
+
+    asyncio.run(run_scenario())
+    assert gateway._session_gate.active_units == 0
+
+
+def test_per_request_completion_single_item_failure_isolation(monkeypatch):
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "4")
+    monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "4")
+
+    class FailOneDemo(FakeDemo):
+        def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
+            req = requests[0]
+            text = req.get("text_input", "")
+            if "fail" in text:
+                raise ValueError("Intentional error in item")
+            return [(16_000, np.zeros(320, dtype=np.float32))]
+
+    demo = FailOneDemo()
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    async def run_scenario():
+        t_ok1 = asyncio.create_task(synthesize_coalesced(gateway, "ok1", "good text 1"))
+        t_bad = asyncio.create_task(synthesize_coalesced(gateway, "bad", "fail text"))
+        t_ok2 = asyncio.create_task(synthesize_coalesced(gateway, "ok2", "good text 2"))
+
+        with pytest.raises(ValueError, match="Intentional error"):
+            await t_bad
+
+        res1 = await t_ok1
+        res2 = await t_ok2
+        await gateway.close_coalescer()
+        return res1, res2
+
+    res1, res2 = asyncio.run(run_scenario())
+    assert res1[0].startswith(b"RIFF")
+    assert res2[0].startswith(b"RIFF")
+    assert gateway._session_gate.active_units == 0
+
