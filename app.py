@@ -318,6 +318,25 @@ class VoxCPMDemo:
             return future.result(timeout=300)
         return getattr(server, method_name)(*args)
 
+    def _ensure_owned_loop(self) -> Any:
+        """為「沒有自帶 loop 的裸 async pool」提供專屬 loop 執行緒。
+
+        full checkpoint 切換路徑會拿到 AsyncVoxCPM2ServerPool 本身
+        （既是 pool 也沒有 .loop）。沒有 loop 就只能走同步 fallback，
+        而它的 generate 是 async generator，同步迭代必炸。
+        """
+        loop = getattr(self, "_owned_engine_loop", None)
+        if loop is not None and loop.is_running():
+            return loop
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=loop.run_forever, name="voxcpm-owned-loop", daemon=True
+        )
+        thread.start()
+        self._owned_engine_loop = loop
+        self._owned_engine_thread = thread
+        return loop
+
     def _ensure_server_loop_running(self) -> None:
         server = getattr(self, "voxcpm_server", None)
         if server is None:
@@ -580,6 +599,15 @@ class VoxCPMDemo:
 
         async_pool = getattr(server, "server_pool", None)
         server_loop = getattr(server, "loop", None)
+        # 部分路徑（如 full checkpoint 切換）拿到的是裸的 async pool，
+        # 本身就是 pool、且沒有自帶 loop —— 此時借用 demo 的專屬 loop
+        # 執行緒。否則會落到同步 fallback，對 async generator 迭代而炸
+        # （'async_generator' object is not iterable）。
+        if async_pool is None and inspect.isasyncgenfunction(
+            getattr(server, "generate", None)
+        ):
+            async_pool = server
+            server_loop = server_loop or self._ensure_owned_loop()
         if async_pool is None or server_loop is None:
             # 落到同步 fallback 前先記錄實情：某些 runtime 版本的 server
             # 物件不帶 server_pool/loop，其 generate 卻是 async generator，
@@ -722,6 +750,13 @@ class VoxCPMDemo:
             yielded = False
             async_pool = getattr(server, "server_pool", None)
             server_loop = getattr(server, "loop", None)
+            # 與批次路徑同理：裸 async pool 沒有自帶 loop，需借用專屬 loop
+            # 執行緒，否則落到同步分支對 async generator 迭代而炸。
+            if async_pool is None and inspect.isasyncgenfunction(
+                getattr(server, "generate", None)
+            ):
+                async_pool = server
+                server_loop = server_loop or self._ensure_owned_loop()
             if async_pool is not None and server_loop is not None:
                 self._ensure_server_loop_running()
                 async_generator = async_pool.generate(**prepared)
