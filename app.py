@@ -240,7 +240,33 @@ _APP_THEME = gr.themes.Soft(
 # ---------- Model ----------
 
 _OWNED_ENGINE_LOOP: Any = None
+_OWNED_ENGINE_THREAD: Optional[threading.Thread] = None
 _OWNED_ENGINE_LOCK = threading.Lock()
+
+
+def _shutdown_owned_engine_loop(timeout: float = 10.0) -> None:
+    """停掉專屬 loop 並**等它真正結束**。
+
+    模型切換時 server.stop() 內部會 run_until_complete；只呼叫
+    loop.stop() 而不等待，會與其形成競態
+    （RuntimeError: Cannot run the event loop while another loop is
+    running），讓卸載半途失敗、引擎留在半死狀態。
+    """
+    global _OWNED_ENGINE_LOOP, _OWNED_ENGINE_THREAD
+    with _OWNED_ENGINE_LOCK:
+        loop, thread = _OWNED_ENGINE_LOOP, _OWNED_ENGINE_THREAD
+        _OWNED_ENGINE_LOOP = _OWNED_ENGINE_THREAD = None
+    if loop is None:
+        return
+    if loop.is_running():
+        loop.call_soon_threadsafe(loop.stop)
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
+    try:
+        if not loop.is_running():
+            loop.close()
+    except Exception:  # 關閉失敗不該擋住模型切換
+        logger.warning("owned engine loop close failed", exc_info=True)
 
 
 def _ensure_owned_engine_loop() -> Any:
@@ -256,11 +282,13 @@ def _ensure_owned_engine_loop() -> Any:
         loop = _OWNED_ENGINE_LOOP
         if loop is not None and loop.is_running():
             return loop
+        global _OWNED_ENGINE_THREAD
         loop = asyncio.new_event_loop()
-        threading.Thread(
+        thread = threading.Thread(
             target=loop.run_forever, name="voxcpm-owned-loop", daemon=True
-        ).start()
-        _OWNED_ENGINE_LOOP = loop
+        )
+        thread.start()
+        _OWNED_ENGINE_LOOP, _OWNED_ENGINE_THREAD = loop, thread
         return loop
 
 
@@ -446,12 +474,7 @@ class VoxCPMDemo:
         # server.stop() 內部走 run_until_complete；若我們的專屬 loop 仍在
         # 執行緒中運轉，會拋 "Cannot run the event loop while another loop
         # is running"，讓模型切換半途失敗（GB10 full checkpoint 實測）。
-        global _OWNED_ENGINE_LOOP
-        with _OWNED_ENGINE_LOCK:
-            owned = _OWNED_ENGINE_LOOP
-            _OWNED_ENGINE_LOOP = None
-        if owned is not None and owned.is_running():
-            owned.call_soon_threadsafe(owned.stop)
+        _shutdown_owned_engine_loop()
         try:
             stop = getattr(server, "stop", None)
             if callable(stop):
