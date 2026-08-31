@@ -443,6 +443,15 @@ class VoxCPMDemo:
                 self._server_loop_thread = None
         model_id = getattr(self, "_model_id", "unknown")
         logger.info("Stopping nano-vllm model: %s", model_id)
+        # server.stop() 內部走 run_until_complete；若我們的專屬 loop 仍在
+        # 執行緒中運轉，會拋 "Cannot run the event loop while another loop
+        # is running"，讓模型切換半途失敗（GB10 full checkpoint 實測）。
+        global _OWNED_ENGINE_LOOP
+        with _OWNED_ENGINE_LOCK:
+            owned = _OWNED_ENGINE_LOOP
+            _OWNED_ENGINE_LOOP = None
+        if owned is not None and owned.is_running():
+            owned.call_soon_threadsafe(owned.stop)
         try:
             stop = getattr(server, "stop", None)
             if callable(stop):
