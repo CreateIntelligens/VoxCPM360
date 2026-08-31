@@ -396,6 +396,7 @@ def register_interactive_routes(app, gateway, history_lock):
                     denoise=prepared.denoise,
                     inference_timesteps=prepared.inference_timesteps,
                     speed=prepared.speed,
+                    seed=prepared.seed,
                 )
             else:
                 wav, extra_headers = await gateway.synthesize_barbet(

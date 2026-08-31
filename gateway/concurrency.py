@@ -408,6 +408,9 @@ class _NativeCoalescer:
                 **timing_headers,
                 "X-Batch-Size": str(submitted_batch_size),
             }
+            if item.request.get("seed") is not None:
+                # 與 Barbet 路徑一致：回報實際使用的種子（併發下為盡力重現）。
+                headers["X-Random-Seed"] = str(item.request["seed"])
             if not item.future.done():
                 item.future.set_result((rendered_wav, headers))
             stage = "completed"

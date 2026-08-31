@@ -460,6 +460,7 @@ class VoxCPMDemo:
         do_normalize: bool = True,
         denoise: bool = True,
         inference_timesteps: int = 10,
+        seed: Optional[int] = None,
         model_selection: str = BASE_MODEL_KEY,
     ) -> dict[str, Any]:
         text = (text_input or "").strip()
@@ -558,6 +559,9 @@ class VoxCPMDemo:
             generate_kwargs["ref_audio_latents"] = ref_audio_latents
         if "inference_timesteps" in sig.parameters:
             generate_kwargs["inference_timesteps"] = int(inference_timesteps)
+        # 引擎支援 per-request seed（z_noise 經 derive_step_seed 逐步派生）。
+        if seed is not None and "seed" in sig.parameters:
+            generate_kwargs["seed"] = int(seed)
         return generate_kwargs
 
     @staticmethod
@@ -778,10 +782,12 @@ class VoxCPMDemo:
         denoise: bool = True,
         inference_timesteps: int = 10,
         model_selection: str = BASE_MODEL_KEY,
+        seed: Optional[int] = None,
     ) -> Tuple[int, np.ndarray]:
         return self.generate_tts_audio_batch(
             [
                 {
+                    "seed": seed,
                     "text_input": text_input,
                     "control_instruction": control_instruction,
                     "reference_wav_path_input": reference_wav_path_input,

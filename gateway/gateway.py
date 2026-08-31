@@ -625,7 +625,7 @@ class TTSGateway:
                     "prompt_transcript": True,
                     "reference_audio": True,
                     "speaker_selection": False,
-                    "seed": False,
+                    "seed": True,  # nano-vLLM per-request seed（z_noise 派生；併發下為盡力重現）
                     "streaming": True,
                     # nano-vLLM 引擎在建構時固定 diffusion 步數
                     # （VOXCPM_INFERENCE_TIMESTEPS），per-request 的
@@ -766,6 +766,7 @@ class TTSGateway:
                             "denoise": bool(request.get("denoise", False)),
                             "inference_timesteps": int(request.get("inference_timesteps", 10)),
                             "model_selection": runtime_selection,
+                            "seed": request.get("seed"),
                         }
                     ]
                 )
@@ -781,6 +782,7 @@ class TTSGateway:
                     cfg_value_input=float(request.get("cfg_value", 2.0)),
                     inference_timesteps=int(request.get("inference_timesteps", 10)),
                     model_selection=runtime_selection,
+                    seed=request.get("seed"),
                     speed=float(request.get("speed", 1.0)),
                 )
                 return int(sample_rate), audio
@@ -805,6 +807,7 @@ class TTSGateway:
         denoise: bool,
         inference_timesteps: int,
         speed: float = 1.0,
+        seed: int | None = None,
     ) -> tuple[bytes, dict[str, str]]:
         wavs, headers = await self.synthesize_native_batch(
             request_id=request_id,
@@ -820,6 +823,7 @@ class TTSGateway:
                     "denoise": denoise,
                     "inference_timesteps": inference_timesteps,
                     "speed": speed,
+                    "seed": seed,
                 }
             ],
         )
@@ -839,6 +843,7 @@ class TTSGateway:
         denoise: bool,
         inference_timesteps: int,
         speed: float = 1.0,
+        seed: int | None = None,
     ) -> tuple[bytes, dict[str, str]]:
         return await self._native_coalescer.submit(
             request_id=request_id,
@@ -853,6 +858,7 @@ class TTSGateway:
                 "denoise": denoise,
                 "inference_timesteps": inference_timesteps,
                 "speed": speed,
+            "seed": seed,
             },
         )
 
@@ -1005,6 +1011,7 @@ class TTSGateway:
                 "do_normalize": request.get("normalize", True),
                 "denoise": request.get("denoise", True),
                 "inference_timesteps": request.get("inference_timesteps", 10),
+                "seed": request.get("seed"),
                 "model_selection": runtime_selection,
             }
             for request in requests
