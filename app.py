@@ -239,6 +239,31 @@ _APP_THEME = gr.themes.Soft(
 
 # ---------- Model ----------
 
+_OWNED_ENGINE_LOOP: Any = None
+_OWNED_ENGINE_LOCK = threading.Lock()
+
+
+def _ensure_owned_engine_loop() -> Any:
+    """為「沒有自帶 loop 的裸 async pool」提供行程級的專屬 loop 執行緒。
+
+    full checkpoint 切換路徑會拿到 AsyncVoxCPM2ServerPool 本身
+    （既是 pool 也沒有 .loop）。沒有 loop 就只能走同步 fallback，
+    而它的 generate 是 async generator，同步迭代必炸。
+    模組級是因為呼叫點含 @staticmethod，取不到 self。
+    """
+    global _OWNED_ENGINE_LOOP
+    with _OWNED_ENGINE_LOCK:
+        loop = _OWNED_ENGINE_LOOP
+        if loop is not None and loop.is_running():
+            return loop
+        loop = asyncio.new_event_loop()
+        threading.Thread(
+            target=loop.run_forever, name="voxcpm-owned-loop", daemon=True
+        ).start()
+        _OWNED_ENGINE_LOOP = loop
+        return loop
+
+
 class VoxCPMDemo:
     def __init__(self, model_id: str = "openbmb/VoxCPM2", device: str = "auto") -> None:
         self.device = resolve_runtime_device(device, "cuda")
@@ -307,6 +332,13 @@ class VoxCPMDemo:
         """
         server_loop = getattr(server, "loop", None)
         pool = getattr(server, "server_pool", None)
+        # 裸 async pool（full checkpoint 路徑）：自己就是 pool、沒有 .loop，
+        # 其方法是 coroutine function，同步呼叫會拿到未 await 的 coroutine。
+        if pool is None and inspect.iscoroutinefunction(
+            getattr(server, method_name, None)
+        ):
+            pool = server
+            server_loop = server_loop or _ensure_owned_engine_loop()
         if (
             server_loop is not None
             and server_loop.is_running()
@@ -317,25 +349,6 @@ class VoxCPMDemo:
             )
             return future.result(timeout=300)
         return getattr(server, method_name)(*args)
-
-    def _ensure_owned_loop(self) -> Any:
-        """為「沒有自帶 loop 的裸 async pool」提供專屬 loop 執行緒。
-
-        full checkpoint 切換路徑會拿到 AsyncVoxCPM2ServerPool 本身
-        （既是 pool 也沒有 .loop）。沒有 loop 就只能走同步 fallback，
-        而它的 generate 是 async generator，同步迭代必炸。
-        """
-        loop = getattr(self, "_owned_engine_loop", None)
-        if loop is not None and loop.is_running():
-            return loop
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(
-            target=loop.run_forever, name="voxcpm-owned-loop", daemon=True
-        )
-        thread.start()
-        self._owned_engine_loop = loop
-        self._owned_engine_thread = thread
-        return loop
 
     def _ensure_server_loop_running(self) -> None:
         server = getattr(self, "voxcpm_server", None)
@@ -607,7 +620,7 @@ class VoxCPMDemo:
             getattr(server, "generate", None)
         ):
             async_pool = server
-            server_loop = server_loop or self._ensure_owned_loop()
+            server_loop = server_loop or _ensure_owned_engine_loop()
         if async_pool is None or server_loop is None:
             # 落到同步 fallback 前先記錄實情：某些 runtime 版本的 server
             # 物件不帶 server_pool/loop，其 generate 卻是 async generator，
@@ -756,7 +769,7 @@ class VoxCPMDemo:
                 getattr(server, "generate", None)
             ):
                 async_pool = server
-                server_loop = server_loop or self._ensure_owned_loop()
+                server_loop = server_loop or _ensure_owned_engine_loop()
             if async_pool is not None and server_loop is not None:
                 self._ensure_server_loop_running()
                 async_generator = async_pool.generate(**prepared)
