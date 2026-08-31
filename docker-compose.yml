@@ -59,10 +59,10 @@ services:
       # Bearer token for the CastAgent-compatible /api/v1/tts/* endpoints.
       # Blank disables auth (local development only).
       - TTS_API_KEY=${TTS_API_KEY:-}
-      # GB10 (Grace-Blackwell) reports sm_121, but torch cu128 nvrtc only knows up
-      # to sm_120, so runtime JIT fusion (e.g. the @torch.jit.script snake op) fails
-      # with "invalid value for --gpu-architecture". Disable JIT so these run eager.
-      - PYTORCH_JIT=0
+      # PYTORCH_JIT 預設開啟。cu128 時代 GB10（sm_121）需設 0 壓制
+      # nvrtc 不相容；cu130 起 nvrtc 原生支援 sm_121，已實測可退役。
+      # 若特定機器仍需壓制，於 .env 設 PYTORCH_JIT=0。
+      - PYTORCH_JIT=${PYTORCH_JIT:-1}
     # Pre-download models first, then start the unified API plus legacy Gradio.
     command: bash -c "python scripts/download_models.py --model-id ${MODEL_ID:-openbmb/VoxCPM2} && python api.py --port 8000"
     volumes:
