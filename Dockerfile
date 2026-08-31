@@ -84,14 +84,14 @@ RUN . /opt/venv/bin/activate && \
     uv pip install --no-cache-dir torch torchaudio --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT}" --find-links /tmp/wheels && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
     WHEEL_NAME="flash_attn-${FLASH_ATTN_VERSION}-cp310-cp310-linux_$(uname -m).whl" && \
-    if ! ls /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl >/dev/null 2>&1; then \
+    if ! ls "/tmp/wheels/${WHEEL_NAME}" >/dev/null 2>&1; then \
         curl -fsSL --retry 3 -o "/tmp/wheels/${WHEEL_NAME}" \
             "https://github.com/CreateIntelligens/VoxCPM360/releases/download/flash-attn-wheels-${TORCH_CUDA_VARIANT}/${WHEEL_NAME}" \
             || rm -f "/tmp/wheels/${WHEEL_NAME}"; \
     fi && \
-    if ls /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl >/dev/null 2>&1; then \
-        echo "flash-attn: installing prebuilt wheel, skipping compilation" && \
-        uv pip install --no-cache-dir /tmp/wheels/flash_attn-*cp310*linux_"$(uname -m)".whl; \
+    if ls "/tmp/wheels/${WHEEL_NAME}" >/dev/null 2>&1; then \
+        echo "flash-attn: installing prebuilt wheel ${WHEEL_NAME}, skipping compilation" && \
+        uv pip install --no-cache-dir "/tmp/wheels/${WHEEL_NAME}"; \
     else \
         python3 -c "import torch.utils.cpp_extension as c; p = c.__file__; content = open(p).read().replace('def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:', 'def _check_cuda_version(compiler_name: str, compiler_version: TorchVersion) -> None:\n    return'); open(p, 'w').write(content)" && \
         git clone --branch "v${FLASH_ATTN_VERSION}" --single-branch https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
