@@ -10,8 +10,10 @@ pretrained_models
 scratch
 venv-nano
 outputs
+data
 models/native
 models/barbet
+wheels-cu*
 
 frontend/node_modules
 frontend/dist
