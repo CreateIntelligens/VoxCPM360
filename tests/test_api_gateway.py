@@ -1751,6 +1751,9 @@ def test_full_native_checkpoint_switches_runtime(monkeypatch, tmp_path):
     base_demo = FakeDemo()
     full_demo = FakeDemo(model_id=str(full))
     monkeypatch.setattr(api, "VoxCPMDemo", lambda **kwargs: full_demo)
+    # 拆分後 _switch_native_runtime 位於 gateway.gateway，patch 需同步指向
+    import gateway.gateway as _gw_mod
+    monkeypatch.setattr(_gw_mod, "VoxCPMDemo", lambda **kwargs: full_demo)
     app = api.create_app(base_demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
 
     with TestClient(app) as client:
