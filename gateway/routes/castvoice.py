@@ -109,8 +109,51 @@ def register_castvoice_routes(app, gateway, demo, helpers):
             )
         return model_id
 
+    # castvoice 端點未指定合成參數時沿用的預設值。與互動端點的 Form 預設
+    # 一致，也是加上選填欄位之前 castvoice 寫死的那組值。
+    _CASTVOICE_DEFAULT_CFG_VALUE = 2.0
+    _CASTVOICE_DEFAULT_NORMALIZE = True
+    _CASTVOICE_DEFAULT_DENOISE = False
+
+    def _castvoice_synthesis_params(
+        *,
+        speed: float,
+        cfg_value: float | None,
+        normalize: bool | None,
+        denoise: bool | None,
+    ) -> dict[str, Any]:
+        """把選填的合成參數收斂成實際要傳給引擎的值，並套用範圍檢查。
+
+        範圍界線與互動端點 /api/v1/synthesize 相同，但違規回 CastAgent 風格
+        的 _CastVoiceError（400 invalid_request），不是 FastAPI 的 422。
+        """
+        if not 0.5 <= speed <= 2.0:
+            raise _CastVoiceError(400, "invalid_speed", "speed 必須介於 0.5 與 2.0")
+        if cfg_value is not None and not 1.0 <= cfg_value <= 5.0:
+            raise _CastVoiceError(
+                400, "invalid_request", "cfg_value 必須介於 1.0 與 5.0"
+            )
+        return {
+            "speed": speed,
+            "cfg_value": (
+                _CASTVOICE_DEFAULT_CFG_VALUE if cfg_value is None else cfg_value
+            ),
+            "normalize": (
+                _CASTVOICE_DEFAULT_NORMALIZE if normalize is None else normalize
+            ),
+            "denoise": _CASTVOICE_DEFAULT_DENOISE if denoise is None else denoise,
+        }
+
     async def _synthesize_castvoice(
-        text: str, voice_id: str, speed: float, model_id: str | None = None
+        text: str,
+        voice_id: str,
+        speed: float,
+        model_id: str | None = None,
+        *,
+        seed: int | None = None,
+        cfg_value: float | None = None,
+        normalize: bool | None = None,
+        denoise: bool | None = None,
     ) -> tuple[bytes, str]:
         """單句 CastAgent 語音合成的共用邏輯。單筆 /synthesize 與 batch worker
         都走這裡，失敗一律拋 _CastVoiceError，呼叫端自行決定怎麼回應
@@ -119,12 +162,19 @@ def register_castvoice_routes(app, gateway, demo, helpers):
         model_id 是選填的模型覆寫：留空沿用 voice_id 綁定的預設模型；有給
         則驗證該模型存在（且對 barbet 而言含有這個語者），沿用同一個參考音
         ／語者身份、只換底層權重。
+
+        seed / cfg_value / normalize / denoise 同為選填，None 代表沿用
+        castvoice 既有預設值。
         """
         text = text.strip()
         if not text:
             raise _CastVoiceError(400, "invalid_text", "text 不可為空白")
-        if not 0.5 <= speed <= 2.0:
-            raise _CastVoiceError(400, "invalid_speed", "speed 必須介於 0.5 與 2.0")
+        params = _castvoice_synthesis_params(
+            speed=speed,
+            cfg_value=cfg_value,
+            normalize=normalize,
+            denoise=denoise,
+        )
 
         definition = _CASTVOICE_DEFINITIONS_BY_ID.get(voice_id)
         if definition is None:
@@ -151,11 +201,12 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                     control_instruction="",
                     reference_path=reference_path,
                     prompt_text=preset.get("prompt_text", ""),
-                    cfg_value=2.0,
-                    normalize=True,
-                    denoise=False,
+                    cfg_value=params["cfg_value"],
+                    normalize=params["normalize"],
+                    denoise=params["denoise"],
                     inference_timesteps=30,
-                    speed=speed,
+                    speed=params["speed"],
+                    seed=seed,
                 )
             else:
                 speaker_id = definition["speaker_id"]
@@ -178,10 +229,10 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                     reference_path=None,
                     prompt_text="",
                     speaker_id=speaker_id,
-                    cfg_value=2.0,
+                    cfg_value=params["cfg_value"],
                     inference_timesteps=30,
-                    seed=None,
-                    speed=speed,
+                    seed=seed,
+                    speed=params["speed"],
                 )
         except HTTPException as exc:
             raise _castvoice_error_from_http(exc) from exc
@@ -240,7 +291,14 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                 try:
                     serial_results.append(
                         await _synthesize_castvoice(
-                            item.text, item.voice_id, item.speed, item.model_id
+                            item.text,
+                            item.voice_id,
+                            item.speed,
+                            item.model_id,
+                            seed=item.seed,
+                            cfg_value=item.cfg_value,
+                            normalize=item.normalize,
+                            denoise=item.denoise,
                         )
                     )
                 except _CastVoiceError as exc:
@@ -265,10 +323,12 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                 text = item.text.strip()
                 if not text:
                     raise _CastVoiceError(400, "invalid_text", "text 不可為空白")
-                if not 0.5 <= item.speed <= 2.0:
-                    raise _CastVoiceError(
-                        400, "invalid_speed", "speed 必須介於 0.5 與 2.0"
-                    )
+                params = _castvoice_synthesis_params(
+                    speed=item.speed,
+                    cfg_value=item.cfg_value,
+                    normalize=item.normalize,
+                    denoise=item.denoise,
+                )
                 assert definition is not None
                 preset = _find_reference_preset(definition["reference_preset_id"])
                 if preset is None:
@@ -291,11 +351,12 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                             definition["reference_preset_id"]
                         ),
                         "prompt_text": preset.get("prompt_text", ""),
-                        "cfg_value": 2.0,
-                        "normalize": True,
-                        "denoise": False,
+                        "cfg_value": params["cfg_value"],
+                        "normalize": params["normalize"],
+                        "denoise": params["denoise"],
                         "inference_timesteps": 30,
-                        "speed": item.speed,
+                        "speed": params["speed"],
+                        "seed": item.seed,
                     }
                 )
         except (_CastVoiceError, HTTPException):
@@ -397,7 +458,14 @@ def register_castvoice_routes(app, gateway, demo, helpers):
 
         try:
             mp3_bytes, request_id = await _synthesize_castvoice(
-                body.text, body.voice_id, body.speed, body.model_id
+                body.text,
+                body.voice_id,
+                body.speed,
+                body.model_id,
+                seed=body.seed,
+                cfg_value=body.cfg_value,
+                normalize=body.normalize,
+                denoise=body.denoise,
             )
         except _CastVoiceError as exc:
             return _castvoice_error(exc.status_code, exc.error, exc.message, **exc.headers)

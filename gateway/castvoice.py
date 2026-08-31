@@ -43,6 +43,11 @@ from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesi
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
 from gateway.gateway import TTSGateway
 
+# 選填的合成參數一律預設 None＝「不指定」，由呼叫端沿用 castvoice 既有
+# 預設值（cfg 2.0、normalize True、denoise False）。外部合約向後相容是
+# 硬約束：沒帶這些欄位的舊客戶端行為必須與加欄位前完全一致。
+# 註：inference_timesteps 刻意不開放 —— voxcpm2 引擎在建構時就定死步數，
+# per-request 傳入不生效（catalog capabilities 已標為 false）。
 class CastVoiceSynthesizeRequest(BaseModel):
     text: str
     voice_id: str
@@ -51,6 +56,10 @@ class CastVoiceSynthesizeRequest(BaseModel):
     # 選填：覆寫該 voice_id 預設綁定的模型/checkpoint，沿用同一個
     # 參考音／語者身份，只換底層權重。留空則用 voice_id 的預設模型。
     model_id: str | None = None
+    seed: int | None = None
+    cfg_value: float | None = None
+    normalize: bool | None = None
+    denoise: bool | None = None
 
 
 class CastVoiceBatchItemRequest(BaseModel):
@@ -58,6 +67,10 @@ class CastVoiceBatchItemRequest(BaseModel):
     voice_id: str
     speed: float = 1.0
     model_id: str | None = None
+    seed: int | None = None
+    cfg_value: float | None = None
+    normalize: bool | None = None
+    denoise: bool | None = None
 
 
 class CastVoiceBatchRequest(BaseModel):
@@ -82,6 +95,10 @@ class _CastVoiceBatchItem:
     voice_id: str
     speed: float
     model_id: str | None = None
+    seed: int | None = None
+    cfg_value: float | None = None
+    normalize: bool | None = None
+    denoise: bool | None = None
     status: str = "pending"  # pending | processing | done | failed
     error: str | None = None
 
@@ -297,6 +314,10 @@ class CastVoiceBatchManager:
                 voice_id=req.voice_id,
                 speed=req.speed,
                 model_id=req.model_id,
+                seed=req.seed,
+                cfg_value=req.cfg_value,
+                normalize=req.normalize,
+                denoise=req.denoise,
             )
             for i, req in enumerate(requests)
         ]

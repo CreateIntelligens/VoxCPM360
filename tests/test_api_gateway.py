@@ -2415,6 +2415,271 @@ def test_castvoice_batch_retries_smaller_chunks_after_oom(monkeypatch):
     assert [len(requests) for requests in demo.batch_calls] == [4, 2, 2]
 
 
+def test_castvoice_synthesize_passes_synthesis_params_to_native_engine(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    demo = FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "台語測試",
+                "voice_id": "voxcpm2-cosy-young-female-01",
+                "seed": 4242,
+                "cfg_value": 3.5,
+                "speed": 1.25,
+                "normalize": False,
+                "denoise": True,
+            },
+        )
+
+    assert response.status_code == 200
+    call = demo.calls[0]
+    assert call["seed"] == 4242
+    assert call["cfg_value_input"] == 3.5
+    assert call["do_normalize"] is False
+    assert call["denoise"] is True
+
+
+def test_castvoice_synthesize_passes_synthesis_params_to_barbet_engine(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    runtime = FakeBarbetRuntime(
+        checkpoints=(FakeBarbetCheckpoint(),),
+        speakers=({"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"},),
+    )
+    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "逐家好",
+                "voice_id": "barbet-hung-yi-lee",
+                "seed": 777,
+                "cfg_value": 4.0,
+            },
+        )
+
+    assert response.status_code == 200
+    assert runtime.calls[0]["seed"] == 777
+    assert runtime.calls[0]["cfg_value"] == 4.0
+
+
+def test_castvoice_synthesize_without_params_keeps_existing_defaults(monkeypatch):
+    """回歸：不帶新欄位時，送進引擎的值必須與加欄位之前完全一致。"""
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    demo = FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={"text": "台語測試", "voice_id": "voxcpm2-cosy-young-female-01"},
+        )
+
+    assert response.status_code == 200
+    call = demo.calls[0]
+    assert call["cfg_value_input"] == 2.0
+    assert call["do_normalize"] is True
+    assert call["denoise"] is False
+    assert call["seed"] is None
+    assert call["inference_timesteps"] == 30
+
+
+def test_castvoice_synthesize_without_params_keeps_barbet_defaults(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    runtime = FakeBarbetRuntime(
+        checkpoints=(FakeBarbetCheckpoint(),),
+        speakers=({"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"},),
+    )
+    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+
+    with TestClient(app) as client:
+        responses = [
+            client.post(
+                "/api/v1/tts/synthesize",
+                json={"text": "逐家好", "voice_id": "barbet-hung-yi-lee"},
+            )
+            for _ in range(2)
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert runtime.calls[0]["cfg_value"] == 2.0
+    # barbet 端 seed=None 由 gateway 補隨機值：不指定時每次都該不一樣，
+    # 這正是加上選填 seed 之前的行為。
+    assert runtime.calls[0]["seed"] != runtime.calls[1]["seed"]
+
+
+@pytest.mark.parametrize("cfg_value", [0.9, 5.1])
+def test_castvoice_synthesize_rejects_out_of_range_cfg_value(monkeypatch, cfg_value):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "台語測試",
+                "voice_id": "voxcpm2-cosy-young-female-01",
+                "cfg_value": cfg_value,
+            },
+        )
+
+    # CastAgent 風格的錯誤形狀，而不是 FastAPI 的 422。
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "invalid_request",
+        "message": "cfg_value 必須介於 1.0 與 5.0",
+    }
+
+
+@pytest.mark.parametrize("speed", [0.4, 2.1])
+def test_castvoice_synthesize_rejects_out_of_range_speed(monkeypatch, speed):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "台語測試",
+                "voice_id": "voxcpm2-cosy-young-female-01",
+                "speed": speed,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_speed"
+
+
+def test_castvoice_synthesize_rejects_inference_timesteps_field(monkeypatch):
+    """voxcpm2 建構時定死步數，per-request 不生效，body 刻意不收這個欄位。"""
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    demo = FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "台語測試",
+                "voice_id": "voxcpm2-cosy-young-female-01",
+                "inference_timesteps": 5,
+            },
+        )
+
+    # pydantic 預設忽略未知欄位：請求仍成功，但步數維持既有的 30。
+    assert response.status_code == 200
+    assert demo.calls[0]["inference_timesteps"] == 30
+
+
+def test_castvoice_batch_items_carry_independent_synthesis_params(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "recommend", lambda self, pending: min(pending, 4)
+    )
+    demo = FakeBatchDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        submit = client.post(
+            "/api/v1/tts/synthesize/batch",
+            json={
+                "items": [
+                    {
+                        "text": "第一句",
+                        "voice_id": "voxcpm2-cosy-young-female-01",
+                        "seed": 111,
+                        "cfg_value": 1.5,
+                        "denoise": True,
+                    },
+                    {
+                        "text": "第二句",
+                        "voice_id": "voxcpm2-cosy-young-female-01",
+                        "seed": 222,
+                        "cfg_value": 4.5,
+                        "normalize": False,
+                    },
+                ]
+            },
+        )
+        assert submit.status_code == 202
+        status = wait_for_batch(client, submit.json()["batch_id"])
+
+    assert [item["status"] for item in status["items"]] == ["done", "done"]
+    # 同一個 nano-vLLM chunk 內，每一筆仍帶著自己的參數。
+    assert len(demo.batch_calls) == 1
+    first, second = demo.batch_calls[0]
+    assert (first["seed"], first["cfg_value_input"]) == (111, 1.5)
+    assert first["denoise"] is True
+    assert first["do_normalize"] is True
+    assert (second["seed"], second["cfg_value_input"]) == (222, 4.5)
+    assert second["do_normalize"] is False
+    assert second["denoise"] is False
+
+
+def test_castvoice_batch_without_params_keeps_existing_defaults(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "recommend", lambda self, pending: min(pending, 4)
+    )
+    demo = FakeBatchDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        submit = client.post(
+            "/api/v1/tts/synthesize/batch",
+            json={
+                "items": [
+                    {"text": f"第 {index} 句", "voice_id": "voxcpm2-cosy-young-female-01"}
+                    for index in range(2)
+                ]
+            },
+        )
+        status = wait_for_batch(client, submit.json()["batch_id"])
+
+    assert [item["status"] for item in status["items"]] == ["done", "done"]
+    for request in demo.batch_calls[0]:
+        assert request["cfg_value_input"] == 2.0
+        assert request["do_normalize"] is True
+        assert request["denoise"] is False
+        assert request["seed"] is None
+
+
+def test_castvoice_batch_marks_only_the_item_with_invalid_cfg_value_failed(monkeypatch):
+    """單筆參數違規不能拖垮同批的其他句子。"""
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "recommend", lambda self, pending: min(pending, 4)
+    )
+    demo = FakeBatchDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        submit = client.post(
+            "/api/v1/tts/synthesize/batch",
+            json={
+                "items": [
+                    {
+                        "text": "好的那句",
+                        "voice_id": "voxcpm2-cosy-young-female-01",
+                        "cfg_value": 2.5,
+                    },
+                    {
+                        "text": "壞的那句",
+                        "voice_id": "voxcpm2-cosy-young-female-01",
+                        "cfg_value": 9.9,
+                    },
+                ]
+            },
+        )
+        status = wait_for_batch(client, submit.json()["batch_id"])
+
+    assert [item["status"] for item in status["items"]] == ["done", "failed"]
+    assert status["items"][1]["error"] == "cfg_value 必須介於 1.0 與 5.0"
+
+
 def test_concurrent_streaming_two_streams_ttfb_unblocked(monkeypatch):
     monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "2")
     stream1_first_sent = threading.Event()

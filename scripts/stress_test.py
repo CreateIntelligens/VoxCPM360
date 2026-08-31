@@ -9,11 +9,13 @@ Validates the v2 concurrent streaming architecture:
 
 import asyncio
 import io
+import os
 import time
+
 import httpx
 import soundfile as sf
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = os.getenv("VOXCPM_BASE_URL", "http://localhost:8000")
 
 async def test_stream(client: httpx.AsyncClient, req_id: int, text: str):
     start_time = time.perf_counter()
@@ -21,9 +23,9 @@ async def test_stream(client: httpx.AsyncClient, req_id: int, text: str):
     total_bytes = 0
     headers_dict = {}
     chunk_count = 0
-    wav_buffer = io.BytesIO()
 
     try:
+        wav_buffer = io.BytesIO()
         async with client.stream(
             "POST",
             f"{BASE_URL}/api/v1/synthesize/stream",
@@ -56,17 +58,20 @@ async def test_stream(client: httpx.AsyncClient, req_id: int, text: str):
         ttfb = (first_chunk_time - start_time) if first_chunk_time else 0.0
         total_time = end_time - start_time
 
-        wav_bytes = wav_buffer.getvalue()
         audio_dur = 0.0
-        if len(wav_bytes) > 44:
-            try:
+        try:
+            if wav_buffer.tell() > 44:
                 wav_buffer.seek(0)
                 data, sr = sf.read(wav_buffer)
                 audio_dur = len(data) / sr
-            except Exception:
-                pass
+        except Exception:
+            pass
+        finally:
+            wav_buffer.close()  # 高併發下即時釋放緩衝
 
-        rtf = (audio_dur / total_time) if total_time > 0 else 0.0
+        # 加速比（幾倍即時，越高越快）；標準 RTF = total/audio（越低越快）
+        speedup = (audio_dur / total_time) if total_time > 0 else 0.0
+        rtf = (total_time / audio_dur) if audio_dur > 0 else 0.0
 
         return {
             "req_id": req_id,
@@ -75,6 +80,7 @@ async def test_stream(client: httpx.AsyncClient, req_id: int, text: str):
             "ttfb": ttfb,
             "total_time": total_time,
             "audio_dur": audio_dur,
+            "speedup": speedup,
             "rtf": rtf,
             "chunks": chunk_count,
             "bytes": total_bytes,
@@ -125,7 +131,8 @@ async def test_non_stream(client: httpx.AsyncClient, req_id: int, text: str):
             "status": 200,
             "total_time": total_time,
             "audio_dur": audio_dur,
-            "rtf": audio_dur / total_time if total_time > 0 else 0.0,
+            "speedup": audio_dur / total_time if total_time > 0 else 0.0,
+            "rtf": total_time / audio_dur if audio_dur > 0 else 0.0,
             "concurrency_header": headers_dict.get("x-engine-concurrency", "N/A"),
             "batch_size_header": headers_dict.get("x-batch-size", "N/A"),
             "gpu_job_time": headers_dict.get("x-gpu-job-time", "N/A"),
@@ -164,7 +171,7 @@ async def main():
         print(f"✅ 場景 A 完成，總耗時: {total_a:.2f}s")
         for res in results_a:
             print(f"   [Stream #{res['req_id']}] Status={res['status']} | TTFB={res.get('ttfb', 0):.2f}s | "
-                  f"Total={res.get('total_time', 0):.2f}s | Audio={res.get('audio_dur', 0):.2f}s ({res.get('rtf', 0):.2f}x RTF) | "
+                  f"Total={res.get('total_time', 0):.2f}s | Audio={res.get('audio_dur', 0):.2f}s ({res.get('speedup', 0):.2f}x 即時) | "
                   f"ConcurrencyHeader={res.get('concurrency_header')} | Chunks={res.get('chunks')}")
 
         # 3. 場景 B: 4 路併發串流 (Concurrent 4 Streams)
@@ -184,7 +191,7 @@ async def main():
         print(f"✅ 場景 B 完成，總耗時: {total_b:.2f}s")
         for res in results_b:
             print(f"   [Stream #{res['req_id']}] Status={res['status']} | TTFB={res.get('ttfb', 0):.2f}s | "
-                  f"Total={res.get('total_time', 0):.2f}s | Audio={res.get('audio_dur', 0):.2f}s ({res.get('rtf', 0):.2f}x RTF) | "
+                  f"Total={res.get('total_time', 0):.2f}s | Audio={res.get('audio_dur', 0):.2f}s ({res.get('speedup', 0):.2f}x 即時) | "
                   f"ConcurrencyHeader={res.get('concurrency_header')} | Chunks={res.get('chunks')}")
 
         # 4. 場景 C: 混合負載（2 路串流 + 2 筆合批請求）
@@ -203,11 +210,11 @@ async def main():
             req_type = res.get("type", "stream")
             if req_type == "stream":
                 print(f"   [Stream #{res['req_id']}] Status={res['status']} | TTFB={res.get('ttfb', 0):.2f}s | "
-                      f"Total={res.get('total_time', 0):.2f}s | Audio={res.get('audio_dur', 0):.2f}s ({res.get('rtf', 0):.2f}x RTF) | "
+                      f"Total={res.get('total_time', 0):.2f}s | Audio={res.get('audio_dur', 0):.2f}s ({res.get('speedup', 0):.2f}x 即時) | "
                       f"ConcurrencyHeader={res.get('concurrency_header')}")
             else:
                 print(f"   [Batch  #{res['req_id']}] Status={res['status']} | Total={res.get('total_time', 0):.2f}s | "
-                      f"Audio={res.get('audio_dur', 0):.2f}s ({res.get('rtf', 0):.2f}x RTF) | "
+                      f"Audio={res.get('audio_dur', 0):.2f}s ({res.get('speedup', 0):.2f}x 即時) | "
                       f"ConcurrencyHeader={res.get('concurrency_header')} | BatchSize={res.get('batch_size_header')}")
 
     print("\n" + "=" * 65)
