@@ -151,8 +151,7 @@ class BarbetRuntime:
                 speaker_centroid=centroid,
                 cfg_value=cfg_value,
                 inference_timesteps=inference_timesteps,
-                # 官方 release_metadata.json 的 inference_policies 明寫
-                # retry_badcase: False —— 我們原本設 True，與官方相反。
+                # 對齊官方 release_metadata.json 的 inference_policies。
                 retry_badcase=False,
                 seed=seed,
             )

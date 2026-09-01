@@ -436,14 +436,20 @@ class VoxCPMDemo:
             if isinstance(outcome, BaseException):
                 raise outcome
             return outcome
+        # nano-vLLM 只接受 GPU 編號，沒有 device type 的概念，且硬依賴
+        # flash-attn。放行 cpu/mps 只會讓服務宣稱跑在該裝置上卻仍佔用 GPU 0。
+        if not self.device.startswith("cuda"):
+            raise ValueError(
+                f"device {self.device!r} is not supported: the nano-vLLM runtime "
+                "requires CUDA. Set VOXCPM_DEVICE to 'auto', 'cuda' or 'cuda:N'."
+            )
         logger.info(f"Loading nano-vllm model: {self._model_id}")
         devices = [0]
-        if "cuda" in self.device:
-            if ":" in self.device:
-                try:
-                    devices = [int(self.device.split(":")[-1])]
-                except ValueError:
-                    devices = [0]
+        if ":" in self.device:
+            try:
+                devices = [int(self.device.split(":")[-1])]
+            except ValueError:
+                devices = [0]
 
         enforce_eager = not self.optimize
         runtime_lora_config = build_nano_lora_config(

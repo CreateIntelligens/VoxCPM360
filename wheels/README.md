@@ -1,34 +1,38 @@
 # flash-attn wheels
 
-本目錄存放建置 image 時優先使用的本機 `flash-attn` wheel。cu128 與 cu130
-產物檔名相同但 ABI 不相容，必須依 CUDA variant 分目錄：
+建置 image 時，Dockerfile 依序尋找 flash-attn wheel：
 
-```text
-wheels/
-├── cu128/
-│   └── flash_attn-2.8.3-cp310-cp310-linux_<arch>.whl
-└── cu130/
-    └── flash_attn-2.8.3-cp310-cp310-linux_<arch>.whl
-```
+1. 本目錄（平放，不分子目錄）
+2. GitHub Release `flash-attn-wheels-${TORCH_CUDA_VARIANT}`
+3. 都沒有則從原始碼編譯，約一小時
 
-Dockerfile 只會讀取 `wheels/${TORCH_CUDA_VARIANT}/`，本機沒有對應 wheel 時，
-會依序嘗試同 variant 的 GitHub Release，最後才從原始碼編譯。Release tag 固定為：
+比對的是含版本與架構的**完整檔名**，例如
+`flash_attn-2.8.3-cp310-cp310-linux_x86_64.whl`。cu128 與 cu130 的產物檔名
+規則相同但 ABI 不相容，靠 `FLASH_ATTN_VERSION` 區分（cu128→2.6.3、
+cu130→2.8.3），因此本目錄放錯 variant 的 wheel 不會被誤裝。
 
-- `flash-attn-wheels-cu128`
-- `flash-attn-wheels-cu130`
+平常不需要在本目錄放任何東西 —— 兩個架構的 wheel 都已上傳 Release，
+build 會自動下載。
 
-舊的 `flash-attn-wheels` tag 僅保留既有 2.6.3 cu128 產物，不再供新版
-Dockerfile 自動下載。
+## 產生新的 wheel
 
-GB10 編譯 cu130 wheel：
+換 CUDA 版本或新增 CPU 架構時才需要：
 
 ```bash
 docker buildx build --target flash-wheel \
   --build-arg CUDA_BASE_IMAGE=nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04 \
   --build-arg TORCH_CUDA_VARIANT=cu130 \
-  --build-arg TORCH_ARCH_LIST=12.0 \
-  -o type=local,dest=wheels-cu130 .
+  --build-arg FLASH_ATTN_VERSION=2.8.3 \
+  --build-arg TORCH_ARCH_LIST="8.6;9.0;12.0" \
+  -o type=local,dest=wheels-out .
 ```
 
-導出後，將 wheel 放到 `wheels/cu130/` 才會被完整 image build 使用。切換
-variant 時不必刪除另一套 wheel；目錄隔離會避免誤裝。
+導出後上傳到對應的 Release，其他機器即可免編譯：
+
+```bash
+gh release upload flash-attn-wheels-cu130 -R CreateIntelligens/VoxCPM360 \
+  wheels-out/flash_attn-2.8.3-cp310-cp310-linux_x86_64.whl
+```
+
+> BuildKit 會回收舊的編譯層，`--target flash-wheel` 不保證命中快取。
+> 導出前先確認是否真的需要重編。

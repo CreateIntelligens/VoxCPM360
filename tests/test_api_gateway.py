@@ -1865,7 +1865,23 @@ def test_full_native_checkpoint_switches_runtime(monkeypatch, tmp_path):
         assert full_demo.calls[0]["model_selection"] == "__base__"
 
 
-def test_dynamic_batch_sizer_uses_cuda_and_cgroup_headroom(monkeypatch):
+def test_demo_rejects_non_cuda_device(monkeypatch, tmp_path):
+    """nano-vLLM 沒有 CPU 路徑，放行只會讓服務誤報 device 卻仍佔 GPU 0。"""
+    import app as app_module
+
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setattr(app_module, "resolve_runtime_device", lambda *_: "cpu")
+    monkeypatch.setattr(
+        app_module, "_HISTORY_DIR", tmp_path / "history", raising=False
+    )
+
+    demo = app_module.VoxCPMDemo(device="cpu")
+    with pytest.raises(ValueError, match="requires CUDA"):
+        demo.get_or_load_voxcpm()
+
+
+def test_dynamic_batch_sizer_sizes_from_cgroup_not_cuda(monkeypatch):
+    """合批規模看 cgroup；CUDA free 是 KV cache 之外的餘量，不是 per-item 池。"""
     gib = 1024**3
     monkeypatch.setattr(
         api.DynamicBatchSizer, "_cuda_headroom", staticmethod(lambda: 10 * gib)
@@ -1878,8 +1894,46 @@ def test_dynamic_batch_sizer_uses_cuda_and_cgroup_headroom(monkeypatch):
 
     sizer = api.DynamicBatchSizer(max_concurrency=16)
 
-    assert sizer.recommend(20) == 5
+    # (20 - 2) / 1.5 = 12，取 cgroup 上限而非較小的 CUDA 餘量。
+    assert sizer.recommend(20) == 12
     assert sizer.recommend(3) == 3
+
+
+def test_dynamic_batch_sizer_small_gpu_still_batches(monkeypatch):
+    """16GB 卡的迴歸：模型佔滿後 CUDA 只剩 ~4.4GB，仍須能合批。"""
+    gib = 1024**3
+    monkeypatch.setattr(
+        api.DynamicBatchSizer,
+        "_cuda_headroom",
+        staticmethod(lambda: int(4.4 * gib)),
+    )
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "_cgroup_headroom", staticmethod(lambda: 60 * gib)
+    )
+    monkeypatch.setenv("VOXCPM_BATCH_MEMORY_RESERVE_GIB", "2")
+    monkeypatch.setenv("VOXCPM_BATCH_MEMORY_PER_ITEM_GIB", "1.5")
+
+    sizer = api.DynamicBatchSizer(max_concurrency=16)
+
+    # 舊行為為 (4.4-2)/1.5 = 1（合不了批 → 學不到 → 永遠 1 的死結）。
+    assert sizer.recommend(16) == 16
+
+
+def test_dynamic_batch_sizer_cuda_guard_clamps_when_vram_critical(monkeypatch):
+    """顯存低於 reserve 時咬住批量，避免與其他 GPU 工作並存時撐爆。"""
+    gib = 1024**3
+    monkeypatch.setattr(
+        api.DynamicBatchSizer,
+        "_cuda_headroom",
+        staticmethod(lambda: int(0.5 * gib)),
+    )
+    monkeypatch.setattr(
+        api.DynamicBatchSizer, "_cgroup_headroom", staticmethod(lambda: 60 * gib)
+    )
+    monkeypatch.setenv("VOXCPM_BATCH_MEMORY_RESERVE_GIB", "2")
+    monkeypatch.setenv("VOXCPM_BATCH_MEMORY_PER_ITEM_GIB", "1.5")
+
+    assert api.DynamicBatchSizer(max_concurrency=16).recommend(16) == 1
 
 
 def test_dynamic_batch_sizer_falls_back_to_one_without_memory_signal(monkeypatch):
@@ -1905,12 +1959,13 @@ def test_dynamic_batch_sizer_learns_headroom_and_shrinks_after_oom(monkeypatch):
     monkeypatch.setenv("VOXCPM_BATCH_MEMORY_PER_ITEM_GIB", "1.5")
     sizer = api.DynamicBatchSizer(max_concurrency=16)
 
-    assert sizer.recommend(20) == 5
-    sizer.observe_success(size=5, elapsed=5.0, work_units=50)
-    assert sizer.recommend(20) == 7
+    assert sizer.recommend(20) == 12
+    sizer.observe_success(size=12, elapsed=5.0, work_units=50)
+    assert sizer.recommend(20) == 16
 
-    sizer.observe_oom(size=7)
-    assert sizer.recommend(20) == 3
+    sizer.observe_oom(size=16)
+    # cap 砍半到 8，per-item 加倍到 2.25GiB：(20-2)/2.25 = 8。
+    assert sizer.recommend(20) == 8
 
 
 def test_local_barbet_catalog_and_synthesis(monkeypatch):

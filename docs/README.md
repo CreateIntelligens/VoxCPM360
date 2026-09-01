@@ -4,6 +4,7 @@
 
 | 我想… | 開這份 |
 |---|---|
+| 第一次做微調，要從環境準備開始 | [TRAINING_GUIDE_zh-TW.md](TRAINING_GUIDE_zh-TW.md) |
 | 知道現在跑到哪、跑完要做什麼 | [TRAINING_LOG.md](TRAINING_LOG.md) 開頭「現況」 |
 | 送出一輪訓練／監看／中止／取回結果 | [TRAINING_LOG.md](TRAINING_LOG.md) 的「操作手冊」 |
 | 查某一輪用了什麼設定、val 曲線長怎樣 | [RUNS.md](RUNS.md) |
@@ -18,6 +19,7 @@
 
 | 檔案 | 行數 | 性質 | 更新時機 |
 |---|---|---|---|
+| **TRAINING_GUIDE_zh-TW.md** | ~370 | **入門指南**：環境準備、資料格式、LoRA／全參數微調步驟 | 流程或設定介面變動時 |
 | **TRAINING_LOG.md** | ~182 | **總覽**：現況、版本表、核心結論、陷阱、操作手冊 | 每輪開跑／結束、狀態變化 |
 | **RUNS.md** | ~334 | **逐輪細節**：changelog 沿革、完整 config、val 曲線、逐輪結論 | 新增一輪、跑完填結果 |
 | **GLOSSARY.md** | ~300 | **名詞解釋**：訓練參數、分散式、Slurm/Enroot、診斷 | 出現新概念時 |

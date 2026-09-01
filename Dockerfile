@@ -1,10 +1,10 @@
 # ==========================================
 # Stage 1: Base image with CUDA and python dependencies
 # ==========================================
-# CUDA 世代可切換（GB10/sm_121 需 CUDA 13 才有瘦長 GEMM 調優，
-# 見 docs/plans/2026-08-31-gb10-cuda13-upgrade-design.md）。
-# 預設維持 cu128 —— x86 機器行為完全不變。
-ARG CUDA_BASE_IMAGE=nvidia/cuda:12.8.0-devel-ubuntu22.04
+# CUDA 世代可切換，但 base image、torch variant、flash-attn 版本三者必須
+# 同時改 —— 混搭會在執行期缺 libcudart。GB10/sm_121 需要 CUDA 13 的瘦長
+# GEMM 調優，見 docs/plans/2026-08-31-gb10-cuda13-upgrade-design.md。
+ARG CUDA_BASE_IMAGE=nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04
 FROM ${CUDA_BASE_IMAGE} AS base
 
 # Prevent Python from writing pyc files and buffering stdout/stderr
@@ -26,6 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     build-essential \
     git \
+    ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # ==========================================
@@ -44,9 +46,8 @@ RUN python3.10 -m venv /opt/venv
 # 在編譯層之後才 COPY 進來）。
 COPY scripts/patch_flash_attention_arch.py ./scripts/patch_flash_attention_arch.py
 
-# wheels/ 內若已有本平台的 flash-attn wheel（從 GH Release 下載或先前編譯導出），
-# 直接安裝、整段編譯跳過（2.5h → 30s）。注意：走 wheel 時 TORCH_ARCH_LIST
-# 不影響 flash-attn（wheel 內含編譯時的架構），標準 wheel 應為三架構版。
+# 本機備妥對應平台的 wheel 即可跳過整段編譯。走 wheel 時 TORCH_ARCH_LIST
+# 不生效 —— 架構已固化在 wheel 內，通用 wheel 應含三架構。
 COPY wheels/ /tmp/wheels/
 
 # Target CUDA compute capabilities are configurable at build time so the same
@@ -61,13 +62,13 @@ ARG MAX_JOBS=""
 # 慢速線路（如 ARM 機到 pytorch CDN 僅 ~0.4MB/s）下載大 wheel 會觸發
 # uv 預設逾時，可用 --build-arg UV_HTTP_TIMEOUT=900 放寬。
 ARG UV_HTTP_TIMEOUT=300
-# torch 的 CUDA variant（cu128/cu130...），須與 CUDA_BASE_IMAGE 配對。
-ARG TORCH_CUDA_VARIANT=cu128
-# flash-attn 版本：2.6.3（cu128 現行，需手工 Blackwell patch）或
-# 2.8.3+（官方支援 Blackwell/CUDA 13，免 patch）。wheel 的 Release tag
-# 依 CUDA variant 分流（flash-attn-wheels-cu128 / -cu130），因為不同
-# CUDA ABI 編出的 wheel 檔名相同但不相容。
-ARG FLASH_ATTN_VERSION=2.6.3
+ARG TORCH_CUDA_VARIANT=cu130
+# 2.6.3 需手工 patch 才認得 Blackwell，2.7.4+ 原生支援。預編 wheel 的
+# Release tag 依 CUDA variant 分流，因為兩者的 wheel 檔名相同但 ABI 不相容。
+ARG FLASH_ATTN_VERSION=2.8.3
+# torch 不釘版會隨 CDN 漂移（實測 2.11→2.13），與 Release 上按特定
+# ABI 編的 flash-attn wheel 形成賭注式組合。釘在 A4000 已實測驗證的版本。
+ARG TORCH_VERSION=2.13.0
 ENV UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT}" \
     TORCH_CUDA_ARCH_LIST="${TORCH_ARCH_LIST}" \
     FLASH_ATTN_CUDA_ARCHS="${TORCH_ARCH_LIST}" \
@@ -81,13 +82,15 @@ RUN . /opt/venv/bin/activate && \
     [ "$jobs" -le "$cores" ] || jobs="$cores" && \
     export MAX_JOBS="$jobs" && \
     echo "flash-attn build: MAX_JOBS=$MAX_JOBS (cores=$cores)" && \
-    uv pip install --no-cache-dir torch torchaudio --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT}" --find-links /tmp/wheels && \
+    uv pip install --no-cache-dir "torch==${TORCH_VERSION}" "torchaudio==${TORCH_VERSION}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT}" --find-links /tmp/wheels && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
     WHEEL_NAME="flash_attn-${FLASH_ATTN_VERSION}-cp310-cp310-linux_$(uname -m).whl" && \
     if ! ls "/tmp/wheels/${WHEEL_NAME}" >/dev/null 2>&1; then \
-        curl -fsSL --retry 3 -o "/tmp/wheels/${WHEEL_NAME}" \
+        echo "flash-attn: fetching prebuilt ${WHEEL_NAME} from GH Release" && \
+        { curl -fsSL --retry 3 -o "/tmp/wheels/${WHEEL_NAME}" \
             "https://github.com/CreateIntelligens/VoxCPM360/releases/download/flash-attn-wheels-${TORCH_CUDA_VARIANT}/${WHEEL_NAME}" \
-            || rm -f "/tmp/wheels/${WHEEL_NAME}"; \
+            || { echo "flash-attn: wheel download failed, falling back to a ~1h source build"; \
+                 rm -f "/tmp/wheels/${WHEEL_NAME}"; }; }; \
     fi && \
     if ls "/tmp/wheels/${WHEEL_NAME}" >/dev/null 2>&1; then \
         echo "flash-attn: installing prebuilt wheel ${WHEEL_NAME}, skipping compilation" && \
