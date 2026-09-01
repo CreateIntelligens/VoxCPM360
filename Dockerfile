@@ -69,6 +69,8 @@ ARG FLASH_ATTN_VERSION=2.8.3
 # torch 不釘版會隨 CDN 漂移（實測 2.11→2.13），與 Release 上按特定
 # ABI 編的 flash-attn wheel 形成賭注式組合。釘在 A4000 已實測驗證的版本。
 ARG TORCH_VERSION=2.13.0
+# torchaudio 版號自 2.12 起與 torch 脫鉤（cu130 index 最新為 2.11.0）
+ARG TORCHAUDIO_VERSION=2.11.0
 ENV UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT}" \
     TORCH_CUDA_ARCH_LIST="${TORCH_ARCH_LIST}" \
     FLASH_ATTN_CUDA_ARCHS="${TORCH_ARCH_LIST}" \
@@ -82,7 +84,7 @@ RUN . /opt/venv/bin/activate && \
     [ "$jobs" -le "$cores" ] || jobs="$cores" && \
     export MAX_JOBS="$jobs" && \
     echo "flash-attn build: MAX_JOBS=$MAX_JOBS (cores=$cores)" && \
-    uv pip install --no-cache-dir "torch==${TORCH_VERSION}" "torchaudio==${TORCH_VERSION}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT}" --find-links /tmp/wheels && \
+    uv pip install --no-cache-dir "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT}" --find-links /tmp/wheels && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
     WHEEL_NAME="flash_attn-${FLASH_ATTN_VERSION}-cp310-cp310-linux_$(uname -m).whl" && \
     if ! ls "/tmp/wheels/${WHEEL_NAME}" >/dev/null 2>&1; then \

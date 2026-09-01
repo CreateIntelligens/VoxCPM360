@@ -20,6 +20,7 @@ services:
         TORCH_CUDA_VARIANT: ${TORCH_CUDA_VARIANT:-cu130}
         FLASH_ATTN_VERSION: ${FLASH_ATTN_VERSION:-2.8.3}
         TORCH_VERSION: ${TORCH_VERSION:-2.13.0}
+        TORCHAUDIO_VERSION: ${TORCHAUDIO_VERSION:-2.11.0}
     image: voxcpm360-app
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     container_name: voxcpm_app
