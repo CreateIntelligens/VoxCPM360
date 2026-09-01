@@ -113,7 +113,7 @@ RUN . /opt/venv/bin/activate && \
 COPY pyproject.toml uv.lock ./
 RUN . /opt/venv/bin/activate && \
     uv pip install --no-cache-dir -r pyproject.toml && \
-    uv pip install --no-cache-dir nano-vllm-voxcpm && \
+    uv pip install --no-cache-dir nano-vllm-voxcpm==2.0.4 && \
     uv pip install --no-cache-dir -r pyproject.toml --extra test
 
 # 編譯後把 wheel 導出保存（每個 CPU 架構跑一次即可，之後所有機器免編譯）：

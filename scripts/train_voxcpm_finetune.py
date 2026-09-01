@@ -799,6 +799,10 @@ def generate_sample_audio(
                 log(f"[Warning] Failed to restore model state: {e}")
 
 
+def _load_torch_checkpoint(path: Path) -> dict:
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
 def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
     """
     Load the latest checkpoint if it exists.
@@ -826,7 +830,7 @@ def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
 
                 state_dict = load_file(str(lora_weights_path))
             else:
-                ckpt = torch.load(lora_weights_path, map_location="cpu")
+                ckpt = _load_torch_checkpoint(lora_weights_path)
                 state_dict = ckpt.get("state_dict", ckpt)
 
             unwrapped.load_state_dict(state_dict, strict=False)
@@ -844,7 +848,7 @@ def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
 
                 state_dict = load_file(str(model_path))
             else:
-                ckpt = torch.load(model_path, map_location="cpu")
+                ckpt = _load_torch_checkpoint(model_path)
                 state_dict = ckpt.get("state_dict", ckpt)
 
             unwrapped.load_state_dict(state_dict, strict=False)
@@ -854,14 +858,14 @@ def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
     # Load optimizer state
     optimizer_path = latest_folder / "optimizer.pth"
     if optimizer_path.exists():
-        optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
+        optimizer.load_state_dict(_load_torch_checkpoint(optimizer_path))
         if rank == 0:
             print(f"Loaded optimizer state from {optimizer_path}", file=sys.stderr)
 
     # Load scheduler state
     scheduler_path = latest_folder / "scheduler.pth"
     if scheduler_path.exists():
-        scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
+        scheduler.load_state_dict(_load_torch_checkpoint(scheduler_path))
         if rank == 0:
             print(f"Loaded scheduler state from {scheduler_path}", file=sys.stderr)
 

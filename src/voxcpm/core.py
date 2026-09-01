@@ -1,14 +1,16 @@
-import os
-import sys
-import re
 import json
+import os
+import re
+import sys
 import tempfile
-import numpy as np
 from typing import Generator, Optional
+
 from huggingface_hub import snapshot_download
-from .model.voxcpm import VoxCPMModel, LoRAConfig
-from .model.voxcpm2 import VoxCPM2Model
+import numpy as np
+
 from .model.utils import next_and_close
+from .model.voxcpm import LoRAConfig, VoxCPMModel
+from .model.voxcpm2 import VoxCPM2Model
 
 
 class VoxCPM:
@@ -45,14 +47,32 @@ class VoxCPM:
             file=sys.stderr,
         )
 
-        # If lora_weights_path is provided but no lora_config, create a default one
+        # LoRA 的 rank/alpha 會改變權重形狀；優先沿用 checkpoint 保存的設定，
+        # 避免用預設 rank 載入非預設 LoRA 時才在 state_dict 階段失敗。
         if lora_weights_path is not None and lora_config is None:
-            lora_config = LoRAConfig(
-                enable_lm=True,
-                enable_dit=True,
-                enable_proj=False,
+            lora_config_path = os.path.join(lora_weights_path, "lora_config.json")
+            has_saved_config = os.path.isdir(lora_weights_path) and os.path.isfile(
+                lora_config_path
             )
-            print(f"Auto-created default LoRAConfig for loading weights from: {lora_weights_path}", file=sys.stderr)
+            if has_saved_config:
+                with open(lora_config_path, "r", encoding="utf-8") as config_file:
+                    saved_config = json.load(config_file)
+                lora_config = LoRAConfig(**saved_config["lora_config"])
+                print(
+                    f"Loaded LoRAConfig from: {lora_config_path}",
+                    file=sys.stderr,
+                )
+            else:
+                lora_config = LoRAConfig(
+                    enable_lm=True,
+                    enable_dit=True,
+                    enable_proj=False,
+                )
+                print(
+                    "Auto-created default LoRAConfig for loading weights "
+                    f"from: {lora_weights_path}",
+                    file=sys.stderr,
+                )
 
         # Determine model type from config.json architecture field
         config_path = os.path.join(voxcpm_model_path, "config.json")

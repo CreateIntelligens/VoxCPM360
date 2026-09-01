@@ -148,3 +148,51 @@ def test_load_lora_weights_rejects_malicious_pickle_payloads(monkeypatch, tmp_pa
         cls.load_lora_weights(DummyModel(), str(ckpt_path), device="cpu")
 
     assert not marker_path.exists()
+
+
+def test_voxcpm_loads_lora_config_saved_with_checkpoint(monkeypatch, tmp_path):
+    bootstrap_repo_modules(monkeypatch)
+    core = _load_module("voxcpm.core", SRC / "voxcpm" / "core.py")
+    captured = {}
+
+    class FakeLoRAConfig:
+        def __init__(self, **kwargs):
+            self.values = kwargs
+
+    class FakeTTSModel:
+        sample_rate = 16_000
+
+        @classmethod
+        def from_local(cls, *args, **kwargs):
+            captured["lora_config"] = kwargs["lora_config"]
+            return cls()
+
+        def load_lora_weights(self, path):
+            captured["weights_path"] = path
+            return [], []
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        '{"architecture": "voxcpm2"}',
+        encoding="utf-8",
+    )
+    checkpoint_dir = tmp_path / "lora"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "lora_config.json").write_text(
+        '{"lora_config": {"r": 32, "alpha": 64}}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(core, "LoRAConfig", FakeLoRAConfig)
+    monkeypatch.setattr(core, "VoxCPM2Model", FakeTTSModel)
+
+    core.VoxCPM(
+        str(model_dir),
+        enable_denoiser=False,
+        optimize=False,
+        lora_weights_path=str(checkpoint_dir),
+    )
+
+    assert captured["lora_config"].values == {"r": 32, "alpha": 64}
+    assert captured["weights_path"] == str(checkpoint_dir)
