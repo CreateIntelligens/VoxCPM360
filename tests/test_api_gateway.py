@@ -1865,6 +1865,21 @@ def test_full_native_checkpoint_switches_runtime(monkeypatch, tmp_path):
         assert full_demo.calls[0]["model_selection"] == "__base__"
 
 
+def test_demo_rejects_non_cuda_device(monkeypatch, tmp_path):
+    """nano-vLLM 沒有 CPU 路徑，放行只會讓服務誤報 device 卻仍佔 GPU 0。"""
+    import app as app_module
+
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setattr(app_module, "resolve_runtime_device", lambda *_: "cpu")
+    monkeypatch.setattr(
+        app_module, "_HISTORY_DIR", tmp_path / "history", raising=False
+    )
+
+    demo = app_module.VoxCPMDemo(device="cpu")
+    with pytest.raises(ValueError, match="requires CUDA"):
+        demo.get_or_load_voxcpm()
+
+
 def test_dynamic_batch_sizer_sizes_from_cgroup_not_cuda(monkeypatch):
     """合批規模看 cgroup；CUDA free 是 KV cache 之外的餘量，不是 per-item 池。"""
     gib = 1024**3
