@@ -62,6 +62,10 @@ services:
       - TTS_API_KEY=${TTS_API_KEY:-}
       # cu130 的 nvrtc 原生支援 sm_121；退回 cu128 棧時 GB10 需設 0。
       - PYTORCH_JIT=${PYTORCH_JIT:-1}
+      # 無值形式：.env 有設才注入容器（cuBLAS 只接受 :4096:8/:16:8，
+      # 用 ${VAR:-} 會讓沒設的機器拿到空字串＝無效設定）。
+      # 用途：強制 cuBLAS 確定性演算法（GB10 seed 決定性調查）。
+      - CUBLAS_WORKSPACE_CONFIG
     # Pre-download models first, then start the unified API plus legacy Gradio.
     command: bash -c "python scripts/download_models.py --model-id ${MODEL_ID:-openbmb/VoxCPM2} && python api.py --port 8000"
     volumes:
