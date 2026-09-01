@@ -534,7 +534,7 @@ python lora_ft_webui.py   # 然后打开 http://localhost:7860
 
 > **完整指南 →** [微调文档](https://voxcpm.readthedocs.io/zh-cn/latest/finetuning/finetune.html)（数据准备、配置、训练、LoRA 热切换、常见问题）
 >
-> **本项目繁体中文指南 →** [VoxCPM 训练指南](README_TRAINING_zh-TW.md)
+> **本项目繁体中文指南 →** [VoxCPM 训练指南](docs/TRAINING_GUIDE_zh-TW.md)
 
 ---
 
