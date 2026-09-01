@@ -7,6 +7,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from typing import Any, Optional, Tuple
 
@@ -915,6 +916,51 @@ class VoxCPMDemo:
                 }
             ]
         )[0]
+
+    def warmup_voxcpm(
+        self,
+        *,
+        reference_path: Optional[str] = None,
+        prompt_text: str = "",
+    ) -> None:
+        """Run the common inference paths once before accepting traffic."""
+        started_at = time.perf_counter()
+        logger.info("Starting VoxCPM2 inference warmup")
+
+        self.generate_tts_audio(
+            text_input="暖機。",
+            do_normalize=False,
+            denoise=False,
+            seed=0,
+        )
+        logger.info(
+            "VoxCPM2 no-reference warmup completed in %.2fs",
+            time.perf_counter() - started_at,
+        )
+
+        if reference_path:
+            reference_started_at = time.perf_counter()
+            self.generate_tts_audio(
+                text_input="暖機。",
+                reference_wav_path_input=reference_path,
+                prompt_text=prompt_text,
+                do_normalize=False,
+                denoise=False,
+                seed=0,
+            )
+            logger.info(
+                "VoxCPM2 reference warmup completed in %.2fs",
+                time.perf_counter() - reference_started_at,
+            )
+        else:
+            logger.warning(
+                "Default reference audio is unavailable; skipping reference warmup"
+            )
+
+        logger.info(
+            "VoxCPM2 inference warmup completed in %.2fs",
+            time.perf_counter() - started_at,
+        )
 
 
 # ---------- UI ----------

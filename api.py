@@ -49,6 +49,18 @@ from gateway.gateway import TTSGateway
 from gateway.castvoice import CastVoiceSynthesizeRequest, CastVoiceBatchItemRequest, CastVoiceBatchRequest, _CastVoiceError, _CastVoiceBatchItem, _CastVoiceBatch, DynamicBatchSizer, CastVoiceBatchManager
 
 
+def _default_warmup_reference() -> tuple[str | None, str]:
+    preset = _find_reference_preset(_DEFAULT_REFERENCE_PRESET_ID)
+    if preset is None:
+        return None, ""
+
+    preset_path = _REFERENCE_AUDIO_DIR / preset["filename"]
+    if not preset_path.is_file():
+        return None, ""
+
+    return str(preset_path), preset.get("prompt_text", "")
+
+
 
 def create_app(
     demo: VoxCPMDemo | None = None,
@@ -67,6 +79,17 @@ def create_app(
         if os.environ.get("VOXCPM_PRELOAD", "true").lower() == "true":
             logger.info("Preloading VoxCPM2 runtime")
             await asyncio.to_thread(demo.get_or_load_voxcpm)
+            reference_path, prompt_text = _default_warmup_reference()
+            try:
+                await asyncio.to_thread(
+                    demo.warmup_voxcpm,
+                    reference_path=reference_path,
+                    prompt_text=prompt_text,
+                )
+            except Exception:
+                logger.exception(
+                    "VoxCPM2 inference warmup failed; continuing startup"
+                )
         app.state.castvoice_batch_manager.start()
         try:
             yield

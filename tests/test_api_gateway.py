@@ -45,6 +45,7 @@ class FakeDemo:
         self.device = device
         self.loads = 0
         self.stops = 0
+        self.warmups = []
 
     def get_or_load_voxcpm(self):
         self.loads += 1
@@ -52,6 +53,9 @@ class FakeDemo:
 
     def stop_voxcpm(self):
         self.stops += 1
+
+    def warmup_voxcpm(self, **kwargs):
+        self.warmups.append(kwargs)
 
     def generate_tts_audio(self, **kwargs):
         self.calls.append(kwargs)
@@ -238,6 +242,80 @@ def test_catalog_exposes_native_engine(monkeypatch):
     # voxcpm2 的 per-request inference_timesteps 不生效（引擎建構時固定），
     # catalog 必須誠實揭露讓前端隱藏該欄位。
     assert payload["engines"][0]["capabilities"]["inference_timesteps"] is False
+
+
+def test_preload_warms_common_inference_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "true")
+    monkeypatch.setattr(api, "_REFERENCE_AUDIO_DIR", tmp_path)
+    preset = api._find_reference_preset(api._DEFAULT_REFERENCE_PRESET_ID)
+    assert preset is not None
+    preset_path = tmp_path / preset["filename"]
+    preset_path.write_bytes(b"audio")
+    demo = FakeDemo()
+    app = api.create_app(
+        demo,
+        barbet_runtime=FakeBarbetRuntime(),
+        mount_legacy=False,
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/api/v1/catalog").status_code == 200
+
+    assert demo.loads == 1
+    assert demo.warmups == [
+        {
+            "reference_path": str(preset_path),
+            "prompt_text": preset["prompt_text"],
+        }
+    ]
+
+
+def test_warmup_runs_without_and_with_reference():
+    demo = FakeDemo()
+
+    api.VoxCPMDemo.warmup_voxcpm(
+        demo,
+        reference_path="/reference.wav",
+        prompt_text="參考逐字稿",
+    )
+
+    assert demo.calls == [
+        {
+            "text_input": "暖機。",
+            "do_normalize": False,
+            "denoise": False,
+            "seed": 0,
+        },
+        {
+            "text_input": "暖機。",
+            "reference_wav_path_input": "/reference.wav",
+            "prompt_text": "參考逐字稿",
+            "do_normalize": False,
+            "denoise": False,
+            "seed": 0,
+        },
+    ]
+
+
+def test_warmup_failure_does_not_block_startup(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "true")
+    demo = FakeDemo()
+
+    def fail_warmup(**_kwargs):
+        raise RuntimeError("warmup failed")
+
+    demo.warmup_voxcpm = fail_warmup
+    app = api.create_app(
+        demo,
+        barbet_runtime=FakeBarbetRuntime(),
+        mount_legacy=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/catalog")
+
+    assert response.status_code == 200
+    assert demo.loads == 1
 
 
 def test_catalog_namespaces_lora_and_accepts_legacy_alias(monkeypatch):
