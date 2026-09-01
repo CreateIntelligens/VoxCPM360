@@ -189,9 +189,38 @@ class DynamicBatchSizer:
         ]
         return min(headrooms) if headrooms else None
 
+    def _batchable_bytes(self) -> int | None:
+        """Headroom that scales with chunk size: container RAM, not VRAM.
+
+        nano-vLLM allocates its KV cache once at startup, so a larger chunk
+        packs more sequences into that fixed block instead of claiming more
+        VRAM. Dividing CUDA free bytes per item would peg small cards at
+        chunk size 1 — and since the per-item estimate only improves after a
+        successful multi-item chunk, that floor never lifts.
+        """
+        cgroup = self._cgroup_headroom()
+        if cgroup is not None:
+            return cgroup
+        return self._cuda_headroom()
+
+    def _cuda_guard_size(self) -> int | None:
+        """Clamp chunks to 1 while VRAM is scarce, else leave sizing alone.
+
+        Guards against co-tenants on the same card (a second container, a
+        training job) that the cgroup ceiling cannot see.
+        """
+        cuda_free = self._cuda_headroom()
+        if cuda_free is None:
+            return None
+        if cuda_free > self._reserve_bytes:
+            return None
+        return 1
+
     def recommend(self, pending_items: int) -> int:
-        available = self._available_bytes()
-        self._last_available_bytes = available
+        available = self._batchable_bytes()
+        # Sizing reads container RAM; the learning baseline keeps both ceilings
+        # so observe_success still notices VRAM the chunk actually consumed.
+        self._last_available_bytes = self._available_bytes()
         if available is None:
             size = 1
             available_bytes = 0
@@ -199,6 +228,9 @@ class DynamicBatchSizer:
             available_bytes = available
             usable_bytes = max(0, available_bytes - self._reserve_bytes)
             size = max(1, usable_bytes // self._bytes_per_item)
+        cuda_guard = self._cuda_guard_size()
+        if cuda_guard is not None:
+            size = min(size, cuda_guard)
         selected = min(
             pending_items,
             self._max_concurrency,
@@ -208,7 +240,7 @@ class DynamicBatchSizer:
         logger.info(
             "castvoice.batch stage=sized pending=%d selected=%d "
             "available_gib=%.2f reserve_gib=%.2f estimated_item_gib=%.2f "
-            "performance_cap=%d max=%d",
+            "performance_cap=%d max=%d cuda_guard=%s",
             pending_items,
             selected,
             available_bytes / self._GIB,
@@ -216,6 +248,7 @@ class DynamicBatchSizer:
             self._bytes_per_item / self._GIB,
             self._performance_cap,
             self._max_concurrency,
+            cuda_guard if cuda_guard is not None else "off",
         )
         return selected
 
