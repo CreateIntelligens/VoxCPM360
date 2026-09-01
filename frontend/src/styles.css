@@ -915,6 +915,41 @@ select:focus {
   opacity: 0.55;
 }
 
+.seed-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+}
+
+.seed-reroll {
+  min-block-size: 2.625rem;
+  padding-inline: 0.875rem;
+  border: 1px solid var(--line);
+  border-radius: 0.625rem;
+  background: var(--panel-soft);
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.seed-reroll:hover:not(:disabled) {
+  border-color: var(--muted);
+  background: var(--line-soft);
+}
+
+.seed-reroll:active:not(:disabled) {
+  transform: translateY(0.0625rem);
+}
+
+.seed-reroll:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .field-helper {
   display: block;
   margin-top: 6px;
@@ -1152,7 +1187,11 @@ input[type="range"] {
 }
 
 .toggle-row input {
-  display: none;
+  position: absolute;
+  inline-size: 0.0625rem;
+  block-size: 0.0625rem;
+  opacity: 0;
+  clip-path: inset(50%);
 }
 
 .toggle-switch {
@@ -1177,10 +1216,6 @@ input[type="range"] {
   transition: transform 150ms ease;
 }
 
-.toggle-row input:checked + .toggle-switch {
-  background: var(--accent);
-}
-
 .toggle-row input:checked + .toggle-switch::after {
   background: #1e100c;
   transform: translateX(15px);
@@ -1188,6 +1223,51 @@ input[type="range"] {
 
 .toggle-row input:disabled + .toggle-switch {
   opacity: 0.4;
+}
+
+.toggle-row:hover input:not(:disabled) + .toggle-switch {
+  background: var(--muted);
+}
+
+.toggle-row input:checked + .toggle-switch,
+.toggle-row:hover input:checked:not(:disabled) + .toggle-switch {
+  background: var(--accent);
+}
+
+.toggle-row input:focus-visible + .toggle-switch {
+  outline: 0.125rem solid var(--accent);
+  outline-offset: 0.125rem;
+}
+
+.toggle-row:active input:not(:disabled) + .toggle-switch {
+  transform: scale(0.96);
+}
+
+.toggle-row:has(input:disabled) {
+  cursor: not-allowed;
+}
+
+.streaming-toggle {
+  margin-block-start: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line-soft);
+  border-radius: 0.75rem;
+  background: var(--panel-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toggle-switch,
+  .toggle-switch::after {
+    transition: none;
+  }
+
+  .toggle-row:active input:not(:disabled) + .toggle-switch {
+    transform: none;
+  }
+
+  .seed-reroll:active:not(:disabled) {
+    transform: none;
+  }
 }
 
 .toggle-row strong,

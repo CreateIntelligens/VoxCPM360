@@ -22,6 +22,7 @@ export interface EngineCapabilities {
   reference_audio: boolean;
   speaker_selection: boolean;
   seed: boolean;
+  streaming?: boolean;
 }
 
 export interface Engine {

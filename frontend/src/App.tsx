@@ -7,6 +7,7 @@ import {
   CircleAlert,
   Clock3,
   Cpu,
+  Dices,
   Download,
   FileAudio,
   Gauge,
@@ -28,7 +29,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { fetchCatalog, fetchGenerationHistory, synthesize } from "./api";
+import {
+  fetchCatalog,
+  fetchGenerationHistory,
+  synthesize,
+  synthesizeStream,
+  type StreamingAudioChunk,
+} from "./api";
 import ModelComparison from "./ModelComparison";
 import { usePersistentState } from "./usePersistentState";
 import {
@@ -37,16 +44,115 @@ import {
   type Engine,
   type HistoryItem,
   type ModelVersion,
+  type ReferenceAudioPreset,
 } from "./types";
 
 const DEFAULT_TEXT = "逐家好，歡迎使用 VoxCPM 360 多模型語音工作室。";
 const HISTORY_LIMIT = 100;
+
+class StreamingAudioPlayer {
+  private readonly context = new AudioContext();
+  private readonly sources = new Set<AudioBufferSourceNode>();
+  private scheduledAt = 0;
+  private complete = false;
+  private stopped = false;
+
+  async prepare(): Promise<void> {
+    if (this.context.state === "suspended") {
+      await this.context.resume();
+    }
+    this.scheduledAt = this.context.currentTime + 0.08;
+  }
+
+  enqueue({ samples, sampleRate }: StreamingAudioChunk): void {
+    if (this.stopped || samples.length === 0) {
+      return;
+    }
+    const buffer = this.context.createBuffer(1, samples.length, sampleRate);
+    buffer.copyToChannel(samples, 0);
+    const source = this.context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.context.destination);
+    source.onended = () => {
+      this.sources.delete(source);
+      this.closeWhenIdle();
+    };
+    this.sources.add(source);
+    const startAt = Math.max(
+      this.scheduledAt,
+      this.context.currentTime + 0.04,
+    );
+    source.start(startAt);
+    this.scheduledAt = startAt + buffer.duration;
+  }
+
+  finish(): void {
+    this.complete = true;
+    this.closeWhenIdle();
+  }
+
+  stop(): void {
+    if (this.stopped) {
+      return;
+    }
+    this.stopped = true;
+    this.sources.forEach((source) => {
+      try {
+        source.stop();
+      } catch {
+        // 已自然播放完畢的 source 不需要再停止。
+      }
+    });
+    this.sources.clear();
+    void this.context.close();
+  }
+
+  private closeWhenIdle(): void {
+    if (this.complete && this.sources.size === 0 && !this.stopped) {
+      this.stopped = true;
+      void this.context.close();
+    }
+  }
+}
 
 function createHistoryId(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
   }
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function createRandomSeed(): string {
+  if (typeof globalThis.crypto?.getRandomValues === "function") {
+    const value = new Uint32Array(1);
+    globalThis.crypto.getRandomValues(value);
+    return String(value[0] & 0x7fffffff);
+  }
+  return String(Math.floor(Math.random() * 0x80000000));
+}
+
+function seedHelpText(streamingActive: boolean, seed: string): string {
+  if (streamingActive) {
+    return "串流端點目前不套用指定種子";
+  }
+  if (seed) {
+    return `目前固定為 ${seed}；重骰會換一組結果`;
+  }
+  return "留空則每次隨機；重骰後可用同一種子重現結果";
+}
+
+function formatReferenceLabel(
+  referenceAudio: File | undefined,
+  preset: ReferenceAudioPreset | undefined,
+): string {
+  if (referenceAudio) {
+    const sizeMb = (referenceAudio.size / 1024 / 1024).toFixed(2);
+    return `自訂：${referenceAudio.name}（${sizeMb} MB）`;
+  }
+  if (preset) {
+    return `${preset.label} · ${preset.description}`;
+  }
+  return "未指定參考音";
 }
 
 function App() {
@@ -87,6 +193,7 @@ function App() {
   const [speed, setSpeed] = usePersistentState("speech-speed", 1);
   const [normalize, setNormalize] = usePersistentState("normalize-v2", true);
   const [denoise, setDenoise] = usePersistentState("denoise", false);
+  const [streaming, setStreaming] = usePersistentState("streaming", false);
   const [seed, setSeed] = usePersistentState("seed", "");
   const [advancedOpen, setAdvancedOpen] = usePersistentState(
     "advanced-open",
@@ -98,6 +205,7 @@ function App() {
   const [autoPlayHistoryId, setAutoPlayHistoryId] = useState("");
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const audioUrlsRef = useRef(new Set<string>());
+  const streamingPlayerRef = useRef<StreamingAudioPlayer | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const selectedEngine = useMemo(
@@ -120,6 +228,9 @@ function App() {
   const supportsPromptTranscript = Boolean(
     selectedEngine?.capabilities.prompt_transcript,
   );
+  const supportsStreaming = Boolean(selectedEngine?.capabilities.streaming);
+  const streamingActive = streaming && supportsStreaming;
+  const effectiveSpeed = streamingActive ? 1 : speed;
   const selectedReferencePreset = useMemo(
     () =>
       catalog.reference_presets.find(
@@ -246,6 +357,7 @@ function App() {
   useEffect(() => {
     const audioUrls = audioUrlsRef.current;
     return () => {
+      streamingPlayerRef.current?.stop();
       audioUrls.forEach((audioUrl) => URL.revokeObjectURL(audioUrl));
       audioUrls.clear();
     };
@@ -314,8 +426,13 @@ function App() {
 
     setGenerating(true);
     setGenerateError("");
+    streamingPlayerRef.current?.stop();
+    let streamPlayer: StreamingAudioPlayer | null = null;
     try {
-      const result = await synthesize({
+      streamPlayer = streamingActive ? new StreamingAudioPlayer() : null;
+      streamingPlayerRef.current = streamPlayer;
+      await streamPlayer?.prepare();
+      const request = {
         engineId: selectedEngine.id,
         modelId: selectedModel.id,
         text: targetText,
@@ -325,12 +442,18 @@ function App() {
         speakerId,
         cfgValue,
         inferenceTimesteps: steps,
-        speed,
+        speed: effectiveSpeed,
         normalize,
         denoise,
-        seed: seed ? Number(seed) : undefined,
+        seed: !streamingActive && seed ? Number(seed) : undefined,
         referenceAudio,
-      });
+      };
+      const result = streamingActive
+        ? await synthesizeStream(request, (chunk) =>
+            streamPlayer?.enqueue(chunk),
+          )
+        : await synthesize(request);
+      streamPlayer?.finish();
       const audioUrl = URL.createObjectURL(result.blob);
       audioUrlsRef.current.add(audioUrl);
       const item: HistoryItem = {
@@ -340,16 +463,15 @@ function App() {
         engineLabel: selectedEngine.label,
         modelId: result.modelId,
         modelLabel: selectedModel.label,
-        referenceLabel: referenceAudio
-          ? `自訂：${referenceAudio.name}（${(referenceAudio.size / 1024 / 1024).toFixed(2)} MB）`
-          : selectedReferencePreset
-            ? `${selectedReferencePreset.label} · ${selectedReferencePreset.description}`
-            : "未指定參考音",
+        referenceLabel: formatReferenceLabel(
+          referenceAudio,
+          selectedReferencePreset,
+        ),
         speakerLabel: selectedSpeaker?.name,
         seed: result.seed,
         cfgValue,
         inferenceTimesteps: steps,
-        speed,
+        speed: effectiveSpeed,
         normalize,
         denoise,
         promptText: promptText.trim() || undefined,
@@ -359,7 +481,7 @@ function App() {
         durationLabel: result.durationLabel,
       };
       setCurrentHistoryId(item.id);
-      setAutoPlayHistoryId(item.id);
+      setAutoPlayHistoryId(streamingActive ? "" : item.id);
       setHistory((previous) => {
         const next = [item, ...previous];
         next.slice(HISTORY_LIMIT).forEach((old) => {
@@ -369,6 +491,7 @@ function App() {
         return next.slice(0, HISTORY_LIMIT);
       });
     } catch (error) {
+      streamPlayer?.stop();
       setGenerateError(
         error instanceof Error ? error.message : "語音生成失敗",
       );
@@ -784,13 +907,36 @@ function App() {
             {selectedEngine?.capabilities.seed && (
               <div className="form-row single-field">
                 <label>
-                  <span className="field-label">隨機種子</span>
-                  <input
-                    type="number"
-                    value={seed}
-                    onChange={(event) => setSeed(event.target.value)}
-                    placeholder="留空則隨機"
-                  />
+                  <span className="field-label">
+                    隨機種子{streamingActive ? "（串流停用）" : ""}
+                  </span>
+                  <span className="seed-control">
+                    <input
+                      type="number"
+                      min="0"
+                      max="2147483647"
+                      step="1"
+                      value={seed}
+                      onChange={(event) => setSeed(event.target.value)}
+                      placeholder={
+                        streamingActive ? "串流模式不支援" : "留空則隨機"
+                      }
+                      disabled={streamingActive}
+                    />
+                    <button
+                      type="button"
+                      className="seed-reroll"
+                      onClick={() => setSeed(createRandomSeed())}
+                      disabled={streamingActive}
+                      title="產生新的隨機種子"
+                    >
+                      <Dices size={16} />
+                      重骰
+                    </button>
+                  </span>
+                  <small className="field-helper" aria-live="polite">
+                    {seedHelpText(streamingActive, seed)}
+                  </small>
                 </label>
               </div>
             )}
@@ -842,16 +988,19 @@ function App() {
                 </label>
                 <label className="range-field">
                   <span>
-                    <span className="field-label">語速（後製變速）</span>
-                    <output>{speed.toFixed(2)}x</output>
+                    <span className="field-label">
+                      語速（{streamingActive ? "串流固定" : "後製變速"}）
+                    </span>
+                    <output>{effectiveSpeed.toFixed(2)}x</output>
                   </span>
                   <input
                     type="range"
                     min="0.5"
                     max="2"
                     step="0.05"
-                    value={speed}
+                    value={effectiveSpeed}
                     onChange={(event) => setSpeed(Number(event.target.value))}
+                    disabled={streamingActive}
                   />
                 </label>
                 <label className="toggle-row">
@@ -882,6 +1031,26 @@ function App() {
               </div>
             )}
 
+            <label className="toggle-row streaming-toggle">
+              <input
+                type="checkbox"
+                role="switch"
+                checked={streamingActive}
+                onChange={(event) => setStreaming(event.target.checked)}
+                disabled={!supportsStreaming || generating}
+                aria-describedby="streaming-help"
+              />
+              <span className="toggle-switch" />
+              <span>
+                <strong>串流生成</strong>
+                <small id="streaming-help">
+                  {supportsStreaming
+                    ? "邊生成邊播放；語速固定 1.00x，隨機種子停用"
+                    : "目前選取的引擎不支援串流"}
+                </small>
+              </span>
+            </label>
+
             {generateError && (
               <div className="alert error-alert compact">
                 <CircleAlert size={17} />
@@ -902,7 +1071,7 @@ function App() {
               {generating ? (
                 <>
                   <LoaderCircle size={19} className="spin" />
-                  正在生成語音…
+                  {streamingActive ? "正在串流播放…" : "正在生成語音…"}
                 </>
               ) : (
                 <>
