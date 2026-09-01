@@ -19,6 +19,7 @@ services:
         CUDA_BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04}
         TORCH_CUDA_VARIANT: ${TORCH_CUDA_VARIANT:-cu130}
         FLASH_ATTN_VERSION: ${FLASH_ATTN_VERSION:-2.8.3}
+        TORCH_VERSION: ${TORCH_VERSION:-2.13.0}
     image: voxcpm360-app
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     container_name: voxcpm_app
@@ -36,8 +37,8 @@ services:
       - VOXCPM_MAX_PENDING_SYNTHESIS=${VOXCPM_MAX_PENDING_SYNTHESIS:-2}
       - VOXCPM_QUEUE_TIMEOUT_SECONDS=${VOXCPM_QUEUE_TIMEOUT_SECONDS:-120}
       - VOXCPM_INTERACTIVE_BATCH_MAX=${VOXCPM_INTERACTIVE_BATCH_MAX:-4}
-      # 併發 session 總量池；loop 專屬執行緒前置完成前必須為 1
-      # （否則併發觸發 "event loop is already running" 崩潰）。
+      # 併發 session 總量池（批次與串流共搶）。loop 執行緒化已完成，
+      # 兩台 prod 實際跑 16（.env 覆寫）；預設 1 僅為新機器的保守起點。
       - VOXCPM_ENGINE_CONCURRENCY=${VOXCPM_ENGINE_CONCURRENCY:-1}
       # Match the upstream VoxCPM bad-case guard: cap audio generation relative
       # to target text length so a missed EOS cannot always run to 2000 tokens.
