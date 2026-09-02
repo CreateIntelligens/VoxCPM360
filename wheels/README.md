@@ -24,8 +24,19 @@ docker buildx build --target flash-wheel \
   --build-arg TORCH_CUDA_VARIANT=cu130 \
   --build-arg FLASH_ATTN_VERSION=2.8.3 \
   --build-arg TORCH_ARCH_LIST="8.6;9.0;12.0" \
+  --build-arg TORCH_VERSION=2.13.0 \
   -o type=local,dest=wheels-out .
 ```
+
+`TORCH_VERSION` 決定 wheel 綁定的 ABI，務必與部署時安裝的 torch 一致 ——
+兩者不符會在 `import flash_attn` 當場失敗。各棧的對應版本：
+
+| CUDA variant | flash-attn | torch | torchaudio |
+|---|---|---|---|
+| cu130 | 2.8.3 | 2.13.0 | 2.11.0 |
+| cu128 | 2.6.3 | 2.11.0 | 2.11.0 |
+
+torchaudio 的版號自 2.12 起與 torch 脫鉤，兩者不必同號。
 
 導出後上傳到對應的 Release，其他機器即可免編譯：
 
