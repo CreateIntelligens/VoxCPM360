@@ -171,7 +171,7 @@ function App() {
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState("");
   const [engineId, setEngineId] = usePersistentState("engine-id", "");
-  const [modelId, setModelId] = usePersistentState("model-id", "");
+  const [modelId, setModelId] = usePersistentState("model-id-v3", "");
   const [speakerId, setSpeakerId] = usePersistentState("speaker-id", "");
   const [text, setText] = usePersistentState("target-text", DEFAULT_TEXT);
   const [controlInstruction, setControlInstruction] = usePersistentState(
@@ -320,6 +320,8 @@ function App() {
       setEngineId(nextEngine?.id || "");
       const nextModel =
         nextEngine?.models.find((model) => model.id === modelId) ||
+        nextEngine?.models.find((model) => model.loaded) ||
+        nextEngine?.models.find((model) => model.id.includes("ft-mixed-lr2e5-avgE-e12run-0820")) ||
         nextEngine?.models.find((model) => model.online !== false) ||
         nextEngine?.models[0];
       setModelId(nextModel?.id || "");

@@ -28,7 +28,7 @@ services:
     environment:
       # Inject environment variables from .env
       - VOXCPM_DEVICE=${VOXCPM_DEVICE:-auto}
-      - MODEL_ID=${MODEL_ID:-openbmb/VoxCPM2}
+      - MODEL_ID=${MODEL_ID:-/app/checkpoints/ft-mixed-lr2e5-avgE-e12run-0820}
       - VOXCPM_OPTIMIZE=${VOXCPM_OPTIMIZE:-false}
       - VOXCPM_GPU_MEMORY_UTILIZATION=${VOXCPM_GPU_MEMORY_UTILIZATION:-0.35}
       - VOXCPM_PRELOAD=${VOXCPM_PRELOAD:-true}
@@ -67,7 +67,7 @@ services:
       # 用途：強制 cuBLAS 確定性演算法（GB10 seed 決定性調查）。
       - CUBLAS_WORKSPACE_CONFIG
     # Pre-download models first, then start the unified API plus legacy Gradio.
-    command: bash -c "python scripts/download_models.py --model-id ${MODEL_ID:-openbmb/VoxCPM2} && python api.py --port 8000"
+    command: bash -c "python scripts/download_models.py --model-id ${MODEL_ID:-/app/checkpoints/ft-mixed-lr2e5-avgE-e12run-0820} && python api.py --port 8000"
     volumes:
       # Persistent cache for downloaded model weights (highly recommended to save GBs of downloading)
       - hf_cache:/home/voxcpm/.cache/huggingface

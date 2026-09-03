@@ -16,6 +16,16 @@ def download_models(model_id: str):
     print(f"Pre-downloading/Checking TTS Model: {model_id}...")
     print("==================================================")
     try:
+        # If model_id is a local directory with required weights, skip CPU loading
+        if os.path.isdir(model_id):
+            model_dir = os.path.abspath(model_id)
+            if (
+                os.path.isfile(os.path.join(model_dir, "model.safetensors"))
+                and os.path.isfile(os.path.join(model_dir, "config.json"))
+            ):
+                print(f"Local model checkpoint verified at {model_dir}.")
+                return
+
         # Trigger huggingface/modelscope download by loading on CPU without optimization
         voxcpm.VoxCPM.from_pretrained(
             model_id,

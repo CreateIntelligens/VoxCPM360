@@ -51,8 +51,6 @@ class TTSGateway:
         self.demo = demo
         self._base_demo = demo
         self._native_demo = demo
-        self._native_runtime_id = BASE_MODEL_KEY
-        self._active_native_selection = PUBLIC_BASE_MODEL_ID
         full_roots_setting = os.environ.get(
             "VOXCPM_FULL_MODEL_ROOTS",
             "/app/models/native:/app/checkpoints",
@@ -60,6 +58,25 @@ class TTSGateway:
         self.full_model_registry = FullModelRegistry(
             Path(value) for value in full_roots_setting.split(os.pathsep) if value.strip()
         )
+        initial_model_str = str(getattr(demo, "_model_id", getattr(demo, "model_id", "")))
+        matched_checkpoint = None
+        if initial_model_str:
+            self.full_model_registry.refresh()
+            for cp in self.full_model_registry.checkpoints:
+                if (
+                    cp.id == initial_model_str
+                    or str(cp.path) == initial_model_str
+                    or cp.path.name == Path(initial_model_str).name
+                ):
+                    matched_checkpoint = cp
+                    break
+
+        if matched_checkpoint is not None:
+            self._native_runtime_id = matched_checkpoint.id
+            self._active_native_selection = matched_checkpoint.id
+        else:
+            self._native_runtime_id = BASE_MODEL_KEY
+            self._active_native_selection = PUBLIC_BASE_MODEL_ID
         if barbet_runtime is None:
             barbet_roots_setting = os.environ.get(
                 "VOXCPM_BARBET_MODEL_ROOTS",
@@ -568,11 +585,17 @@ class TTSGateway:
         previous_runtime_id = self._native_runtime_id
         previous_demo.stop_voxcpm()
 
-        next_demo = (
-            VoxCPMDemo(model_id=str(checkpoint.path), device=self._base_demo.device)
-            if checkpoint is not None
-            else self._base_demo
+        base_model_path = os.environ.get("VOXCPM_BASE_MODEL_PATH", "openbmb/VoxCPM2")
+        initial_is_base = (
+            getattr(self._base_demo, "_model_id", getattr(self._base_demo, "model_id", ""))
+            in {BASE_MODEL_KEY, PUBLIC_BASE_MODEL_ID, "openbmb/VoxCPM2"}
         )
+        if checkpoint is not None:
+            next_demo = VoxCPMDemo(model_id=str(checkpoint.path), device=self._base_demo.device)
+        elif initial_is_base:
+            next_demo = self._base_demo
+        else:
+            next_demo = VoxCPMDemo(model_id=base_model_path, device=self._base_demo.device)
         try:
             next_demo.get_or_load_voxcpm()
         except Exception:

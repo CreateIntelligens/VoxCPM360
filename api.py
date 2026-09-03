@@ -68,8 +68,14 @@ def create_app(
     barbet_runtime: BarbetRuntime | None = None,
     mount_legacy: bool = True,
 ) -> FastAPI:
+    default_model = "/app/checkpoints/ft-mixed-lr2e5-avgE-e12run-0820"
+    if not os.path.exists(default_model) and os.path.exists("checkpoints/ft-mixed-lr2e5-avgE-e12run-0820"):
+        default_model = "checkpoints/ft-mixed-lr2e5-avgE-e12run-0820"
+    elif not os.path.exists(default_model) and not os.path.exists("checkpoints/ft-mixed-lr2e5-avgE-e12run-0820"):
+        default_model = "openbmb/VoxCPM2"
+
     demo = demo or VoxCPMDemo(
-        model_id=os.environ.get("MODEL_ID", "openbmb/VoxCPM2"),
+        model_id=os.environ.get("MODEL_ID", default_model),
         device=os.environ.get("VOXCPM_DEVICE", "auto"),
     )
     gateway = TTSGateway(demo, barbet_runtime=barbet_runtime)

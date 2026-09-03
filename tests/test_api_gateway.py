@@ -24,6 +24,9 @@ def isolate_generation_history(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway.history, "_HISTORY_DIR", tmp_path / "generation_history")
     monkeypatch.setattr(api, "_CASTVOICE_BATCH_DIR", tmp_path / "castvoice_batches")
     monkeypatch.setattr(gateway.castvoice, "_CASTVOICE_BATCH_DIR", tmp_path / "castvoice_batches")
+    monkeypatch.setenv("TTS_API_KEY", "")
+    monkeypatch.setattr(api, "_TTS_API_KEY", "")
+    monkeypatch.setattr(gateway.castvoice, "_TTS_API_KEY", "")
 
 
 class FakeRegistry:
