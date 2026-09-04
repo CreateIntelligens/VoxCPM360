@@ -514,7 +514,14 @@ class VoxCPMDemo:
         finally:
             import gc
 
+            import torch
+
+            # 卸載後歸還顯存，與 BarbetRuntime._release_model 對稱。模型切換
+            # 本就要重載數 GB，多這一步不影響延遲，但能避免新舊模型的配置
+            # 模式差異在 16GB 卡上累積成碎片。
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         logger.info("nano-vllm model stopped.")
 
     def get_or_load_asr_model(self) -> AutoModel:

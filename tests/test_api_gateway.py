@@ -3261,6 +3261,24 @@ def test_voxcpm_loop_thread_lifecycle_and_no_run_until_complete():
     assert not thread.is_alive()
 
 
+def test_stop_voxcpm_releases_cuda_cache(monkeypatch):
+    """卸載要歸還顯存，與 BarbetRuntime._release_model 對稱。"""
+    import torch
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+
+    demo = api.VoxCPMDemo.__new__(api.VoxCPMDemo)
+    demo._server_loop_thread = None
+    demo._server_loop_lock = threading.Lock()
+    demo.voxcpm_server = object()
+
+    demo.stop_voxcpm()
+
+    assert calls == ["empty"]
+
+
 def test_synthesize_without_model_id_uses_active_model(monkeypatch):
     """未指定 model_id 時沿用當前已載入模型，不觸發引擎切換。"""
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
