@@ -29,14 +29,22 @@ docker buildx build --target flash-wheel \
 ```
 
 `TORCH_VERSION` 決定 wheel 綁定的 ABI，務必與部署時安裝的 torch 一致 ——
-兩者不符會在 `import flash_attn` 當場失敗。各棧的對應版本：
+兩者不符會在 `import flash_attn` 當場失敗。各棧的完整組合與存放位置：
 
-| CUDA variant | flash-attn | torch | torchaudio |
-|---|---|---|---|
-| cu130 | 2.8.3 | 2.13.0 | 2.11.0 |
-| cu128 | 2.6.3 | 2.11.0 | 2.11.0 |
+| CUDA variant | flash-attn | torch | torchaudio | Release tag |
+|---|---|---|---|---|
+| cu130（現行） | 2.8.3 | 2.13.0 | 2.11.0 | [`flash-attn-wheels-cu130`](https://github.com/CreateIntelligens/VoxCPM360/releases/tag/flash-attn-wheels-cu130) |
+| cu128 | 2.6.3 | 2.11.0 | 2.11.0 | [`flash-attn-wheels-cu128`](https://github.com/CreateIntelligens/VoxCPM360/releases/tag/flash-attn-wheels-cu128) |
 
-torchaudio 的版號自 2.12 起與 torch 脫鉤，兩者不必同號。
+torchaudio 的版號自 2.12 起與 torch 脫鉤，兩者不必同號。每個 tag 各有
+`linux_x86_64` 與 `linux_aarch64` 兩顆。
+
+手動取得（正常情況下 build 會自動下載，不需要這步）：
+
+```bash
+gh release download flash-attn-wheels-cu130 -R CreateIntelligens/VoxCPM360 \
+  --pattern 'flash_attn-2.8.3-cp310-cp310-linux_x86_64.whl' --dir wheels/
+```
 
 導出後上傳到對應的 Release，其他機器即可免編譯：
 

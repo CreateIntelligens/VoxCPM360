@@ -54,8 +54,35 @@ def download_models(model_id: str):
         print(f"Warning: ASR model pre-download encountered an issue: {e}")
         print("The app will still attempt to load/download it when ASR is triggered.")
 
+def verify_flash_attn() -> None:
+    """在載入模型前確認 flash-attn 可用。
+
+    wheel 綁定編譯當時的 torch ABI，版本不符時 import 會拋出 undefined
+    symbol 之類的底層錯誤 —— 那個訊息看不出真正的原因，而失敗會延到
+    nano-vLLM 載入數 GB 權重之後才出現。
+    """
+    try:
+        import flash_attn
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            f"無法匯入 flash-attn：{exc}\n"
+            "預編 wheel 綁定特定 torch ABI，請確認 TORCH_VERSION 與 "
+            "FLASH_ATTN_VERSION 是配對的組合（見 wheels/README.md 的對應表）。"
+        ) from exc
+
+    print(
+        f"flash-attn {flash_attn.__version__} / torch {torch.__version__} ABI OK."
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-id", type=str, default="openbmb/VoxCPM2")
+    parser.add_argument(
+        "--model-id",
+        type=str,
+        default="/app/checkpoints/ft-mixed-lr2e5-avgE-e12run-0820",
+    )
     args = parser.parse_args()
+    verify_flash_attn()
     download_models(args.model_id)
