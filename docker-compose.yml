@@ -81,9 +81,14 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: all
+            # CDI 模式：裝置權限由 Docker 依 /var/run/cdi/nvidia.yaml 正式納管，
+            # 不再靠 legacy nvidia runtime hook 偷塞 cgroup 規則 —— 根治
+            # systemd daemon-reload 洗掉 GPU 存取權導致 NVML 失效的問題。
+            # spec 由 nvidia-cdi-refresh.service 於開機/驅動更新時自動重生。
+            - driver: cdi
               capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
 
   train:
     <<: *memory-guardrails
@@ -111,9 +116,14 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: all
+            # CDI 模式：裝置權限由 Docker 依 /var/run/cdi/nvidia.yaml 正式納管，
+            # 不再靠 legacy nvidia runtime hook 偷塞 cgroup 規則 —— 根治
+            # systemd daemon-reload 洗掉 GPU 存取權導致 NVML 失效的問題。
+            # spec 由 nvidia-cdi-refresh.service 於開機/驅動更新時自動重生。
+            - driver: cdi
               capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
 
   web:
     build:
