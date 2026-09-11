@@ -164,6 +164,9 @@ def main() -> None:
         port=args.port,
         proxy_headers=True,
         forwarded_allow_ips="*",
+        # nginx 是唯一入口且已記錄 access log；uvicorn 這份看到的 client
+        # 永遠是 nginx 容器 IP，留著只是同一請求記兩次。
+        access_log=False,
     )
 
 
