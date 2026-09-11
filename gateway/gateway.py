@@ -480,12 +480,17 @@ class TTSGateway:
     def _native_models(self) -> list[dict[str, Any]]:
         self.demo.lora_registry.refresh()
         self.full_model_registry.refresh()
+        # MODEL_ID 指向自訓 checkpoint 時，這一項載入的其實是那個權重，
+        # 不是原生 VoxCPM2；label 寫死「基礎模型」會讓前端誤以為沒套用微調。
+        base_source = Path(
+            str(getattr(self.demo, "_model_id", "") or "")
+        ).name or "openbmb/VoxCPM2"
         models: list[dict[str, Any]] = [
             {
                 "id": PUBLIC_BASE_MODEL_ID,
-                "label": "VoxCPM2 基礎模型",
+                "label": f"預設模型（{base_source}）",
                 "kind": "base",
-                "description": "原生 MiniCPM4 Text-Semantic LM",
+                "description": f"啟動時由 MODEL_ID 載入：{base_source}",
                 "loaded": self._active_native_selection == PUBLIC_BASE_MODEL_ID,
             }
         ]
