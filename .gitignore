@@ -57,3 +57,7 @@ frontend/vite.config.d.ts
 !/models/barbet/.gitkeep
 wheels/*.whl
 wheels-cu*/
+
+# 舊模型封存：清單精簡時搬離 checkpoints/ 與 models/，檔案保留但不進版控
+checkpoints_archive/
+models_archive/
