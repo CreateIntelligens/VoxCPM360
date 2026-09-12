@@ -480,20 +480,10 @@ class TTSGateway:
     def _native_models(self) -> list[dict[str, Any]]:
         self.demo.lora_registry.refresh()
         self.full_model_registry.refresh()
-        # MODEL_ID 指向自訓 checkpoint 時，這一項載入的其實是那個權重，
-        # 不是原生 VoxCPM2；label 寫死「基礎模型」會讓前端誤以為沒套用微調。
-        base_source = Path(
-            str(getattr(self.demo, "_model_id", "") or "")
-        ).name or "openbmb/VoxCPM2"
-        models: list[dict[str, Any]] = [
-            {
-                "id": PUBLIC_BASE_MODEL_ID,
-                "label": f"預設模型（{base_source}）",
-                "kind": "base",
-                "description": f"啟動時由 MODEL_ID 載入：{base_source}",
-                "loaded": self._active_native_selection == PUBLIC_BASE_MODEL_ID,
-            }
-        ]
+        # 不列官方原版 —— 它跟自訓 checkpoint 是不同權重，切過去會觸發
+        # 重新載入與 torch 重編譯（實測 120s vs 7s），且切換時舊 worker
+        # 不會被回收，GPU 記憶體只進不出。這裡只提供自訓的模型。
+        models: list[dict[str, Any]] = []
         for checkpoint in self.full_model_registry.checkpoints:
             models.append(
                 {
