@@ -580,7 +580,13 @@ class TTSGateway:
         previous_runtime_id = self._native_runtime_id
         previous_demo.stop_voxcpm()
 
-        base_model_path = os.environ.get("VOXCPM_BASE_MODEL_PATH", "openbmb/VoxCPM2")
+        # 未指定 model 的請求會走到這裡。預設值跟著 MODEL_ID 走，而不是
+        # 寫死 openbmb/VoxCPM2 —— 否則批次呼叫方每次都會把服務切回官方
+        # 原版，等於自訓 checkpoint 從沒被用到，切換還會白白重載數 GB。
+        base_model_path = os.environ.get(
+            "VOXCPM_BASE_MODEL_PATH",
+            os.environ.get("MODEL_ID", "openbmb/VoxCPM2"),
+        )
         initial_is_base = (
             getattr(self._base_demo, "_model_id", getattr(self._base_demo, "model_id", ""))
             in {BASE_MODEL_KEY, PUBLIC_BASE_MODEL_ID, "openbmb/VoxCPM2"}
