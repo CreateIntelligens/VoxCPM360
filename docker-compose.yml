@@ -81,14 +81,16 @@ services:
       resources:
         reservations:
           devices:
-            # CDI 模式：裝置權限由 Docker 依 /var/run/cdi/nvidia.yaml 正式納管，
-            # 不再靠 legacy nvidia runtime hook 偷塞 cgroup 規則 —— 根治
+            # 預設 CDI 模式：裝置權限由 Docker 依 /var/run/cdi/nvidia.yaml 正式
+            # 納管，不再靠 legacy nvidia runtime hook 偷塞 cgroup 規則 —— 根治
             # systemd daemon-reload 洗掉 GPU 存取權導致 NVML 失效的問題。
             # spec 由 nvidia-cdi-refresh.service 於開機/驅動更新時自動重生。
-            - driver: cdi
+            # Docker Desktop for Windows 沒有 CDI spec，那台在 .env 設
+            # GPU_DRIVER=nvidia / GPU_DEVICE_ID=0 覆寫（見 .env.example）。
+            - driver: ${GPU_DRIVER:-cdi}
               capabilities: [gpu]
               device_ids:
-                - nvidia.com/gpu=all
+                - ${GPU_DEVICE_ID:-nvidia.com/gpu=all}
 
   train:
     <<: *memory-guardrails
@@ -116,14 +118,16 @@ services:
       resources:
         reservations:
           devices:
-            # CDI 模式：裝置權限由 Docker 依 /var/run/cdi/nvidia.yaml 正式納管，
-            # 不再靠 legacy nvidia runtime hook 偷塞 cgroup 規則 —— 根治
+            # 預設 CDI 模式：裝置權限由 Docker 依 /var/run/cdi/nvidia.yaml 正式
+            # 納管，不再靠 legacy nvidia runtime hook 偷塞 cgroup 規則 —— 根治
             # systemd daemon-reload 洗掉 GPU 存取權導致 NVML 失效的問題。
             # spec 由 nvidia-cdi-refresh.service 於開機/驅動更新時自動重生。
-            - driver: cdi
+            # Docker Desktop for Windows 沒有 CDI spec，那台在 .env 設
+            # GPU_DRIVER=nvidia / GPU_DEVICE_ID=0 覆寫（見 .env.example）。
+            - driver: ${GPU_DRIVER:-cdi}
               capabilities: [gpu]
               device_ids:
-                - nvidia.com/gpu=all
+                - ${GPU_DEVICE_ID:-nvidia.com/gpu=all}
 
   web:
     build:
