@@ -525,6 +525,22 @@ class TTSGateway:
         self.full_model_registry.refresh()
 
         if requested_id in {BASE_MODEL_KEY, PUBLIC_BASE_MODEL_ID}:
+            # 「基礎模型」的路徑跟著 MODEL_ID 走（見 _switch_native_runtime），
+            # 所以當它指向已註冊的 full checkpoint 時，這裡直接正規化成該
+            # checkpoint 的身分。否則同一份權重會以 base::__base__ 名義觸發
+            # 整段卸載重載（數 GB），與 full:: 請求交錯時服務反覆重載，
+            # 在 16GB 共享卡上會因舊顯存未及釋放而 OOM。
+            base_model_path = os.environ.get(
+                "VOXCPM_BASE_MODEL_PATH",
+                os.environ.get("MODEL_ID", "openbmb/VoxCPM2"),
+            )
+            for checkpoint in self.full_model_registry.checkpoints:
+                if checkpoint.valid and (
+                    checkpoint.id == base_model_path
+                    or str(checkpoint.path) == base_model_path
+                    or checkpoint.path.name == Path(base_model_path).name
+                ):
+                    return checkpoint.id
             return PUBLIC_BASE_MODEL_ID
 
         full_checkpoints = {
