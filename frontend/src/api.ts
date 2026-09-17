@@ -113,7 +113,9 @@ function synthesisBody(request: SynthesisRequest): FormData {
   body.set("reference_preset_id", request.referencePresetId);
   body.set("speaker_id", request.speakerId);
   body.set("cfg_value", String(request.cfgValue));
-  body.set("inference_timesteps", String(request.inferenceTimesteps));
+  if (request.inferenceTimesteps !== undefined) {
+    body.set("inference_timesteps", String(request.inferenceTimesteps));
+  }
   body.set("speed", String(request.speed));
   body.set("normalize", String(request.normalize));
   body.set("denoise", String(request.denoise));

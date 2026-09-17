@@ -185,8 +185,13 @@ function App() {
     "",
   );
   const [cfgValue, setCfgValue] = usePersistentState("cfg-value", 2);
-  // 舊版的 30 未傳入 native 引擎；使用新 key 維持原本實際的 10 步。
-  const [steps, setSteps] = usePersistentState("inference-steps-v3", 10);
+  // null = 使用者沒調過，跟隨引擎回報的部署預設（見 stepsDefault）。寫死數值
+  // 會讓 VOXCPM_INFERENCE_TIMESTEPS 非 10 的機器送出與部署不符的步數，因而
+  // 退出 CUDA graph 走 eager。新 key：舊 v3 存的是寫死的 10。
+  const [stepsOverride, setStepsOverride] = usePersistentState<number | null>(
+    "inference-steps-v4",
+    null,
+  );
   const [speed, setSpeed] = usePersistentState("speech-speed", 1);
   const [normalize, setNormalize] = usePersistentState("normalize-v2", true);
   const [denoise, setDenoise] = usePersistentState("denoise", false);
@@ -226,6 +231,10 @@ function App() {
     selectedEngine?.capabilities.prompt_transcript,
   );
   const supportsStreaming = Boolean(selectedEngine?.capabilities.streaming);
+  // 引擎未回報時退回 10（舊版後端沒有這個欄位）。
+  const stepsDefault =
+    selectedEngine?.capabilities.default_inference_timesteps ?? 10;
+  const steps = stepsOverride ?? stepsDefault;
   const streamingActive = streaming && supportsStreaming;
   const effectiveSpeed = streamingActive ? 1 : speed;
   const selectedReferencePreset = useMemo(
@@ -440,7 +449,7 @@ function App() {
         referencePresetId,
         speakerId,
         cfgValue,
-        inferenceTimesteps: steps,
+        inferenceTimesteps: stepsOverride ?? undefined,
         speed: effectiveSpeed,
         normalize,
         denoise,
@@ -982,9 +991,13 @@ function App() {
                     max="50"
                     step="1"
                     value={steps}
-                    onChange={(event) => setSteps(Number(event.target.value))}
+                    onChange={(event) =>
+                      setStepsOverride(Number(event.target.value))
+                    }
                   />
-                  <small>VoxCPM2 使用非部署預設步數時可能較慢。</small>
+                  <small>
+                    VoxCPM2 使用非部署預設步數（{stepsDefault}）時可能較慢。
+                  </small>
                 </label>
                 <label className="range-field">
                   <span>

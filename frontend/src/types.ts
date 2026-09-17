@@ -24,6 +24,7 @@ export interface EngineCapabilities {
   seed: boolean;
   streaming?: boolean;
   inference_timesteps?: boolean;
+  default_inference_timesteps?: number;
 }
 
 export interface Engine {
@@ -68,7 +69,8 @@ export interface SynthesisRequest {
   referencePresetId: string;
   speakerId: string;
   cfgValue: number;
-  inferenceTimesteps: number;
+  // 未指定時不送出該欄位，由後端沿用部署預設（見 routes/interactive.py）。
+  inferenceTimesteps?: number;
   speed: number;
   normalize: boolean;
   denoise: boolean;

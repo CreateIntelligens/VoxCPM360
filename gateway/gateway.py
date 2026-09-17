@@ -39,6 +39,7 @@ from voxcpm.lora_registry import BASE_MODEL_KEY
 logger = logging.getLogger(__name__)
 
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
+from gateway.presets import _VOXCPM2_DEFAULT_TIMESTEPS
 from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
 
@@ -668,6 +669,10 @@ class TTSGateway:
                     "seed": True,  # nano-vLLM per-request seed（z_noise 派生；併發下為盡力重現）
                     "streaming": True,
                     "inference_timesteps": True,
+                    # 部署預設步數。前端據此初始化滑桿 —— 硬編碼會讓
+                    # VOXCPM_INFERENCE_TIMESTEPS 設非 10 的機器上，使用者
+                    # 拿到與部署值不符的步數並因此退出 CUDA graph。
+                    "default_inference_timesteps": _VOXCPM2_DEFAULT_TIMESTEPS,
                 },
                 "models": self._native_models(),
             }
