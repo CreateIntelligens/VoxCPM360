@@ -3310,6 +3310,9 @@ def test_synthesize_without_model_id_uses_active_model(monkeypatch):
 def test_per_request_completion_short_sentences_return_early_without_waiting_long_sentence(monkeypatch):
     monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "4")
     monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "4")
+    # 本案例同時送 4 個請求，預設 admission 容量只有 3（MAX_PENDING=2），
+    # 第 4 個會被 429 拒絕，該例外再經 gather 取消其餘任務。
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "8")
 
     class DelayDemo(FakeDemo):
         def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
@@ -3413,6 +3416,9 @@ def test_per_request_completion_capacity_refill_immediate_dispatch(monkeypatch):
 def test_per_request_completion_single_item_failure_isolation(monkeypatch):
     monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "4")
     monkeypatch.setenv("VOXCPM_INTERACTIVE_BATCH_MAX", "4")
+    # 本案例同時送 4 個請求，預設 admission 容量只有 3（MAX_PENDING=2），
+    # 第 4 個會被 429 拒絕，該例外再經 gather 取消其餘任務。
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "8")
 
     class FailOneDemo(FakeDemo):
         def generate_tts_audio_batch(self, requests, *, return_exceptions=False):
