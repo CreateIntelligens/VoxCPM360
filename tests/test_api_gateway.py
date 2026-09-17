@@ -230,8 +230,19 @@ class FakeBarbetRuntime:
         return None
 
 
-def test_catalog_exposes_native_engine(monkeypatch):
+def test_catalog_exposes_native_engine(monkeypatch, tmp_path):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    # 目錄裡放齊必要檔案，FullModelRegistry 才會認列。上游 base model 自
+    # 760134f 起不再進 catalog（切過去會觸發重新載入），所以這裡要自備一個
+    # checkpoint，而不是斷言早已移除的 base::__base__。
+    checkpoint = tmp_path / "ckpt-under-test"
+    checkpoint.mkdir()
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "audiovae.pth").write_bytes(b"vae")
+    monkeypatch.setenv("VOXCPM_FULL_MODEL_ROOTS", str(tmp_path))
+
     app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
 
     with TestClient(app) as client:
@@ -240,7 +251,8 @@ def test_catalog_exposes_native_engine(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert [engine["id"] for engine in payload["engines"]] == ["voxcpm2"]
-    assert payload["engines"][0]["models"][0]["id"] == "base::__base__"
+    models = payload["engines"][0]["models"]
+    assert [model["id"] for model in models] == ["full::ckpt-under-test"]
     assert payload["engines"][0]["capabilities"]["streaming"] is True
     assert payload["engines"][0]["capabilities"]["inference_timesteps"] is True
 
