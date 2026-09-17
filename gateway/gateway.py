@@ -667,10 +667,7 @@ class TTSGateway:
                     "speaker_selection": False,
                     "seed": True,  # nano-vLLM per-request seed（z_noise 派生；併發下為盡力重現）
                     "streaming": True,
-                    # nano-vLLM 引擎在建構時固定 diffusion 步數
-                    # （VOXCPM_INFERENCE_TIMESTEPS），per-request 的
-                    # inference_timesteps 參數不生效 —— 前端據此隱藏該欄位。
-                    "inference_timesteps": False,
+                    "inference_timesteps": True,
                 },
                 "models": self._native_models(),
             }

@@ -20,6 +20,7 @@ class FakeServer:
         self.lora_names = []
         self.target_texts = []
         self.max_generate_lengths = []
+        self.timesteps = []
 
     def generate(
         self,
@@ -31,7 +32,9 @@ class FakeServer:
         cfg_value=2.0,
         ref_audio_latents=None,
         lora_name=None,
+        inference_timesteps=10,
     ):
+        self.timesteps.append(inference_timesteps)
         self.lora_names.append(lora_name)
         self.target_texts.append(target_text)
         self.max_generate_lengths.append(max_generate_length)
@@ -121,3 +124,29 @@ def test_rejects_invalid_gpu_memory_utilization(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="must be in"):
         VoxCPMDemo(device="cpu")
+
+
+@pytest.mark.parametrize("steps", [10, 20, 30])
+def test_generate_forwards_diffusion_steps(steps):
+    server = FakeServer()
+    demo = VoxCPMDemo.__new__(VoxCPMDemo)
+    demo.voxcpm_server = server
+    demo.lora_registry = FakeRegistry()
+    demo.generate_tts_audio(
+        text_input="測試", do_normalize=False, denoise=False,
+        inference_timesteps=steps,
+    )
+    assert server.timesteps == [steps]
+
+
+def test_unpatched_engine_cannot_silently_ignore_steps():
+    server = FakeServer()
+    server.generate = lambda target_text: iter([])
+    demo = VoxCPMDemo.__new__(VoxCPMDemo)
+    demo.voxcpm_server = server
+    demo.lora_registry = FakeRegistry()
+    with pytest.raises(RuntimeError, match="lacks per-request timesteps"):
+        demo.generate_tts_audio(
+            text_input="測試", do_normalize=False, denoise=False,
+            inference_timesteps=20,
+        )

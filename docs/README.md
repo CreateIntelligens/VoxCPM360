@@ -4,6 +4,7 @@
 
 | 我想… | 開這份 |
 |---|---|
+| 調整推論 DiT 步數、確認預設與效能 | [DIT_INFERENCE.md](DIT_INFERENCE.md) |
 | 第一次做微調，要從環境準備開始 | [TRAINING_GUIDE_zh-TW.md](TRAINING_GUIDE_zh-TW.md) |
 | 知道現在跑到哪、跑完要做什麼 | [TRAINING_LOG.md](TRAINING_LOG.md) 開頭「現況」 |
 | 送出一輪訓練／監看／中止／取回結果 | [TRAINING_LOG.md](TRAINING_LOG.md) 的「操作手冊」 |

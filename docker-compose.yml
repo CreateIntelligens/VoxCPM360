@@ -43,8 +43,8 @@ services:
       - VOXCPM_ENGINE_CONCURRENCY=${VOXCPM_ENGINE_CONCURRENCY:-1}
       # Match the upstream VoxCPM bad-case guard: cap audio generation relative
       # to target text length so a missed EOS cannot always run to 2000 tokens.
-      # voxcpm2 的 diffusion 步數只能在引擎建構時設定（per-request 參數
-      # 不生效），這裡是唯一真正的控制點。
+      # VoxCPM2 未指定步數時的部署預設，也是 CUDA graph 的固定步數。
+      # 逐請求可指定 1–50；不同於部署預設時走 eager。
       - VOXCPM_INFERENCE_TIMESTEPS=${VOXCPM_INFERENCE_TIMESTEPS:-10}
       - VOXCPM_MAX_GENERATE_LENGTH=${VOXCPM_MAX_GENERATE_LENGTH:-2000}
       - VOXCPM_MAX_AUDIO_TEXT_RATIO=${VOXCPM_MAX_AUDIO_TEXT_RATIO:-6.0}

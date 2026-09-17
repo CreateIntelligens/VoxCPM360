@@ -23,6 +23,7 @@ export interface EngineCapabilities {
   speaker_selection: boolean;
   seed: boolean;
   streaming?: boolean;
+  inference_timesteps?: boolean;
 }
 
 export interface Engine {

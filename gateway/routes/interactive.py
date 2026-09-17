@@ -39,7 +39,7 @@ from voxcpm.lora_registry import BASE_MODEL_KEY
 logger = logging.getLogger(__name__)
 
 # 相容層：保留舊的 import 路徑，避免既有呼叫端隨模組拆分而改寫。
-from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_FIXED_TIMESTEPS, _by_id, _find_reference_preset
+from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_DEFAULT_TIMESTEPS, _by_id, _find_reference_preset
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
@@ -189,7 +189,7 @@ def register_interactive_routes(app, gateway, history_lock):
         reference_preset_id: str,
         speaker_id: str,
         cfg_value: float,
-        inference_timesteps: int,
+        inference_timesteps: int | None,
         normalize: bool,
         denoise: bool,
         speed: float,
@@ -202,6 +202,10 @@ def register_interactive_routes(app, gateway, history_lock):
             raise HTTPException(status_code=422, detail="請輸入要合成的文字")
         if not 1.0 <= cfg_value <= 5.0:
             raise HTTPException(status_code=422, detail="CFG 必須介於 1.0 與 5.0")
+        if inference_timesteps is None:
+            inference_timesteps = (
+                _VOXCPM2_DEFAULT_TIMESTEPS if engine_id == "voxcpm2" else 30
+            )
         if not 1 <= inference_timesteps <= 50:
             raise HTTPException(status_code=422, detail="取樣步數必須介於 1 與 50")
         if not 0.5 <= speed <= 2.0:
@@ -342,9 +346,8 @@ def register_interactive_routes(app, gateway, history_lock):
         reference_preset_id: str = Form(""),
         speaker_id: str = Form(""),
         cfg_value: float = Form(2.0),
-        # 10 太低，diffusion 沒收斂完就輸出 —— 實聽是「亂叫、聽不懂」。
-        # 25~30 明顯較穩；代價是生成時間約 3 倍。
-        inference_timesteps: int = Form(30),
+        # 未指定時維持各引擎既有的實際步數。
+        inference_timesteps: int | None = Form(None),
         # 預設開啟音量正規化 —— 關閉時實測輸出 peak 逼近 1.0（參考音僅 0.259），
         # 聽感是「音量爆掉像大聲吼叫」。
         normalize: bool = Form(True),
@@ -419,12 +422,9 @@ def register_interactive_routes(app, gateway, history_lock):
                 "X-Request-ID": request_id,
                 **extra_headers,
             }
-            # voxcpm2 引擎的 diffusion 步數在建構時固定，請求參數不生效；
-            # 誠實回報實際生效值，客戶端不必猜（見 catalog capabilities）。
-            if prepared.engine_id == "voxcpm2":
-                headers["X-Inference-Timesteps-Effective"] = str(
-                    _VOXCPM2_FIXED_TIMESTEPS
-                )
+            headers["X-Inference-Timesteps-Effective"] = str(
+                prepared.inference_timesteps
+            )
             history_id = uuid.uuid4().hex
             record = await _build_history_record(
                 prepared,
@@ -450,7 +450,7 @@ def register_interactive_routes(app, gateway, history_lock):
         reference_preset_id: str = Form(""),
         speaker_id: str = Form(""),
         cfg_value: float = Form(2.0),
-        inference_timesteps: int = Form(30),
+        inference_timesteps: int | None = Form(None),
         normalize: bool = Form(True),
         denoise: bool = Form(False),
         speed: float = Form(1.0),
@@ -565,6 +565,7 @@ def register_interactive_routes(app, gateway, history_lock):
             "X-Model-Version": prepared.model_id,
             "X-Request-ID": request_id,
             "X-Sample-Rate": str(stream.sample_rate),
+            "X-Inference-Timesteps-Effective": str(prepared.inference_timesteps),
             "X-Engine-Concurrency": str(stream.session_concurrency),
         }
         return _ManagedStreamingResponse(

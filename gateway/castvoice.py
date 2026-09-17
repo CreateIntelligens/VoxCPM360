@@ -39,6 +39,7 @@ from voxcpm.lora_registry import BASE_MODEL_KEY
 
 logger = logging.getLogger(__name__)
 
+from gateway.presets import _VOXCPM2_DEFAULT_TIMESTEPS
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
 from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
@@ -47,8 +48,7 @@ from gateway.gateway import TTSGateway
 # 選填的合成參數一律預設 None＝「不指定」，由呼叫端沿用 castvoice 既有
 # 預設值（cfg 2.0、normalize True、denoise False）。外部合約向後相容是
 # 硬約束：沒帶這些欄位的舊客戶端行為必須與加欄位前完全一致。
-# 註：inference_timesteps 刻意不開放 —— voxcpm2 引擎在建構時就定死步數，
-# per-request 傳入不生效（catalog capabilities 已標為 false）。
+# CastVoice 維持既有外部合約；步數由引擎預設決定，不新增請求欄位。
 class CastVoiceSynthesizeRequest(BaseModel):
     text: str
     voice_id: str
@@ -567,7 +567,7 @@ _CASTVOICE_DEFINITIONS_BY_ID = {
     definition["voice_id"]: definition for definition in _CASTVOICE_DEFINITIONS
 }
 # castvoice 端點未指定合成參數時沿用的預設值（單一真相來源）。
-# 與互動端點的 Form 預設一致，也是加上選填欄位之前寫死的那組值。
+# native 沿用部署步數，Barbet 沿用 30；未指定時維持既有實際行為。
 # 這些值改變會讓相同輸入產生不同輸出，故納入 model_version 指紋。
 _CASTVOICE_DEFAULT_CFG_VALUE = 2.0
 _CASTVOICE_DEFAULT_TIMESTEPS = 30
@@ -633,6 +633,7 @@ def _compute_castvoice_model_version() -> str:
         for value in (
             _CASTVOICE_DEFAULT_CFG_VALUE,
             _CASTVOICE_DEFAULT_TIMESTEPS,
+            _VOXCPM2_DEFAULT_TIMESTEPS,
             _CASTVOICE_DEFAULT_NORMALIZE,
             _CASTVOICE_DEFAULT_DENOISE,
             _CASTVOICE_DEFAULT_TARGET_PEAK,

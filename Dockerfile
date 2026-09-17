@@ -134,6 +134,10 @@ FROM base AS runner
 # Copy the pre-compiled virtual environment containing python packages from builder
 COPY --from=builder /opt/venv /opt/venv
 
+COPY scripts/patch_nanovllm_timesteps.py /tmp/patch_nanovllm_timesteps.py
+RUN python /tmp/patch_nanovllm_timesteps.py \
+    && rm /tmp/patch_nanovllm_timesteps.py
+
 # Run bind-mounted workspace processes as the host user so generated files remain editable.
 ARG APP_UID=1000
 ARG APP_GID=1000

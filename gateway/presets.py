@@ -184,10 +184,8 @@ _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
     },
 )
 _DEFAULT_REFERENCE_PRESET_ID = "cosy-young-female-01"
-# voxcpm2 引擎實際生效的 diffusion 步數（nano-vLLM 建構時固定，
-# 與 app.py 讀同一個環境變數）；per-request 的 inference_timesteps
-# 對 voxcpm2 不生效，catalog capabilities 與回應 header 據此誠實揭露。
-_VOXCPM2_FIXED_TIMESTEPS = int(os.environ.get("VOXCPM_INFERENCE_TIMESTEPS", "10"))
+# 未指定步數時沿用部署設定；相同設定也用於引擎啟動時的 CUDA graph。
+_VOXCPM2_DEFAULT_TIMESTEPS = int(os.environ.get("VOXCPM_INFERENCE_TIMESTEPS", "10"))
 
 _DEFAULT_CONTROL_INSTRUCTION = os.environ.get(
     "VOXCPM_DEFAULT_CONTROL_INSTRUCTION", "用台語說"

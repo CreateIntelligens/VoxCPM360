@@ -439,9 +439,12 @@ nginx ─┬─ /        → web 服務（React 靜態檔，multi-stage build �
 > ⚠️ 實作細節：預設路徑**不可**寫進 `temp_path`，那個變數在 `finally` 會被
 > `os.unlink` —— 會刪掉預設檔本身。故另用 `active_reference` 傳給推論。
 
-**改善音質的參數**（`/api/v1/synthesize`）：`inference_timesteps` 預設 10 偏低，
-提到 25~30 明顯較穩；`prompt_text` 填參考音的逐字稿可讓音色與內容解耦；
-`cfg_value` 2.0→2.5 更貼合 reference。
+**DiT 取樣步數**：VoxCPM2 支援逐請求 `inference_timesteps`（1–50），
+未指定沿用 `VOXCPM_INFERENCE_TIMESTEPS`（預設 10）；Barbet 未指定維持 30。
+VoxCPM2 與部署步數相同時可使用 CUDA graph，其他步數走 eager，可能較慢。
+先前畫面與請求的 30 未進入 nano-vLLM，不能據此推論 30 的音質優勢；
+應以相同模型、文字、reference 與 seed 實聽比較。詳見 [DIT_INFERENCE.md](docs/DIT_INFERENCE.md)。
+`prompt_text` 可填參考音逐字稿；`cfg_value` 控制 reference 條件強度。
 
 **生成佇列與長尾防護（2026-08-17）**：VoxCPM2／Barbet 共用同一張 GPU，
 `api.py` 已改為共用單一 GPU gate，不可再拆成兩把 engine lock。預設僅 1 個任務

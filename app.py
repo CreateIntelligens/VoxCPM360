@@ -466,9 +466,8 @@ class VoxCPMDemo:
         lora_config = LoRAConfig(**runtime_lora_config)
         self.voxcpm_server = VoxCPM.from_pretrained(
             self._model_id,
-            # nano-vLLM 只在建構時接受 diffusion 步數；per-request 的
-            # inference_timesteps 到不了引擎（generate 簽名沒有它），
-            # 所以真正的控制點是這個部署層環境變數。
+            # 此步數是預設值，也是 CUDA graph 的固定加速路徑。
+            # 逐請求的其他步數由 runner 分組後以 eager 執行。
             inference_timesteps=int(
                 os.environ.get("VOXCPM_INFERENCE_TIMESTEPS", "10")
             ),
@@ -660,8 +659,12 @@ class VoxCPMDemo:
         sig = inspect.signature(server.generate)
         if "ref_audio_latents" in sig.parameters:
             generate_kwargs["ref_audio_latents"] = ref_audio_latents
-        if "inference_timesteps" in sig.parameters:
-            generate_kwargs["inference_timesteps"] = int(inference_timesteps)
+        if "inference_timesteps" not in sig.parameters:
+            raise RuntimeError(
+                "nano-vLLM lacks per-request timesteps; rebuild the app image "
+                "with scripts/patch_nanovllm_timesteps.py"
+            )
+        generate_kwargs["inference_timesteps"] = int(inference_timesteps)
         # 引擎支援 per-request seed（z_noise 經 derive_step_seed 逐步派生）。
         if seed is not None and "seed" in sig.parameters:
             generate_kwargs["seed"] = int(seed)

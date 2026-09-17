@@ -242,9 +242,7 @@ def test_catalog_exposes_native_engine(monkeypatch):
     assert [engine["id"] for engine in payload["engines"]] == ["voxcpm2"]
     assert payload["engines"][0]["models"][0]["id"] == "base::__base__"
     assert payload["engines"][0]["capabilities"]["streaming"] is True
-    # voxcpm2 的 per-request inference_timesteps 不生效（引擎建構時固定），
-    # catalog 必須誠實揭露讓前端隱藏該欄位。
-    assert payload["engines"][0]["capabilities"]["inference_timesteps"] is False
+    assert payload["engines"][0]["capabilities"]["inference_timesteps"] is True
 
 
 def test_preload_warms_common_inference_paths(monkeypatch, tmp_path):
@@ -2603,7 +2601,7 @@ def test_castvoice_synthesize_passes_synthesis_params_to_barbet_engine(monkeypat
 
 
 def test_castvoice_synthesize_without_params_keeps_existing_defaults(monkeypatch):
-    """回歸：不帶新欄位時，送進引擎的值必須與加欄位之前完全一致。"""
+    """未指定參數時維持既有實際步數，而非舊版忽略的 30。"""
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
     app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
@@ -2620,7 +2618,7 @@ def test_castvoice_synthesize_without_params_keeps_existing_defaults(monkeypatch
     assert call["do_normalize"] is True
     assert call["denoise"] is False
     assert call["seed"] is None
-    assert call["inference_timesteps"] == 30
+    assert call["inference_timesteps"] == gateway.presets._VOXCPM2_DEFAULT_TIMESTEPS
 
 
 def test_castvoice_synthesize_without_params_keeps_barbet_defaults(monkeypatch):
@@ -2642,6 +2640,7 @@ def test_castvoice_synthesize_without_params_keeps_barbet_defaults(monkeypatch):
 
     assert [response.status_code for response in responses] == [200, 200]
     assert runtime.calls[0]["cfg_value"] == 2.0
+    assert runtime.calls[0]["inference_timesteps"] == 30
     # barbet 端 seed=None 由 gateway 補隨機值：不指定時每次都該不一樣，
     # 這正是加上選填 seed 之前的行為。
     assert runtime.calls[0]["seed"] != runtime.calls[1]["seed"]
@@ -2690,7 +2689,7 @@ def test_castvoice_synthesize_rejects_out_of_range_speed(monkeypatch, speed):
 
 
 def test_castvoice_synthesize_rejects_inference_timesteps_field(monkeypatch):
-    """voxcpm2 建構時定死步數，per-request 不生效，body 刻意不收這個欄位。"""
+    """CastVoice 保留原外部合約，忽略未開放的步數欄位。"""
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
     app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
@@ -2705,9 +2704,9 @@ def test_castvoice_synthesize_rejects_inference_timesteps_field(monkeypatch):
             },
         )
 
-    # pydantic 預設忽略未知欄位：請求仍成功，但步數維持既有的 30。
+    # pydantic 忽略未知欄位，native 使用部署預設步數。
     assert response.status_code == 200
-    assert demo.calls[0]["inference_timesteps"] == 30
+    assert demo.calls[0]["inference_timesteps"] == gateway.presets._VOXCPM2_DEFAULT_TIMESTEPS
 
 
 def test_castvoice_batch_items_carry_independent_synthesis_params(monkeypatch):
@@ -2781,6 +2780,7 @@ def test_castvoice_batch_without_params_keeps_existing_defaults(monkeypatch):
         assert request["do_normalize"] is True
         assert request["denoise"] is False
         assert request["seed"] is None
+        assert request["inference_timesteps"] == gateway.presets._VOXCPM2_DEFAULT_TIMESTEPS
 
 
 def test_castvoice_batch_marks_only_the_item_with_invalid_cfg_value_failed(monkeypatch):
@@ -3453,3 +3453,57 @@ def test_castvoice_model_version_reflects_runtime(monkeypatch):
     # 明確覆寫優先
     monkeypatch.setenv("VOXCPM_CASTVOICE_MODEL_VERSION", "pinned-1.0")
     assert gc._compute_castvoice_model_version() == "pinned-1.0"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("steps", [None, 1, 10, 20, 30, 50])
+def test_native_timesteps_match_request_header_and_history(monkeypatch, streaming, steps):
+    import gateway.routes.interactive as routes
+
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setenv("MODEL_ID", "openbmb/VoxCPM2")
+    monkeypatch.setenv("VOXCPM_BASE_MODEL_PATH", "openbmb/VoxCPM2")
+    monkeypatch.setenv("VOXCPM_FULL_MODEL_ROOTS", "")
+    monkeypatch.setattr(routes, "_VOXCPM2_DEFAULT_TIMESTEPS", 12)
+    demo = FakeStreamingDemo() if streaming else FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    data = {"engine_id": "voxcpm2", "model_id": "__base__", "text": "步數測試"}
+    if steps is not None:
+        data["inference_timesteps"] = str(steps)
+    endpoint = "/api/v1/synthesize" + ("/stream" if streaming else "")
+    with TestClient(app) as client:
+        response = client.post(endpoint, data=data)
+        history = client.get("/api/v1/history?limit=1").json()["items"]
+    expected = 12 if steps is None else steps
+    assert response.status_code == 200
+    assert response.headers["x-inference-timesteps-effective"] == str(expected)
+    assert history[0]["inference_timesteps"] == expected
+    calls = demo.stream_calls if streaming else demo.calls
+    assert calls[0]["inference_timesteps"] == expected
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("steps", [0, 51, "1.5"])
+def test_native_timesteps_reject_invalid_values(monkeypatch, streaming, steps):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    demo = FakeStreamingDemo() if streaming else FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    endpoint = "/api/v1/synthesize" + ("/stream" if streaming else "")
+    with TestClient(app) as client:
+        response = client.post(endpoint, data={
+            "engine_id": "voxcpm2",
+            "text": "步數測試", "inference_timesteps": str(steps),
+        })
+    assert response.status_code == 422
+    assert not demo.calls
+    if streaming:
+        assert not demo.stream_calls
+
+
+def test_castvoice_version_reflects_native_default_timesteps(monkeypatch):
+    import gateway.castvoice as castvoice
+
+    monkeypatch.delenv("VOXCPM_CASTVOICE_MODEL_VERSION", raising=False)
+    before = castvoice._compute_castvoice_model_version()
+    monkeypatch.setattr(castvoice, "_VOXCPM2_DEFAULT_TIMESTEPS", 21)
+    assert castvoice._compute_castvoice_model_version() != before

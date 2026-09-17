@@ -185,11 +185,8 @@ function App() {
     "",
   );
   const [cfgValue, setCfgValue] = usePersistentState("cfg-value", 2);
-  // 與 api.py 的 Form 預設對齊。steps=10 會讓 diffusion 沒收斂完就輸出
-  // （實聽「亂叫、聽不懂」），normalize=false 則會讓音量爆掉；兩者原本都
-  // 只寫在後端，但前端每次都顯式送值，後端預設等於被架空。
-  // key 加 -v2 是為了讓已存舊值的瀏覽器重新套用新預設。
-  const [steps, setSteps] = usePersistentState("inference-steps-v2", 30);
+  // 舊版的 30 未傳入 native 引擎；使用新 key 維持原本實際的 10 步。
+  const [steps, setSteps] = usePersistentState("inference-steps-v3", 10);
   const [speed, setSpeed] = usePersistentState("speech-speed", 1);
   const [normalize, setNormalize] = usePersistentState("normalize-v2", true);
   const [denoise, setDenoise] = usePersistentState("denoise", false);
@@ -982,11 +979,12 @@ function App() {
                   <input
                     type="range"
                     min="1"
-                    max="30"
+                    max="50"
                     step="1"
                     value={steps}
                     onChange={(event) => setSteps(Number(event.target.value))}
                   />
+                  <small>VoxCPM2 使用非部署預設步數時可能較慢。</small>
                 </label>
                 <label className="range-field">
                   <span>

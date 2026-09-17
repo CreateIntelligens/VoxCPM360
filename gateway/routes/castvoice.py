@@ -39,9 +39,9 @@ from voxcpm.lora_registry import BASE_MODEL_KEY
 logger = logging.getLogger(__name__)
 
 # 相容層：保留舊的 import 路徑，避免既有呼叫端隨模組拆分而改寫。
-from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_FIXED_TIMESTEPS, _by_id, _find_reference_preset
+from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_DEFAULT_TIMESTEPS, _by_id, _find_reference_preset
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
-from gateway.castvoice import _CASTVOICE_DEFAULT_CFG_VALUE, _CASTVOICE_DEFAULT_DENOISE, _CASTVOICE_DEFAULT_NORMALIZE, _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
+from gateway.castvoice import _CASTVOICE_DEFAULT_TIMESTEPS, _CASTVOICE_DEFAULT_CFG_VALUE, _CASTVOICE_DEFAULT_DENOISE, _CASTVOICE_DEFAULT_NORMALIZE, _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
 from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
@@ -199,7 +199,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                     cfg_value=params["cfg_value"],
                     normalize=params["normalize"],
                     denoise=params["denoise"],
-                    inference_timesteps=30,
+                    inference_timesteps=_VOXCPM2_DEFAULT_TIMESTEPS,
                     speed=params["speed"],
                     seed=seed,
                 )
@@ -225,7 +225,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                     prompt_text="",
                     speaker_id=speaker_id,
                     cfg_value=params["cfg_value"],
-                    inference_timesteps=30,
+                    inference_timesteps=_CASTVOICE_DEFAULT_TIMESTEPS,
                     seed=seed,
                     speed=params["speed"],
                 )
@@ -349,7 +349,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                         "cfg_value": params["cfg_value"],
                         "normalize": params["normalize"],
                         "denoise": params["denoise"],
-                        "inference_timesteps": 30,
+                        "inference_timesteps": _VOXCPM2_DEFAULT_TIMESTEPS,
                         "speed": params["speed"],
                         "seed": item.seed,
                     }
