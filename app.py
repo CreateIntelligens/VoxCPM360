@@ -15,7 +15,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import gradio as gr
 import numpy as np
-from funasr import AutoModel
 from nanovllm_voxcpm import VoxCPM
 from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig
 
@@ -324,7 +323,7 @@ class VoxCPMDemo:
 
         self.asr_model_id = "iic/SenseVoiceSmall"
         self.asr_device = "cuda:0" if self.device.startswith("cuda") else "cpu"
-        self.asr_model: Optional[AutoModel] = None
+        self.asr_model: Optional[Any] = None
 
         roots_setting = os.environ.get(
             "VOXCPM_LORA_ROOTS",
@@ -523,9 +522,14 @@ class VoxCPMDemo:
                 torch.cuda.empty_cache()
         logger.info("nano-vllm model stopped.")
 
-    def get_or_load_asr_model(self) -> AutoModel:
+    def get_or_load_asr_model(self) -> Any:
         if self.asr_model is not None:
             return self.asr_model
+        # funasr 的 import 要 17 秒，佔 app 匯入成本的六成，而 ASR 只有
+        # Gradio 介面上那個 toggle 會用到（生產日誌顯示從未載入過）。
+        # 延後到真正要建構模型時才付這筆錢。
+        from funasr import AutoModel
+
         logger.info(
             f"Loading ASR model: {self.asr_model_id} on device: {self.asr_device}"
         )
