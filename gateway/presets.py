@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from app import VoxCPMDemo, create_demo_interface
+from runtime_config import read_default_inference_timesteps
 from voxcpm.barbet_registry import BarbetModelRegistry
 from voxcpm.barbet_runtime import BarbetRuntime
 from voxcpm.full_model_registry import FULL_MODEL_PREFIX, FullModelRegistry
@@ -185,7 +186,7 @@ _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
 )
 _DEFAULT_REFERENCE_PRESET_ID = "cosy-young-female-01"
 # 未指定步數時沿用部署設定；相同設定也用於引擎啟動時的 CUDA graph。
-_VOXCPM2_DEFAULT_TIMESTEPS = int(os.environ.get("VOXCPM_INFERENCE_TIMESTEPS", "10"))
+_VOXCPM2_DEFAULT_TIMESTEPS = read_default_inference_timesteps()
 
 _DEFAULT_CONTROL_INSTRUCTION = os.environ.get(
     "VOXCPM_DEFAULT_CONTROL_INSTRUCTION", "用台語說"

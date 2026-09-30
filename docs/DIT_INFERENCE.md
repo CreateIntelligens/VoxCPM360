@@ -20,6 +20,10 @@ Barbet 維持 30；兩者的預設步數均納入 `model_version` 指紋。
 修補由 `scripts/patch_nanovllm_timesteps.py` 套用至
 `nano-vllm-voxcpm==2.0.4`；Dockerfile 的 runner 階段會自動套用。
 腳本以來源結構檢查相容性，不符合時直接停止建置，避免升級後靜默失效。
+服務啟動時也會檢查同步、非同步與 worker 介面的逐請求步數支援；
+即使 `VOXCPM_PRELOAD=false`，缺少補丁也會停止啟動，避免 catalog 宣告後才合成失敗。
+`VOXCPM_INFERENCE_TIMESTEPS` 必須是 1–50 的整數；不合法時於載入模型前報錯，
+API 預設值與引擎的 CUDA graph 步數共用同一個驗證函式。
 
 GB10 `10.9.0.37:8800` 已驗證一般、串流及 10／20／30 混合並行請求，
 皆回傳 HTTP 200 與正確的 effective 步數。未指定時仍回報 10。

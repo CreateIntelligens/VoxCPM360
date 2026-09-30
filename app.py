@@ -18,6 +18,11 @@ import numpy as np
 from nanovllm_voxcpm import VoxCPM
 from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig
 
+from runtime_config import (
+    read_default_inference_timesteps,
+    require_per_request_timesteps,
+)
+
 import voxcpm
 from voxcpm.lora_registry import (
     BASE_MODEL_KEY,
@@ -294,6 +299,8 @@ def _ensure_owned_engine_loop() -> Any:
 
 class VoxCPMDemo:
     def __init__(self, model_id: str = "openbmb/VoxCPM2", device: str = "auto") -> None:
+        read_default_inference_timesteps()
+        require_per_request_timesteps()
         self.device = resolve_runtime_device(device, "cuda")
         self.optimize = os.environ.get("VOXCPM_OPTIMIZE", "false").lower() == "true"
         self.gpu_memory_utilization = float(
@@ -467,9 +474,7 @@ class VoxCPMDemo:
             self._model_id,
             # 此步數是預設值，也是 CUDA graph 的固定加速路徑。
             # 逐請求的其他步數由 runner 分組後以 eager 執行。
-            inference_timesteps=int(
-                os.environ.get("VOXCPM_INFERENCE_TIMESTEPS", "10")
-            ),
+            inference_timesteps=read_default_inference_timesteps(),
             max_num_batched_tokens=8192,
             max_num_seqs=16,
             max_model_len=4096,

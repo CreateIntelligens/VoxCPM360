@@ -86,6 +86,8 @@ barbet = ["LICENSE"]
 
 [tool.setuptools_scm]
 version_scheme = "post-release"
+# Wheel-cache tags are not package versions; select only release-style tags.
+git_describe_command = "git describe --dirty --tags --long --match [0-9]* --match v[0-9]*"
 
 [tool.black]
 line-length = 120

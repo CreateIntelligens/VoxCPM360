@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from app import VoxCPMDemo, create_demo_interface
+from runtime_config import require_per_request_timesteps
 from voxcpm.barbet_registry import BarbetModelRegistry
 from voxcpm.barbet_runtime import BarbetRuntime
 from voxcpm.full_model_registry import FULL_MODEL_PREFIX, FullModelRegistry
@@ -49,6 +50,8 @@ class TTSGateway:
         demo: VoxCPMDemo,
         barbet_runtime: BarbetRuntime | None = None,
     ) -> None:
+        # Catalog capabilities require a patched engine even with preload off.
+        require_per_request_timesteps(getattr(demo, "voxcpm_server", None))
         self.demo = demo
         self._base_demo = demo
         self._native_demo = demo
