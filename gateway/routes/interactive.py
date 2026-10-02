@@ -84,9 +84,17 @@ def register_interactive_routes(app, gateway, history_lock):
         }
 
     @app.get("/api/v1/health")
-    async def health() -> dict[str, Any]:
+    async def health() -> Any:
         catalog = await _catalog_payload()
-        return {"status": "ok", **catalog}
+        worker = await asyncio.to_thread(gateway.worker_status)
+        if worker.get("alive") is False:
+            # worker 被殺掉時 gateway 本身還活著，以前這裡照回 ok，
+            # 正式環境因此等了 7 小時、每個請求 120 秒才退備援。
+            return JSONResponse(
+                status_code=503,
+                content={"status": "worker_dead", "worker": worker, **catalog},
+            )
+        return {"status": "ok", "worker": worker, **catalog}
 
     @app.get("/api/v1/catalog")
     async def catalog() -> dict[str, Any]:

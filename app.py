@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Optional, Tuple
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -297,6 +298,40 @@ def _ensure_owned_engine_loop() -> Any:
         return loop
 
 
+class EngineWorkerDied(RuntimeError):
+    """nano-vLLM 推論子程序已不在（例如被 kernel OOM killer 殺掉）。"""
+
+
+def _engine_processes(server: Any) -> Optional[list[Any]]:
+    """取出 server 底下所有推論子程序；拿不到（假物件、舊 runtime）回 None。"""
+    pool = getattr(server, "server_pool", None) or server
+    servers = getattr(pool, "servers", None)
+    if not isinstance(servers, (list, tuple)):
+        return None
+    processes = [getattr(item, "process", None) for item in servers]
+    if not processes or any(proc is None for proc in processes):
+        return None
+    return processes
+
+
+def engine_alive(server: Any) -> Optional[bool]:
+    """True = 子程序都在；False = 至少一個已退出；None = 無法判斷。
+
+    worker 被 OOM killer 殺掉時父行程不會收到任何通知，送進 queue 的請求
+    永遠等不到回應。沒有這個檢查，health 照回 ok、每個請求卡滿 300 秒。
+    """
+    processes = _engine_processes(server)
+    if processes is None:
+        return None
+    for proc in processes:
+        if getattr(proc, "exitcode", None) is not None:
+            return False
+        is_alive = getattr(proc, "is_alive", None)
+        if callable(is_alive) and not is_alive():
+            return False
+    return True
+
+
 class VoxCPMDemo:
     def __init__(self, model_id: str = "openbmb/VoxCPM2", device: str = "auto") -> None:
         read_default_inference_timesteps()
@@ -374,6 +409,10 @@ class VoxCPMDemo:
         ):
             pool = server
             server_loop = server_loop or _ensure_owned_engine_loop()
+        if engine_alive(server) is False:
+            raise EngineWorkerDied(
+                f"nano-vllm worker is not running (method={method_name})"
+            )
         if (
             server_loop is not None
             and server_loop.is_running()
@@ -382,7 +421,20 @@ class VoxCPMDemo:
             future = asyncio.run_coroutine_threadsafe(
                 getattr(pool, method_name)(*args), server_loop
             )
-            return future.result(timeout=300)
+            # 等待期間子程序若死掉，queue 永遠不會回應；每秒看一次存活，
+            # 死了就立刻失敗，不要等滿 300 秒。
+            deadline = time.monotonic() + 300
+            while True:
+                try:
+                    return future.result(timeout=1.0)
+                except FutureTimeoutError:
+                    if engine_alive(server) is False:
+                        future.cancel()
+                        raise EngineWorkerDied(
+                            f"nano-vllm worker died while handling {method_name}"
+                        ) from None
+                    if time.monotonic() >= deadline:
+                        raise
         return getattr(server, method_name)(*args)
 
     def _ensure_server_loop_running(self) -> None:
@@ -413,10 +465,25 @@ class VoxCPMDemo:
                 )
                 self._server_loop_thread.start()
 
+    def worker_alive(self) -> Optional[bool]:
+        """已載入的推論子程序是否還活著；未載入或無法判斷回 None。"""
+        server = getattr(self, "voxcpm_server", None)
+        if server is None:
+            return None
+        return engine_alive(server)
+
     def get_or_load_voxcpm(self):
         if self.voxcpm_server is not None:
-            self._ensure_server_loop_running()
-            return self.voxcpm_server
+            if self.worker_alive() is False:
+                # 子程序死了但父行程還在：清掉殘骸重載，讓下一個請求自己復原，
+                # 而不是對著死 queue 等 300 秒。
+                logger.error(
+                    "nano-vllm worker for %s is gone; reloading", self._model_id
+                )
+                self.stop_voxcpm()
+            else:
+                self._ensure_server_loop_running()
+                return self.voxcpm_server
         try:
             asyncio.get_running_loop()
         except RuntimeError:

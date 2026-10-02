@@ -630,6 +630,21 @@ class TTSGateway:
         logger.info("Native runtime switched to %s", desired_runtime_id)
         return next_demo, runtime_selection, canonical_id
 
+    def worker_status(self) -> dict[str, Any]:
+        """推論子程序存活狀態，給 /api/v1/health 用。
+
+        alive=False 代表 worker 已死（典型是被 OOM killer 殺掉）但 gateway
+        還在；呼叫端應視為服務不可用，不要等每個請求逾時才退備援。
+        """
+        demo = self._native_demo
+        probe = getattr(demo, "worker_alive", None)
+        alive = probe() if callable(probe) else None
+        return {
+            "loaded": getattr(demo, "voxcpm_server", None) is not None,
+            "alive": alive,
+            "model": self._native_runtime_id,
+        }
+
     def close(self) -> None:
         stop = getattr(self._native_demo, "stop_voxcpm", None)
         if callable(stop):
