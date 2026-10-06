@@ -1,10 +1,16 @@
 # ==========================================
-# Stage 1: Base image with CUDA and python dependencies
+# Stage 1: Base images with CUDA and python dependencies
 # ==========================================
 # CUDA 世代可切換，但 base image、torch variant、flash-attn 版本三者必須
 # 同時改 —— 混搭會在執行期缺 libcudart。GB10/sm_121 需要 CUDA 13 的瘦長
 # GEMM 調優，見 docs/plans/2026-08-31-gb10-cuda13-upgrade-design.md。
+# builder 需要 devel 的 nvcc 編 flash-attn；runner 只用 runtime（省約 7GB）——
+# torch 連的是 venv 自帶的 nvidia/cu13 與 cuDNN，devel 那套執行期用不到。
+# 不可再縮成 564MB 的 `base` tag：flash-attn 連的是 image 的
+# /usr/local/cuda/lib64/libcudart.so.13，不是 venv 那份。
 ARG CUDA_BASE_IMAGE=nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.0.3-cudnn-runtime-ubuntu22.04
+
 FROM ${CUDA_BASE_IMAGE} AS base
 
 # Prevent Python from writing pyc files and buffering stdout/stderr
@@ -16,7 +22,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install runtime system dependencies and python
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3.10-dev \
@@ -25,6 +30,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     build-essential \
+    git \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM ${CUDA_RUNTIME_IMAGE} AS runtime-base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONPATH=/app/src \
+    PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+# 看似只屬於 build 的三樣，執行期都會用到：
+# - gcc/g++ 與 python3.10-dev：triton 在執行期編 kernel，缺了
+#   torch.compile 會 InductorError（VOXCPM_OPTIMIZE=true 失效）。
+# - git：castvoice 取 git hash 當 CastAgent 快取 key，缺了退化成 nogit。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3.10-dev \
+    ffmpeg \
+    libsndfile1 \
+    gcc \
+    g++ \
     git \
     ca-certificates \
     curl \
@@ -129,7 +160,7 @@ COPY --from=builder /tmp/wheels/ /
 # ==========================================
 # Stage 3: Runner image (Production/Runtime)
 # ==========================================
-FROM base AS runner
+FROM runtime-base AS runner
 
 # Copy the pre-compiled virtual environment containing python packages from builder
 COPY --from=builder /opt/venv /opt/venv

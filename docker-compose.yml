@@ -17,6 +17,7 @@ services:
         TORCH_ARCH_LIST: ${TORCH_ARCH_LIST:-8.6;9.0;12.0}
         # 三者必須同時改，混搭會在執行期缺 libcudart。
         CUDA_BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04}
+        CUDA_RUNTIME_IMAGE: ${CUDA_RUNTIME_IMAGE:-nvidia/cuda:13.0.3-cudnn-runtime-ubuntu22.04}
         TORCH_CUDA_VARIANT: ${TORCH_CUDA_VARIANT:-cu130}
         FLASH_ATTN_VERSION: ${FLASH_ATTN_VERSION:-2.8.3}
         TORCH_VERSION: ${TORCH_VERSION:-2.13.0}
