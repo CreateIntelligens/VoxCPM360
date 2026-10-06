@@ -10,6 +10,10 @@
 
 本目錄包含 `cosy-*` 系列 14 個音檔（孩童／少年／青年／年長 × 男女聲），
 為同一句話由不同聲音錄製，逐字稿共用 `api.py` 的 `_COSY_PROMPT_TEXT`。
+音檔取自 CosyVoice（`10.9.0.35:50010`）的同名聲線（去掉 `cosy-` 前綴）。
+
+**只收台語錄音。** 華語參考音雖能讓模型輸出台語，但實聽品質很差，
+因此 CosyVoice 的華語聲線 `young-female-02`（Hayley）刻意不收。
 
 下拉項目與檔名的白名單定義於 `api.py`；新增檔案後仍須在該處加入項目。
 資產完整性由 `tests/test_reference_presets.py` 檢查；啟動時若 preset

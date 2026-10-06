@@ -434,7 +434,11 @@ nginx ─┬─ /        → web 服務（React 靜態檔，multi-stage build �
 > reference」，**該解釋有誤** —— 實測用**華語** reference 也會輸出台語。
 > 關鍵在「有沒有 reference」而非「reference 是什麼語言」：無 reference 時
 > 條件路徑缺失（log 不會出現 `[Voice Control] reference_wav only`），
-> 模型退回依文字表面發音。故預設參考音仍屬必要，但**不必堅持用台語音檔**。
+> 模型退回依文字表面發音。故預設參考音仍屬必要。
+>
+> 📌 **再修正（2026-10-02，ac-Spark 實聽）**：華語 reference 雖然會輸出台語，
+> **但音質很差**。**內建參考音一律用台語錄音**：`cosy-*` 14 個都是同一句台語，
+> CosyVoice 的華語聲線 `young-female-02`（Hayley）因此刻意不收。
 
 > ⚠️ 實作細節：預設路徑**不可**寫進 `temp_path`，那個變數在 `finally` 會被
 > `os.unlink` —— 會刪掉預設檔本身。故另用 `active_reference` 傳給推論。
