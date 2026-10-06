@@ -3,7 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app import VoxCPMDemo
+import app as app_module
+from app import VoxCPMDemo, resolve_gpu_memory_utilization
 
 
 class FakeRegistry:
@@ -111,11 +112,37 @@ def test_prompt_cloning_does_not_prefix_control_instruction(tmp_path):
 
 def test_defaults_to_guarded_gpu_memory_utilization(monkeypatch, tmp_path):
     monkeypatch.delenv("VOXCPM_GPU_MEMORY_UTILIZATION", raising=False)
+    monkeypatch.delenv("VOXCPM_GPU_MEMORY_GB", raising=False)
     monkeypatch.setenv("VOXCPM_LORA_ROOT", str(tmp_path))
+    # 無 CUDA 時算不出比例，退回佔位值
+    monkeypatch.setattr(app_module, "_total_gpu_memory_gb", lambda device: None)
 
     demo = VoxCPMDemo(device="cpu")
 
     assert demo.gpu_memory_utilization == 0.35
+
+
+def test_gpu_memory_budget_in_gb_scales_with_the_machine(monkeypatch):
+    env = {"VOXCPM_GPU_MEMORY_GB": "10"}
+    monkeypatch.setattr(app_module, "_total_gpu_memory_gb", lambda device: 119.0)
+    assert resolve_gpu_memory_utilization("cuda:0", env) == pytest.approx(10 / 119, abs=1e-4)
+    monkeypatch.setattr(app_module, "_total_gpu_memory_gb", lambda device: 16.0)
+    assert resolve_gpu_memory_utilization("cuda:0", env) == pytest.approx(0.625, abs=1e-4)
+    # 預設 10 GB
+    assert resolve_gpu_memory_utilization("cuda:0", {}) == pytest.approx(0.625, abs=1e-4)
+    # 預算比整張卡還大就封頂
+    assert resolve_gpu_memory_utilization("cuda:0", {"VOXCPM_GPU_MEMORY_GB": "40"}) == 1.0
+
+
+def test_explicit_utilization_overrides_gb_budget(monkeypatch):
+    monkeypatch.setattr(app_module, "_total_gpu_memory_gb", lambda device: 119.0)
+    env = {"VOXCPM_GPU_MEMORY_GB": "10", "VOXCPM_GPU_MEMORY_UTILIZATION": "0.35"}
+    assert resolve_gpu_memory_utilization("cuda:0", env) == 0.35
+    # compose 傳空字串代表沒設，要當成未指定
+    env["VOXCPM_GPU_MEMORY_UTILIZATION"] = ""
+    assert resolve_gpu_memory_utilization("cuda:0", env) == pytest.approx(10 / 119, abs=1e-4)
+    with pytest.raises(ValueError, match="must be > 0"):
+        resolve_gpu_memory_utilization("cuda:0", {"VOXCPM_GPU_MEMORY_GB": "0"})
 
 
 def test_rejects_invalid_gpu_memory_utilization(monkeypatch, tmp_path):

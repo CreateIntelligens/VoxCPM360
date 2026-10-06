@@ -298,6 +298,49 @@ def _ensure_owned_engine_loop() -> Any:
         return loop
 
 
+DEFAULT_GPU_MEMORY_GB = 10.0
+# 沒有 CUDA（單元測試、CPU 機器）時算不出比例；nano-vLLM 反正只跑 CUDA，
+# 這個值只是佔位，不會真的拿去配記憶體。
+_FALLBACK_GPU_MEMORY_UTILIZATION = 0.35
+
+
+def _total_gpu_memory_gb(device: str) -> Optional[float]:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        index = int(device.split(":")[-1]) if ":" in device else 0
+        return torch.cuda.get_device_properties(index).total_memory / 1024**3
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def resolve_gpu_memory_utilization(
+    device: str, environ: Optional[dict[str, str]] = None
+) -> float:
+    """把「這台最多給 VoxCPM 幾 GB」換算成 nano-vLLM 要的比例。
+
+    比例寫死在 compose 會跟著機器變：0.35 在 16 GB 卡是 5.6 GB、在 119 GB
+    統一記憶體的 GB10 卻是 42 GB，每換一台都要重算。改成用 GB 設定，
+    VOXCPM_GPU_MEMORY_UTILIZATION 仍可明確指定比例覆蓋。
+    """
+    env = os.environ if environ is None else environ
+    explicit = (env.get("VOXCPM_GPU_MEMORY_UTILIZATION") or "").strip()
+    if explicit:
+        fraction = float(explicit)
+        if not 0 < fraction <= 1:
+            raise ValueError("VOXCPM_GPU_MEMORY_UTILIZATION must be in (0, 1]")
+        return fraction
+    budget_gb = float(env.get("VOXCPM_GPU_MEMORY_GB") or DEFAULT_GPU_MEMORY_GB)
+    if budget_gb <= 0:
+        raise ValueError("VOXCPM_GPU_MEMORY_GB must be > 0")
+    total_gb = _total_gpu_memory_gb(device)
+    if total_gb is None:
+        return _FALLBACK_GPU_MEMORY_UTILIZATION
+    return min(1.0, round(budget_gb / total_gb, 4))
+
+
 class EngineWorkerDied(RuntimeError):
     """nano-vLLM 推論子程序已不在（例如被 kernel OOM killer 殺掉）。"""
 
@@ -338,11 +381,7 @@ class VoxCPMDemo:
         require_per_request_timesteps()
         self.device = resolve_runtime_device(device, "cuda")
         self.optimize = os.environ.get("VOXCPM_OPTIMIZE", "false").lower() == "true"
-        self.gpu_memory_utilization = float(
-            os.environ.get("VOXCPM_GPU_MEMORY_UTILIZATION", "0.35")
-        )
-        if not 0 < self.gpu_memory_utilization <= 1:
-            raise ValueError("VOXCPM_GPU_MEMORY_UTILIZATION must be in (0, 1]")
+        self.gpu_memory_utilization = resolve_gpu_memory_utilization(self.device)
         self.max_generate_length = int(
             os.environ.get("VOXCPM_MAX_GENERATE_LENGTH", "2000")
         )

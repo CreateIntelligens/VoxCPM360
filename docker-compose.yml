@@ -30,7 +30,10 @@ services:
       - VOXCPM_DEVICE=${VOXCPM_DEVICE:-auto}
       - MODEL_ID=${MODEL_ID:-/app/checkpoints/ft-mixed-lr2e5-avgE-e12run-0820}
       - VOXCPM_OPTIMIZE=${VOXCPM_OPTIMIZE:-false}
-      - VOXCPM_GPU_MEMORY_UTILIZATION=${VOXCPM_GPU_MEMORY_UTILIZATION:-0.35}
+      # 給 VoxCPM 的 GPU 記憶體上限，以 GB 設定，啟動時換算成比例，換機器不用重算。
+      # 要直接指定比例就設 VOXCPM_GPU_MEMORY_UTILIZATION（優先）。
+      - VOXCPM_GPU_MEMORY_GB=${VOXCPM_GPU_MEMORY_GB:-10}
+      - VOXCPM_GPU_MEMORY_UTILIZATION=${VOXCPM_GPU_MEMORY_UTILIZATION:-}
       - VOXCPM_PRELOAD=${VOXCPM_PRELOAD:-true}
       # One GB10 GPU is shared by both engines. Keep one active job, allow at
       # most two waiters, and fail queued requests explicitly instead of
