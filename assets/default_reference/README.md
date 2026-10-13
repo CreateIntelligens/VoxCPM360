@@ -15,6 +15,11 @@
 **只收台語錄音。** 華語參考音雖能讓模型輸出台語，但實聽品質很差，
 因此 CosyVoice 的華語聲線 `young-female-02`（Hayley）刻意不收。
 
+`gemini/` 另有 6 個青年聲（男女各 3，Fenrir／Alnilam／Sadaltager、
+Autonoe／Despina／Erinome），24 kHz WAV，同一句台語「創作智能真歡喜，會使參加
+高雄的智慧時代。」逐字稿存於 `_GEMINI_PROMPT_TEXT`，由 Breeze-ASR-26 與 SenseVoice
+交叉核對，尚未人耳逐字驗證；來源與雜湊見該目錄的 `manifest.json`。
+
 下拉項目與檔名的白名單定義於 `api.py`；新增檔案後仍須在該處加入項目。
 資產完整性由 `tests/test_reference_presets.py` 檢查；啟動時若 preset
 對應的音檔缺失，`create_app` 會記錄 warning 並自選單隱藏該項目。

@@ -350,7 +350,10 @@ def test_catalog_exposes_available_reference_presets(monkeypatch, tmp_path):
     monkeypatch.setattr(api, "_REFERENCE_AUDIO_DIR", tmp_path)
     monkeypatch.setattr(gateway.presets, "_REFERENCE_AUDIO_DIR", tmp_path)
     for preset in api._REFERENCE_AUDIO_PRESETS:
-        (tmp_path / preset["filename"]).write_bytes(b"audio")
+        # gemini-* 這批放在子目錄，filename 含路徑
+        target = tmp_path / preset["filename"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"audio")
     app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
 
     with TestClient(app) as client:

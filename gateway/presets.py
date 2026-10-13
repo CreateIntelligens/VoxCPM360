@@ -56,6 +56,9 @@ _LANG_ZH_TW = "zh-TW"
 _COSY_PROMPT_TEXT = (
     "你好，歡迎使用創造智能台語生成服務，很高興為你服務，請輸入想要生成的文本內容"
 )
+# gemini-* 這批 6 個是 Gemini TTS 預建聲線唸同一句台語（assets/default_reference/gemini/）。逐字稿以
+# Breeze-ASR-26 與 SenseVoice 兩套 ASR 交叉核對（2026-10-13），尚未人耳逐字驗證。
+_GEMINI_PROMPT_TEXT = "創作智能真歡喜，會使參加高雄的智慧時代。"
 _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
     {
         "id": "cosy-child-female-01",
@@ -181,6 +184,60 @@ _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
         "description": "基頻約 118 Hz，音域約 91–158 Hz",
         "prompt_text": _COSY_PROMPT_TEXT,
         "gender": "male",
+        "language": _LANG_NAN_TW,
+    },
+    {
+        "id": "gemini-fenrir",
+        "label": "Fenrir（青年男聲・臺灣台語）",
+        "filename": "gemini/gemini-fenrir.wav",
+        "description": "圓潤、極乾淨、柔和自然",
+        "prompt_text": _GEMINI_PROMPT_TEXT,
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+    },
+    {
+        "id": "gemini-alnilam",
+        "label": "Alnilam（青年男聲・臺灣台語）",
+        "filename": "gemini/gemini-alnilam.wav",
+        "description": "音質極為清亮乾淨，共鳴適中，無任何雜訊",
+        "prompt_text": _GEMINI_PROMPT_TEXT,
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+    },
+    {
+        "id": "gemini-sadaltager",
+        "label": "Sadaltager（青年男聲・臺灣台語）",
+        "filename": "gemini/gemini-sadaltager.wav",
+        "description": "聲音飽滿清亮，質地非常流暢自然且圓潤",
+        "prompt_text": _GEMINI_PROMPT_TEXT,
+        "gender": "male",
+        "language": _LANG_NAN_TW,
+    },
+    {
+        "id": "gemini-autonoe",
+        "label": "Autonoe（青年女聲・臺灣台語）",
+        "filename": "gemini/gemini-autonoe.wav",
+        "description": "亮麗清爽、結實清亮",
+        "prompt_text": _GEMINI_PROMPT_TEXT,
+        "gender": "female",
+        "language": _LANG_NAN_TW,
+    },
+    {
+        "id": "gemini-despina",
+        "label": "Despina（青年女聲・臺灣台語）",
+        "filename": "gemini/gemini-despina.wav",
+        "description": "潤澤溫和、聲線純淨透亮",
+        "prompt_text": _GEMINI_PROMPT_TEXT,
+        "gender": "female",
+        "language": _LANG_NAN_TW,
+    },
+    {
+        "id": "gemini-erinome",
+        "label": "Erinome（青年女聲・臺灣台語）",
+        "filename": "gemini/gemini-erinome.wav",
+        "description": "清亮高亢、透光度高",
+        "prompt_text": _GEMINI_PROMPT_TEXT,
+        "gender": "female",
         "language": _LANG_NAN_TW,
     },
 )
