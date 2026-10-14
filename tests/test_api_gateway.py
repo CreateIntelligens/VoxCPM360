@@ -3528,3 +3528,57 @@ def test_castvoice_version_reflects_native_default_timesteps(monkeypatch):
     before = castvoice._compute_castvoice_model_version()
     monkeypatch.setattr(castvoice, "_VOXCPM2_DEFAULT_TIMESTEPS", 21)
     assert castvoice._compute_castvoice_model_version() != before
+
+
+def test_native_streaming_can_output_16k(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    # 48 kHz 原生，一段 1 kHz 正弦波切成不等長 chunk；重採樣要跨 chunk 連續
+    native_rate = 48_000
+    t = np.arange(int(native_rate * 0.3)) / native_rate
+    sine = (0.3 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+    chunks = [sine[:5000], sine[5000:5003], sine[5003:11000], sine[11000:]]
+    demo = FakeStreamingDemo(chunks=chunks)
+    demo.server = FakeStreamingServer(sample_rate=native_rate)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/synthesize/stream",
+            data={
+                "engine_id": "voxcpm2",
+                "model_id": "__base__",
+                "text": "台語串流測試",
+                "sample_rate": "16000",
+            },
+        )
+        history = client.get("/api/v1/history?limit=1").json()["items"]
+        history_audio = client.get(f"/api/v1/history/{history[0]['id']}/audio")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.headers["x-sample-rate"] == "16000"
+    assert int.from_bytes(response.content[24:28], "little") == 16_000
+    assert int.from_bytes(response.content[28:32], "little") == 32_000
+    pcm = np.frombuffer(response.content[44:], dtype="<i2").astype(np.float32) / 32767
+    # 長度約為原生的 1/3（濾波器延遲允許幾十個樣本誤差）
+    assert abs(len(pcm) - len(sine) // 3) < 64
+    # 1 kHz 正弦波重採樣後還是 1 kHz：找 FFT 峰值
+    spectrum = np.abs(np.fft.rfft(pcm[200:-200]))
+    peak_hz = np.argmax(spectrum) * 16_000 / len(pcm[200:-200])
+    assert abs(peak_hz - 1000) < 20
+    # 接縫沒有爆音：相鄰樣本差不會超過正弦波的理論最大斜率
+    assert np.max(np.abs(np.diff(pcm[100:-100]))) < 0.3 * 2 * np.pi * 1000 / 16_000 * 1.5
+    # history 仍存原生取樣率
+    assert int.from_bytes(history_audio.content[24:28], "little") == native_rate
+
+
+def test_native_streaming_rejects_unsupported_sample_rate(monkeypatch):
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    app = api.create_app(FakeStreamingDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/synthesize/stream",
+            data={"engine_id": "voxcpm2", "model_id": "__base__", "text": "x", "sample_rate": "22050"},
+        )
+    assert response.status_code == 422
+    assert "sample_rate" in response.json()["detail"]

@@ -43,7 +43,7 @@ from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DE
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
-from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
+from gateway.streaming import _STREAMING_END, _STREAM_OUTPUT_SAMPLE_RATES, _ChunkResampler, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
 from gateway.gateway import TTSGateway
 from gateway.castvoice import CastVoiceSynthesizeRequest, CastVoiceBatchItemRequest, CastVoiceBatchRequest, _CastVoiceError, _CastVoiceBatchItem, _CastVoiceBatch, DynamicBatchSizer, CastVoiceBatchManager
@@ -463,9 +463,19 @@ def register_interactive_routes(app, gateway, history_lock):
         denoise: bool = Form(False),
         speed: float = Form(1.0),
         seed: int | None = Form(None),
+        # 選填：輸出取樣率。不帶＝模型原生（48 kHz）；目前只接受 16000。
+        sample_rate: int | None = Form(None),
         reference_audio: UploadFile | None = File(None),
     ) -> Response:
         request_id = uuid.uuid4().hex
+        # 測試直接呼叫路由函式時拿到的是 Form 預設物件而非 None
+        if not isinstance(sample_rate, int):
+            sample_rate = None
+        if sample_rate is not None and sample_rate not in _STREAM_OUTPUT_SAMPLE_RATES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"sample_rate 只支援 {', '.join(str(r) for r in _STREAM_OUTPUT_SAMPLE_RATES)}，或不帶沿用原生取樣率",
+            )
         logger.info(
             "synthesis.request request_id=%s stage=received engine=%s model=%s "
             "content_type=%s text_chars=%d streaming=true",
@@ -511,18 +521,27 @@ def register_interactive_routes(app, gateway, history_lock):
 
         history_id = uuid.uuid4().hex
         audio_chunks: list[np.ndarray] = []
+        output_rate = sample_rate or stream.sample_rate
+        resampler = _ChunkResampler(stream.sample_rate, output_rate)
+
+        def _pcm16(audio: np.ndarray) -> bytes:
+            return (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
         async def body() -> AsyncIterator[bytes]:
-            yield gateway._streaming_wav_header(stream.sample_rate)
+            yield gateway._streaming_wav_header(output_rate)
             try:
                 async for chunk in stream:
                     normalized = gateway._peak_normalize(
                         np.asarray(chunk, dtype=np.float32)
                     )
+                    # history 存原生取樣率，重採樣只影響送出的 bytes
                     audio_chunks.append(normalized)
-                    yield (
-                        np.clip(normalized, -1.0, 1.0) * 32767
-                    ).astype("<i2").tobytes()
+                    out = resampler.process(normalized)
+                    if out.size:
+                        yield _pcm16(out)
+                tail = resampler.flush()
+                if tail.size:
+                    yield _pcm16(tail)
             except asyncio.CancelledError:
                 logger.warning(
                     "synthesis.request request_id=%s stage=client_cancelled "
@@ -572,7 +591,7 @@ def register_interactive_routes(app, gateway, history_lock):
             "X-Model-Engine": "voxcpm2",
             "X-Model-Version": prepared.model_id,
             "X-Request-ID": request_id,
-            "X-Sample-Rate": str(stream.sample_rate),
+            "X-Sample-Rate": str(output_rate),
             "X-Inference-Timesteps-Effective": str(prepared.inference_timesteps),
             "X-Engine-Concurrency": str(stream.session_concurrency),
         }

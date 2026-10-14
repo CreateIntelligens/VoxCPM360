@@ -28,6 +28,7 @@ import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+import soxr
 from pydantic import BaseModel
 
 from app import VoxCPMDemo, create_demo_interface
@@ -114,6 +115,43 @@ class _NativeSynthesisStream:
             raise
         finally:
             await self._cleanup_done.wait()
+
+
+# 串流端點可選的輸出取樣率。16 kHz 是 MatesX 對嘴等下游要的格式，在模型端
+# 降頻比呼叫端拿 48 kHz WAV 再重採樣省一次轉換。
+_STREAM_OUTPUT_SAMPLE_RATES = (16_000,)
+
+
+class _ChunkResampler:
+    """逐 chunk 重採樣，跨 chunk 保留濾波器狀態，接縫不會有爆音。
+
+    soxr.ResampleStream 是有狀態的；對每個 chunk 各自呼叫一次性 resample
+    會在邊界截斷濾波器尾巴，拼起來會有週期性雜訊。
+    """
+
+    def __init__(self, source_rate: int, target_rate: int) -> None:
+        self.source_rate = int(source_rate)
+        self.target_rate = int(target_rate)
+        self._stream = (
+            None
+            if self.source_rate == self.target_rate
+            else soxr.ResampleStream(
+                self.source_rate, self.target_rate, 1, dtype="float32"
+            )
+        )
+
+    def process(self, chunk: np.ndarray, *, last: bool = False) -> np.ndarray:
+        chunk = np.asarray(chunk, dtype=np.float32)
+        if self._stream is None:
+            return chunk
+        return np.asarray(
+            self._stream.resample_chunk(chunk, last=last), dtype=np.float32
+        )
+
+    def flush(self) -> np.ndarray:
+        if self._stream is None:
+            return np.zeros(0, dtype=np.float32)
+        return self.process(np.zeros(0, dtype=np.float32), last=True)
 
 
 class _ManagedStreamingResponse(StreamingResponse):

@@ -73,7 +73,9 @@ reference 解析、prompt_text 自動帶入、control_instruction 互斥邏輯�
 - Headers（回應開頭即送出，因此**不含**生成結束才知道的
   `X-Queue-Wait` / `X-GPU-Job-Time` / `X-Synthesis-Time`）：
   - `X-Request-ID`、`X-Model-Engine`、`X-Model-Version`（同現有端點）
-  - `X-Sample-Rate`：整數字串
+  - `X-Sample-Rate`：整數字串。2026-10-14 起可帶選填表單欄位 `sample_rate=16000`
+    讓模型端用 soxr 逐 chunk 降頻成 16 kHz 單聲道 PCM16 WAV（header 與此
+    header 同步改為 16000）；不帶維持原生 48 kHz。history 一律存原生取樣率。
   - `X-History-ID`：**預先產生**的 history id；串流正常完成後才會真的
     寫入 history。客戶端拿到 id 後若查無此筆，表示串流未完成。
   - `X-Accel-Buffering: no`：停用 nginx response buffering，確保公開入口

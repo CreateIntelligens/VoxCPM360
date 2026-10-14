@@ -42,6 +42,7 @@ dependencies = [
     "simplejson",
     "sortedcontainers",
     "soundfile",
+    "soxr",
     "librosa",
     "matplotlib",
     "funasr",
