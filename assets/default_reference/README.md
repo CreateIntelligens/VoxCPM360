@@ -8,12 +8,14 @@
 舊版用戶端未傳送選項時，可用環境變數 `VOXCPM_DEFAULT_REFERENCE` 覆寫預設
 路徑；設為空字串則停用預設參考音訊。
 
-本目錄包含 `cosy-*` 系列 14 個音檔（孩童／少年／青年／年長 × 男女聲），
+本目錄包含 `cosy-*` 系列 15 個音檔（孩童／少年／青年／年長 × 男女聲），
 為同一句話由不同聲音錄製，逐字稿共用 `api.py` 的 `_COSY_PROMPT_TEXT`。
 音檔取自 CosyVoice（`10.9.0.35:50010`）的同名聲線（去掉 `cosy-` 前綴）。
 
-**只收台語錄音。** 華語參考音雖能讓模型輸出台語，但實聽品質很差，
-因此 CosyVoice 的華語聲線 `young-female-02`（Hayley）刻意不收。
+**只收台語錄音。** 華語參考音雖能讓模型輸出台語，但實聽品質很差。
+CosyVoice 的華語聲線 `young-female-02`（Hayley）因此不直接收它的華語錄音；
+`cosy-young-female-02.mp3` 是請 CosyVoice 用這個聲線唸同一句台語逐字稿
+（CosyVoice 先轉台文再合成）產生的台語錄音，2026-10-19 人耳確認為台語。
 
 `gemini/` 另有 6 個青年聲（男女各 3，Fenrir／Alnilam／Sadaltager、
 Autonoe／Despina／Erinome），24 kHz WAV，同一句台語「創作智能真歡喜，會使參加

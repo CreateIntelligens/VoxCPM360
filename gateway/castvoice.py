@@ -482,6 +482,15 @@ _CASTVOICE_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "reference_preset_id": "cosy-young-female-01",
     },
     {
+        "voice_id": "voxcpm2-cosy-young-female-02",
+        "label": "Hayley（青年女聲・臺灣台語）",
+        "gender": "female",
+        "language": _LANG_NAN_TW,
+        "desc": "Hayley 聲線，VoxCPM2 zero-shot 聲音克隆",
+        "engine_id": "voxcpm2",
+        "reference_preset_id": "cosy-young-female-02",
+    },
+    {
         "voice_id": "voxcpm2-cosy-senior-female-01",
         "label": "年長女聲 01（臺灣台語）",
         "gender": "female",
