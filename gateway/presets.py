@@ -106,12 +106,12 @@ _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
         "language": _LANG_NAN_TW,
     },
     {
-        # Hayley：CosyVoice 華語聲線 young-female-02 由 CosyVoice 轉台文後唸同一句台語，
+        # CosyVoice 華語聲線 young-female-02 由 CosyVoice 轉台文後唸同一句台語，
         # 收的是台語錄音（華語錄音當參考音品質差，見 assets/default_reference/README.md）。
         "id": "cosy-young-female-02",
-        "label": "Hayley（青年女聲・臺灣台語）",
+        "label": "青年女聲 02（臺灣台語）",
         "filename": "cosy-young-female-02.mp3",
-        "description": "Hayley 聲線，與 IndexTTS／CosyVoice 的 Hayley 同一位",
+        "description": "與 CosyVoice young-female-02 同一聲線",
         "prompt_text": _COSY_PROMPT_TEXT,
         "gender": "female",
         "language": _LANG_NAN_TW,
