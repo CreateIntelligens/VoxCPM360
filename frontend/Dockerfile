@@ -7,6 +7,6 @@ RUN pnpm install --frozen-lockfile
 COPY frontend/ ./
 RUN pnpm build
 
-FROM nginx:alpine AS runner
+FROM nginx:1.31.7-alpine AS runner
 COPY nginx.template /etc/nginx/templates/default.conf.template
 COPY --from=builder /frontend/dist /usr/share/nginx/html
