@@ -50,6 +50,12 @@ dependencies = [
     "argbind",
     "safetensors",
     "speechbrain",
+    # 2026-10 安全下限：Docker 以 `uv pip install -r pyproject.toml` 重新解析、不讀 uv.lock，
+    # 傳遞依賴要在這裡設下限才會裝到修正版。Pillow 13、fsspec 2026.6 分別被 gradio 6、datasets 3 擋住；
+    # filelock 的修正版要 Python 3.11，正式環境是 3.10，所以沒加。
+    "certifi>=2026.10.23",
+    "brotli>=1.2.1",
+    "setuptools>=78.1.1",
 ]
 
 [project.optional-dependencies]
