@@ -55,7 +55,8 @@ dependencies = [
     # filelock 的修正版要 Python 3.11，正式環境是 3.10，所以沒加。
     "certifi>=2026.10.23",
     "brotli>=1.2.1",
-    "setuptools>=78.1.1",
+    # setuptools 82 起移除 pkg_resources，執行期仍有套件需要它
+    "setuptools>=78.1.1,<82",
 ]
 
 [project.optional-dependencies]
