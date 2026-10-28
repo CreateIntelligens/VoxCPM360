@@ -23,10 +23,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 \
-    python3.10-dev \
-    python3.10-venv \
-    python3-pip \
     ffmpeg \
     libsndfile1 \
     build-essential \
@@ -46,12 +42,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # 看似只屬於 build 的三樣，執行期都會用到：
-# - gcc/g++ 與 python3.10-dev：triton 在執行期編 kernel，缺了
-#   torch.compile 會 InductorError（VOXCPM_OPTIMIZE=true 失效）。
+# - gcc/g++：triton 在執行期編 kernel，缺了 torch.compile 會 InductorError
+#   （VOXCPM_OPTIMIZE=true 失效）。Python.h 由 /opt/python 那份 Python 自帶。
 # - git：castvoice 取 git hash 當 CastAgent 快取 key，缺了退化成 nogit。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 \
-    python3.10-dev \
     ffmpeg \
     libsndfile1 \
     gcc \
@@ -69,8 +63,13 @@ FROM base AS builder
 # Install uv for fast Python package resolution
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Create a virtual environment to isolate dependencies
-RUN python3.10 -m venv /opt/venv
+# Python 由 uv 安裝（Ubuntu 22.04 的 python3.11 套件停在 3.11.0），裝到固定路徑，
+# runner 整份複製過去，venv 的 python 連結才找得到。--seed 帶 pip：flash-attn
+# 從原始碼編時要用 pip wheel。
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
+ARG PYTHON_VERSION=3.11
+RUN uv python install "${PYTHON_VERSION}" && \
+    uv venv --seed --python "${PYTHON_VERSION}" /opt/venv
 
 # flash-attn 編譯層刻意只 COPY patch 腳本、不碰 pyproject.toml ——
 # 依賴清單的改動才不會觸發近一小時的 flash-attn 重編（pyproject.toml
@@ -117,7 +116,8 @@ RUN . /opt/venv/bin/activate && \
     echo "flash-attn build: MAX_JOBS=$MAX_JOBS (cores=$cores)" && \
     uv pip install --no-cache-dir "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT}" --find-links /tmp/wheels && \
     uv pip install --no-cache-dir wheel packaging psutil ninja && \
-    WHEEL_NAME="flash_attn-${FLASH_ATTN_VERSION}-cp310-cp310-linux_$(uname -m).whl" && \
+    PYTAG="$(python3 -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')" && \
+    WHEEL_NAME="flash_attn-${FLASH_ATTN_VERSION}-${PYTAG}-${PYTAG}-linux_$(uname -m).whl" && \
     if ! ls "/tmp/wheels/${WHEEL_NAME}" >/dev/null 2>&1; then \
         echo "flash-attn: fetching prebuilt ${WHEEL_NAME} from GH Release" && \
         { curl -fsSL --retry 3 -o "/tmp/wheels/${WHEEL_NAME}" \
@@ -162,7 +162,8 @@ COPY --from=builder /tmp/wheels/ /
 # ==========================================
 FROM runtime-base AS runner
 
-# Copy the pre-compiled virtual environment containing python packages from builder
+# Copy the Python runtime and the pre-compiled virtual environment from builder
+COPY --from=builder /opt/python /opt/python
 COPY --from=builder /opt/venv /opt/venv
 
 COPY scripts/patch_nanovllm_timesteps.py /tmp/patch_nanovllm_timesteps.py

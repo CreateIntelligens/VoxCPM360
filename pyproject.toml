@@ -20,17 +20,15 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "torch>=2.5.0",
     "torchaudio>=2.5.0",
     "torchcodec",
     "transformers>=4.45,<6",
     "einops",
-    "gradio>=6,<7",
     "inflect",
     "addict",
     "wetext",
@@ -38,6 +36,11 @@ dependencies = [
     "datasets>=3,<6",
     "huggingface-hub",
     "pydantic",
+    # api.py 直接用到；以前由 gradio 間接帶進來，拿掉 gradio 後要自己列
+    "fastapi>=0.142.2",
+    "starlette>=1.7.0",
+    "python-multipart>=0.0.32",
+    "uvicorn>=0.37.0",
     "tqdm",
     "simplejson",
     "sortedcontainers",
@@ -46,17 +49,17 @@ dependencies = [
     "librosa",
     "matplotlib",
     "funasr",
-    "spaces",
     "argbind",
     "safetensors",
     "speechbrain",
     # 2026-10 安全下限：Docker 以 `uv pip install -r pyproject.toml` 重新解析、不讀 uv.lock，
-    # 傳遞依賴要在這裡設下限才會裝到修正版。Pillow 13、fsspec 2026.6 分別被 gradio 6、datasets 3 擋住；
-    # filelock 的修正版要 Python 3.11，正式環境是 3.10，所以沒加。
+    # 傳遞依賴要在這裡設下限才會裝到修正版。
     "certifi>=2026.10.23",
     "brotli>=1.2.1",
-    # setuptools 82 起移除 pkg_resources，執行期仍有套件需要它
-    "setuptools>=78.1.1,<85",
+    # gradio 6 擋 Pillow 13，所以 gradio 不列為依賴；舊版 Gradio 介面要用時另外 pip install "gradio>=6,<7"
+    "pillow>=13.0.0",
+    "filelock>=4.2.4",
+    "setuptools>=78.1.1",
 ]
 
 [project.optional-dependencies]
