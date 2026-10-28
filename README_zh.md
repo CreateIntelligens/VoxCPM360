@@ -528,8 +528,6 @@ python scripts/train_voxcpm_finetune.py \
 python scripts/train_voxcpm_finetune.py \
     --config_path conf/voxcpm_v2/voxcpm_finetune_all.yaml
 
-# WebUI 训练与推理
-python lora_ft_webui.py   # 然后打开 http://localhost:7860
 ```
 
 > **完整指南 →** [微调文档](https://voxcpm.readthedocs.io/zh-cn/latest/finetuning/finetune.html)（数据准备、配置、训练、LoRA 热切换、常见问题）

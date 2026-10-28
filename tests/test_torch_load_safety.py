@@ -10,7 +10,6 @@ SCANNED_PATHS = [
     REPO_ROOT / "src",
     REPO_ROOT / "scripts",
     REPO_ROOT / "app.py",
-    REPO_ROOT / "lora_ft_webui.py",
 ]
 
 
