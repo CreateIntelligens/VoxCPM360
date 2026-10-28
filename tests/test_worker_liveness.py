@@ -147,7 +147,7 @@ class DeadWorkerDemo(FakeDemo):
 
 
 def test_health_returns_503_when_worker_is_dead():
-    app = api.create_app(DeadWorkerDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(DeadWorkerDemo(), barbet_runtime=FakeBarbetRuntime())
     with TestClient(app) as client:
         response = client.get("/api/v1/health")
     assert response.status_code == 503
@@ -158,7 +158,7 @@ def test_health_returns_503_when_worker_is_dead():
 
 
 def test_health_stays_ok_without_liveness_information():
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
     with TestClient(app) as client:
         response = client.get("/api/v1/health")
     assert response.status_code == 200
