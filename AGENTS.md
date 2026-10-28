@@ -411,8 +411,7 @@ optimizer state 在 4 卡放不下，需 8 卡或梯度檢查點。
 
 ```
 nginx ─┬─ /        → web 服務（React 靜態檔，multi-stage build 烤進 nginx image）
-       ├─ /api/    → app:8000（api.py，FastAPI gateway）
-       └─ /legacy/ → app:8000（舊 Gradio，過渡期對照）
+       └─ /api/    → app:8000（api.py，FastAPI gateway）
 ```
 
 | 位置 | 放什麼 |

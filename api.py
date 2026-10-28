@@ -30,7 +30,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from app import VoxCPMDemo, create_demo_interface
+from app import VoxCPMDemo
 from voxcpm.barbet_registry import BarbetModelRegistry
 from voxcpm.barbet_runtime import BarbetRuntime
 from voxcpm.full_model_registry import FULL_MODEL_PREFIX, FullModelRegistry
@@ -66,7 +66,6 @@ def create_app(
     demo: VoxCPMDemo | None = None,
     *,
     barbet_runtime: BarbetRuntime | None = None,
-    mount_legacy: bool = True,
 ) -> FastAPI:
     default_model = "/app/checkpoints/ft-mixed-lr2e5-avgE-e12run-0820"
     if not os.path.exists(default_model) and os.path.exists("checkpoints/ft-mixed-lr2e5-avgE-e12run-0820"):
@@ -127,22 +126,7 @@ def create_app(
     from gateway.routes.castvoice import register_castvoice_routes
 
     helpers = register_interactive_routes(app, gateway, history_lock)
-    batch_manager = register_castvoice_routes(app, gateway, demo, helpers)
-
-    if mount_legacy:
-        import gradio as gr
-
-        legacy = create_demo_interface(demo)
-        legacy.queue(max_size=10, default_concurrency_limit=1)
-        app = gr.mount_gradio_app(
-            app,
-            legacy,
-            path="/legacy",
-            show_error=True,
-            allowed_paths=[str(Path.cwd() / "assets")],
-        )
-        app.state.tts_gateway = gateway
-        app.state.castvoice_batch_manager = batch_manager
+    register_castvoice_routes(app, gateway, demo, helpers)
 
     return app
 
@@ -151,7 +135,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--no-legacy", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -159,7 +142,7 @@ def main() -> None:
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
     uvicorn.run(
-        create_app(mount_legacy=not args.no_legacy),
+        create_app(),
         host=args.host,
         port=args.port,
         proxy_headers=True,

@@ -30,7 +30,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from app import VoxCPMDemo, create_demo_interface
+from app import VoxCPMDemo
 from runtime_config import require_per_request_timesteps
 from voxcpm.barbet_registry import BarbetModelRegistry
 from voxcpm.barbet_runtime import BarbetRuntime

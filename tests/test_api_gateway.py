@@ -243,7 +243,7 @@ def test_catalog_exposes_native_engine(monkeypatch, tmp_path):
     (checkpoint / "audiovae.pth").write_bytes(b"vae")
     monkeypatch.setenv("VOXCPM_FULL_MODEL_ROOTS", str(tmp_path))
 
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.get("/api/v1/catalog")
@@ -268,7 +268,6 @@ def test_preload_warms_common_inference_paths(monkeypatch, tmp_path):
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
 
     with TestClient(app) as client:
@@ -321,7 +320,6 @@ def test_warmup_failure_does_not_block_startup(monkeypatch):
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
 
     with TestClient(app) as client:
@@ -354,7 +352,7 @@ def test_catalog_exposes_available_reference_presets(monkeypatch, tmp_path):
         target = tmp_path / preset["filename"]
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"audio")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.get("/api/v1/catalog")
@@ -379,7 +377,7 @@ def test_model_registry_endpoint_returns_document(monkeypatch, tmp_path):
     monkeypatch.setattr(api, "_MODEL_REGISTRY_PATH", registry_path)
     monkeypatch.setattr(gateway.presets, "_MODEL_REGISTRY_PATH", registry_path)
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.get("/api/v1/models/registry")
@@ -395,7 +393,7 @@ def test_model_registry_endpoint_returns_empty_document_when_missing(monkeypatch
     monkeypatch.setattr(api, "_MODEL_REGISTRY_PATH", tmp_path / "missing.json")
     monkeypatch.setattr(gateway.presets, "_MODEL_REGISTRY_PATH", tmp_path / "missing.json")
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.get("/api/v1/models/registry")
@@ -415,7 +413,7 @@ def test_native_synthesis_uses_selected_reference_preset(
     selected_reference = tmp_path / "cosy-young-female-01.mp3"
     selected_reference.write_bytes(b"RIFF")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -437,7 +435,7 @@ def test_native_synthesis_uses_selected_reference_preset(
 def test_native_prompt_cloning_drops_explicit_control_instruction(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -462,7 +460,7 @@ def test_native_prompt_cloning_drops_explicit_control_instruction(monkeypatch):
 def test_native_control_instruction_is_preserved_without_prompt_transcript(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -484,7 +482,7 @@ def test_native_control_instruction_is_preserved_without_prompt_transcript(monke
 def test_uploaded_reference_overrides_selected_preset(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -505,7 +503,7 @@ def test_uploaded_reference_overrides_selected_preset(monkeypatch):
 def test_native_synthesis_returns_wav(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -909,7 +907,6 @@ def test_native_interactive_batch_isolates_http_errors_and_history(monkeypatch):
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
     payload = {
         "engine_id": "voxcpm2",
@@ -964,7 +961,6 @@ def test_native_streaming_synthesis_returns_unknown_length_wav_and_history(
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
 
     with TestClient(app) as client:
@@ -1018,7 +1014,6 @@ def test_native_streaming_preserves_preset_cloning_rules(monkeypatch, tmp_path):
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
 
     with TestClient(app) as client:
@@ -1046,7 +1041,6 @@ def test_native_streaming_removes_uploaded_reference_after_response(monkeypatch)
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
 
     with TestClient(app) as client:
@@ -1085,7 +1079,6 @@ def test_native_streaming_rejects_unsupported_options(
     app = api.create_app(
         FakeStreamingDemo(),
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
     payload = {
         "engine_id": "voxcpm2",
@@ -1118,7 +1111,6 @@ def test_native_streaming_queue_full_is_rejected_before_response_start(monkeypat
     app = api.create_app(
         BlockingStreamingDemo(),
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
     endpoint = next(
         route.endpoint
@@ -1197,7 +1189,6 @@ def test_native_streaming_queue_timeout_returns_503_and_recovers(monkeypatch):
     app = api.create_app(
         BlockingStreamingDemo(),
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
 
     async def run_scenario():
@@ -1262,7 +1253,6 @@ def test_native_streaming_final_send_failure_rolls_back_history(monkeypatch):
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
     endpoint = next(
         route.endpoint
@@ -1334,7 +1324,6 @@ def test_native_streaming_generation_failure_does_not_write_history(monkeypatch)
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
     endpoint = next(
         route.endpoint
@@ -1402,7 +1391,6 @@ def test_native_streaming_failure_before_first_chunk_keeps_response_unstarted(
     app = api.create_app(
         FakeStreamingDemo(error_after=0),
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
 
     async def run_scenario():
@@ -1445,7 +1433,6 @@ def test_native_streaming_asgi23_disconnect_during_commit_rolls_back_history(
     app = api.create_app(
         FakeStreamingDemo(),
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
     endpoint = next(
         route.endpoint
@@ -1534,7 +1521,6 @@ def test_native_streaming_asgi23_disconnect_cleans_worker_gate_and_upload(
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
     endpoint = next(
         route.endpoint
@@ -1656,7 +1642,6 @@ def test_native_streaming_disconnect_waits_for_worker_before_releasing_gate(
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
     endpoint = next(
         route.endpoint
@@ -1860,7 +1845,7 @@ def test_full_native_checkpoint_switches_runtime(monkeypatch, tmp_path):
     # 拆分後 _switch_native_runtime 位於 gateway.gateway，patch 需同步指向
     import gateway.gateway as _gw_mod
     monkeypatch.setattr(_gw_mod, "VoxCPMDemo", lambda **kwargs: full_demo)
-    app = api.create_app(base_demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(base_demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         catalog = client.get("/api/v1/catalog").json()
@@ -1989,7 +1974,7 @@ def test_local_barbet_catalog_and_synthesis(monkeypatch):
     runtime = FakeBarbetRuntime(
         checkpoints=(FakeBarbetCheckpoint(),),
     )
-    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=runtime)
 
     with TestClient(app) as client:
         catalog = client.get("/api/v1/catalog").json()
@@ -2164,7 +2149,7 @@ def test_gpu_queue_wait_has_server_side_timeout(monkeypatch):
 
 def test_castvoice_voices_lists_available_voxcpm2_voices(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.get("/api/v1/tts/voices")
@@ -2183,7 +2168,7 @@ def test_castvoice_voices_lists_available_voxcpm2_voices(monkeypatch):
 def test_castvoice_synthesize_returns_mp3_for_voxcpm2_voice(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2202,7 +2187,7 @@ def test_castvoice_synthesize_returns_mp3_for_voxcpm2_voice(monkeypatch):
 
 def test_castvoice_synthesize_rejects_empty_text(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2216,7 +2201,7 @@ def test_castvoice_synthesize_rejects_empty_text(monkeypatch):
 
 def test_castvoice_synthesize_rejects_unknown_voice(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2230,7 +2215,7 @@ def test_castvoice_synthesize_rejects_unknown_voice(monkeypatch):
 
 def test_castvoice_synthesize_rejects_unsupported_format(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2250,7 +2235,7 @@ def test_castvoice_synthesize_requires_bearer_token_when_configured(monkeypatch)
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     monkeypatch.setattr(api, "_TTS_API_KEY", "secret-token")
     monkeypatch.setattr(gateway.castvoice, "_TTS_API_KEY", "secret-token")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         unauthorized = client.post(
@@ -2281,7 +2266,7 @@ def test_castvoice_synthesize_returns_429_with_retry_after_when_queue_full(monke
             assert release_native.wait(timeout=2)
             return 16_000, np.zeros(320, dtype=np.float32)
 
-    app = api.create_app(BlockingDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(BlockingDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -2307,7 +2292,7 @@ def test_castvoice_synthesize_returns_429_with_retry_after_when_queue_full(monke
 def test_castvoice_synthesize_accepts_valid_voxcpm2_model_override(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2325,7 +2310,7 @@ def test_castvoice_synthesize_accepts_valid_voxcpm2_model_override(monkeypatch):
 
 def test_castvoice_synthesize_rejects_unknown_voxcpm2_model_override(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2344,7 +2329,7 @@ def test_castvoice_synthesize_rejects_unknown_voxcpm2_model_override(monkeypatch
 def test_castvoice_batch_item_supports_model_override(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         submit = client.post(
@@ -2383,7 +2368,6 @@ def test_castvoice_batch_submits_same_model_items_together(monkeypatch):
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
 
     with TestClient(app) as client:
@@ -2418,7 +2402,6 @@ def test_castvoice_batch_retries_smaller_chunks_after_oom(monkeypatch):
     app = api.create_app(
         demo,
         barbet_runtime=FakeBarbetRuntime(),
-        mount_legacy=False,
     )
 
     with TestClient(app) as client:
@@ -2443,7 +2426,7 @@ def test_castvoice_batch_retries_smaller_chunks_after_oom(monkeypatch):
 def test_castvoice_synthesize_passes_synthesis_params_to_native_engine(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2471,7 +2454,7 @@ def test_castvoice_synthesize_without_params_keeps_existing_defaults(monkeypatch
     """未指定參數時維持既有實際步數，而非舊版忽略的 30。"""
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2491,7 +2474,7 @@ def test_castvoice_synthesize_without_params_keeps_existing_defaults(monkeypatch
 @pytest.mark.parametrize("cfg_value", [0.9, 5.1])
 def test_castvoice_synthesize_rejects_out_of_range_cfg_value(monkeypatch, cfg_value):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2514,7 +2497,7 @@ def test_castvoice_synthesize_rejects_out_of_range_cfg_value(monkeypatch, cfg_va
 @pytest.mark.parametrize("speed", [0.4, 2.1])
 def test_castvoice_synthesize_rejects_out_of_range_speed(monkeypatch, speed):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2534,7 +2517,7 @@ def test_castvoice_synthesize_rejects_inference_timesteps_field(monkeypatch):
     """CastVoice 保留原外部合約，忽略未開放的步數欄位。"""
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -2557,7 +2540,7 @@ def test_castvoice_batch_items_carry_independent_synthesis_params(monkeypatch):
         api.DynamicBatchSizer, "recommend", lambda self, pending: min(pending, 4)
     )
     demo = FakeBatchDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         submit = client.post(
@@ -2602,7 +2585,7 @@ def test_castvoice_batch_without_params_keeps_existing_defaults(monkeypatch):
         api.DynamicBatchSizer, "recommend", lambda self, pending: min(pending, 4)
     )
     demo = FakeBatchDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         submit = client.post(
@@ -2632,7 +2615,7 @@ def test_castvoice_batch_marks_only_the_item_with_invalid_cfg_value_failed(monke
         api.DynamicBatchSizer, "recommend", lambda self, pending: min(pending, 4)
     )
     demo = FakeBatchDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         submit = client.post(
@@ -3124,7 +3107,7 @@ def test_stop_voxcpm_releases_cuda_cache(monkeypatch):
 def test_synthesize_without_model_id_uses_active_model(monkeypatch):
     """未指定 model_id 時沿用當前已載入模型，不觸發引擎切換。"""
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -3314,7 +3297,7 @@ def test_native_timesteps_match_request_header_and_history(monkeypatch, streamin
     monkeypatch.setenv("VOXCPM_FULL_MODEL_ROOTS", "")
     monkeypatch.setattr(routes, "_VOXCPM2_DEFAULT_TIMESTEPS", 12)
     demo = FakeStreamingDemo() if streaming else FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
     data = {"engine_id": "voxcpm2", "model_id": "__base__", "text": "步數測試"}
     if steps is not None:
         data["inference_timesteps"] = str(steps)
@@ -3335,7 +3318,7 @@ def test_native_timesteps_match_request_header_and_history(monkeypatch, streamin
 def test_native_timesteps_reject_invalid_values(monkeypatch, streaming, steps):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     demo = FakeStreamingDemo() if streaming else FakeDemo()
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
     endpoint = "/api/v1/synthesize" + ("/stream" if streaming else "")
     with TestClient(app) as client:
         response = client.post(endpoint, data={
@@ -3366,7 +3349,7 @@ def test_native_streaming_can_output_16k(monkeypatch):
     chunks = [sine[:5000], sine[5000:5003], sine[5003:11000], sine[11000:]]
     demo = FakeStreamingDemo(chunks=chunks)
     demo.server = FakeStreamingServer(sample_rate=native_rate)
-    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
 
     with TestClient(app) as client:
         response = client.post(
@@ -3401,7 +3384,7 @@ def test_native_streaming_can_output_16k(monkeypatch):
 
 def test_native_streaming_rejects_unsupported_sample_rate(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    app = api.create_app(FakeStreamingDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
+    app = api.create_app(FakeStreamingDemo(), barbet_runtime=FakeBarbetRuntime())
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/synthesize/stream",
