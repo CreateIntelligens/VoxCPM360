@@ -2162,13 +2162,9 @@ def test_gpu_queue_wait_has_server_side_timeout(monkeypatch):
     asyncio.run(run_scenario())
 
 
-def test_castvoice_voices_lists_available_voxcpm2_and_barbet_voices(monkeypatch):
+def test_castvoice_voices_lists_available_voxcpm2_voices(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    runtime = FakeBarbetRuntime(
-        checkpoints=(FakeBarbetCheckpoint(),),
-        speakers=({"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"},),
-    )
-    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
 
     with TestClient(app) as client:
         response = client.get("/api/v1/tts/voices")
@@ -2182,19 +2178,6 @@ def test_castvoice_voices_lists_available_voxcpm2_and_barbet_voices(monkeypatch)
     }
     for voice in body["voices"]:
         assert voice["gender"] in {"male", "female", "unknown"}
-
-
-def test_castvoice_voices_omits_barbet_when_speaker_unavailable(monkeypatch):
-    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    # No checkpoints exposes "hung_yi_lee", so the barbet voice must drop out.
-    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
-
-    with TestClient(app) as client:
-        voices = client.get("/api/v1/tts/voices").json()["voices"]
-        voice_ids = {voice["voice_id"] for voice in voices}
-
-    assert "barbet-hung-yi-lee" not in voice_ids
-    assert "voxcpm2-cosy-young-female-01" in voice_ids
 
 
 def test_castvoice_synthesize_returns_mp3_for_voxcpm2_voice(monkeypatch):
@@ -2215,26 +2198,6 @@ def test_castvoice_synthesize_returns_mp3_for_voxcpm2_voice(monkeypatch):
     # Cloning mode: control_instruction must be cleared, prompt_text carried in.
     assert demo.calls[0]["control_instruction"] == ""
     assert demo.calls[0]["prompt_text"]
-
-
-def test_castvoice_synthesize_returns_mp3_for_barbet_voice(monkeypatch):
-    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    runtime = FakeBarbetRuntime(
-        checkpoints=(FakeBarbetCheckpoint(),),
-        speakers=({"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"},),
-    )
-    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/tts/synthesize",
-            json={"text": "逐家好", "voice_id": "barbet-hung-yi-lee"},
-        )
-
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "audio/mpeg"
-    assert runtime.calls[0]["speaker_id"] == "hung_yi_lee"
-    assert runtime.calls[0]["model_id"] == "barbet::barbet-tw-v1"
 
 
 def test_castvoice_synthesize_rejects_empty_text(monkeypatch):
@@ -2378,105 +2341,10 @@ def test_castvoice_synthesize_rejects_unknown_voxcpm2_model_override(monkeypatch
     assert response.json()["error"] == "model_not_found"
 
 
-def test_castvoice_synthesize_accepts_valid_barbet_model_override(monkeypatch):
-    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    runtime = FakeBarbetRuntime(
-        checkpoints=(FakeBarbetCheckpoint(), FakeBarbetCheckpointV2()),
-        speakers_by_checkpoint={
-            "barbet::barbet-tw-v1": [
-                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
-            ],
-            "barbet::barbet-tw-v2": [
-                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
-            ],
-        },
-    )
-    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/tts/synthesize",
-            json={
-                "text": "逐家好",
-                "voice_id": "barbet-hung-yi-lee",
-                "model_id": "barbet::barbet-tw-v2",
-            },
-        )
-
-    assert response.status_code == 200
-    assert runtime.calls[0]["model_id"] == "barbet::barbet-tw-v2"
-    assert runtime.calls[0]["speaker_id"] == "hung_yi_lee"
-
-
-def test_castvoice_synthesize_rejects_barbet_model_without_requested_speaker(monkeypatch):
-    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    runtime = FakeBarbetRuntime(
-        checkpoints=(FakeBarbetCheckpoint(), FakeBarbetCheckpointV2()),
-        speakers_by_checkpoint={
-            "barbet::barbet-tw-v1": [
-                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
-            ],
-            "barbet::barbet-tw-v2": [
-                {"id": "someone_else", "name": "別人", "gender": "female"}
-            ],
-        },
-    )
-    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/tts/synthesize",
-            json={
-                "text": "逐家好",
-                "voice_id": "barbet-hung-yi-lee",
-                "model_id": "barbet::barbet-tw-v2",
-            },
-        )
-
-    assert response.status_code == 400
-    assert response.json()["error"] == "model_not_found"
-
-
-def test_castvoice_synthesize_rejects_unknown_barbet_model_override(monkeypatch):
-    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    runtime = FakeBarbetRuntime(
-        checkpoints=(FakeBarbetCheckpoint(),),
-        speakers_by_checkpoint={
-            "barbet::barbet-tw-v1": [
-                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
-            ],
-        },
-    )
-    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/tts/synthesize",
-            json={
-                "text": "逐家好",
-                "voice_id": "barbet-hung-yi-lee",
-                "model_id": "does-not-exist",
-            },
-        )
-
-    assert response.status_code == 400
-    assert response.json()["error"] == "model_not_found"
-
-
 def test_castvoice_batch_item_supports_model_override(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    runtime = FakeBarbetRuntime(
-        checkpoints=(FakeBarbetCheckpoint(), FakeBarbetCheckpointV2()),
-        speakers_by_checkpoint={
-            "barbet::barbet-tw-v1": [
-                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
-            ],
-            "barbet::barbet-tw-v2": [
-                {"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"}
-            ],
-        },
-    )
-    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
+    demo = FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime(), mount_legacy=False)
 
     with TestClient(app) as client:
         submit = client.post(
@@ -2485,8 +2353,8 @@ def test_castvoice_batch_item_supports_model_override(monkeypatch):
                 "items": [
                     {
                         "text": "逐家好",
-                        "voice_id": "barbet-hung-yi-lee",
-                        "model_id": "barbet::barbet-tw-v2",
+                        "voice_id": "voxcpm2-cosy-young-female-01",
+                        "model_id": "__base__",
                     }
                 ]
             },
@@ -2495,7 +2363,15 @@ def test_castvoice_batch_item_supports_model_override(monkeypatch):
         status = wait_for_batch(client, submit.json()["batch_id"])
 
     assert status["items"][0]["status"] == "done"
-    assert runtime.calls[0]["model_id"] == "barbet::barbet-tw-v2"
+    assert demo.calls[0]["model_selection"] == "__base__"
+
+
+def test_castvoice_definitions_exclude_retired_barbet_voice():
+    # 使用者明確不要李宏毅老師的聲音；CastVoice 只提供 voxcpm2 參考音克隆。
+    for definition in api._CASTVOICE_DEFINITIONS:
+        assert definition["engine_id"] == "voxcpm2"
+        assert definition["voice_id"] != "barbet-hung-yi-lee"
+        assert "李宏毅" not in definition["label"]
 
 
 def test_castvoice_batch_submits_same_model_items_together(monkeypatch):
@@ -2591,30 +2467,6 @@ def test_castvoice_synthesize_passes_synthesis_params_to_native_engine(monkeypat
     assert call["denoise"] is True
 
 
-def test_castvoice_synthesize_passes_synthesis_params_to_barbet_engine(monkeypatch):
-    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    runtime = FakeBarbetRuntime(
-        checkpoints=(FakeBarbetCheckpoint(),),
-        speakers=({"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"},),
-    )
-    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/tts/synthesize",
-            json={
-                "text": "逐家好",
-                "voice_id": "barbet-hung-yi-lee",
-                "seed": 777,
-                "cfg_value": 4.0,
-            },
-        )
-
-    assert response.status_code == 200
-    assert runtime.calls[0]["seed"] == 777
-    assert runtime.calls[0]["cfg_value"] == 4.0
-
-
 def test_castvoice_synthesize_without_params_keeps_existing_defaults(monkeypatch):
     """未指定參數時維持既有實際步數，而非舊版忽略的 30。"""
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
@@ -2634,31 +2486,6 @@ def test_castvoice_synthesize_without_params_keeps_existing_defaults(monkeypatch
     assert call["denoise"] is False
     assert call["seed"] is None
     assert call["inference_timesteps"] == gateway.presets._VOXCPM2_DEFAULT_TIMESTEPS
-
-
-def test_castvoice_synthesize_without_params_keeps_barbet_defaults(monkeypatch):
-    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
-    runtime = FakeBarbetRuntime(
-        checkpoints=(FakeBarbetCheckpoint(),),
-        speakers=({"id": "hung_yi_lee", "name": "李宏毅老師", "gender": "male"},),
-    )
-    app = api.create_app(FakeDemo(), barbet_runtime=runtime, mount_legacy=False)
-
-    with TestClient(app) as client:
-        responses = [
-            client.post(
-                "/api/v1/tts/synthesize",
-                json={"text": "逐家好", "voice_id": "barbet-hung-yi-lee"},
-            )
-            for _ in range(2)
-        ]
-
-    assert [response.status_code for response in responses] == [200, 200]
-    assert runtime.calls[0]["cfg_value"] == 2.0
-    assert runtime.calls[0]["inference_timesteps"] == 30
-    # barbet 端 seed=None 由 gateway 補隨機值：不指定時每次都該不一樣，
-    # 這正是加上選填 seed 之前的行為。
-    assert runtime.calls[0]["seed"] != runtime.calls[1]["seed"]
 
 
 @pytest.mark.parametrize("cfg_value", [0.9, 5.1])

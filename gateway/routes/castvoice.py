@@ -95,21 +95,6 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                 400, "model_not_found", f"找不到模型 {model_id}"
             ) from exc
 
-    async def _resolve_barbet_model_override(model_id: str, speaker_id: str) -> str:
-        """驗證使用者指定的 model_id 是可用的 Barbet checkpoint，且該
-        checkpoint 內含 speaker_id 的 centroid（否則克隆對象根本不存在）。"""
-        checkpoints = await asyncio.to_thread(gateway.barbet_runtime.registry.refresh)
-        checkpoint = next((c for c in checkpoints if c.id == model_id), None)
-        if checkpoint is None or not checkpoint.valid:
-            raise _CastVoiceError(400, "model_not_found", f"找不到模型 {model_id}")
-        speakers = await asyncio.to_thread(gateway.barbet_runtime.speakers, checkpoint)
-        if not any(speaker["id"] == speaker_id for speaker in speakers):
-            raise _CastVoiceError(
-                400, "model_not_found", f"模型 {model_id} 沒有語者 {speaker_id}"
-            )
-        return model_id
-
-
     def _castvoice_synthesis_params(
         *,
         speed: float,
@@ -155,8 +140,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
         （單筆轉成 HTTP response；batch 則記到該筆 item 的 error 欄位）。
 
         model_id 是選填的模型覆寫：留空沿用 voice_id 綁定的預設模型；有給
-        則驗證該模型存在（且對 barbet 而言含有這個語者），沿用同一個參考音
-        ／語者身份、只換底層權重。
+        則驗證該模型存在，沿用同一個參考音、只換底層權重。
 
         seed / cfg_value / normalize / denoise 同為選填，None 代表沿用
         castvoice 既有預設值。
@@ -177,58 +161,31 @@ def register_castvoice_routes(app, gateway, demo, helpers):
 
         request_id = uuid.uuid4().hex
         try:
-            if definition["engine_id"] == "voxcpm2":
-                preset = _find_reference_preset(definition["reference_preset_id"])
-                if preset is None:
-                    raise _CastVoiceError(
-                        503, "voice_unavailable", f"語音 {voice_id} 目前無法使用"
-                    )
-                resolved_model_id = (
-                    await _resolve_native_model_override(model_id)
-                    if model_id
-                    else PUBLIC_BASE_MODEL_ID
+            preset = _find_reference_preset(definition["reference_preset_id"])
+            if preset is None:
+                raise _CastVoiceError(
+                    503, "voice_unavailable", f"語音 {voice_id} 目前無法使用"
                 )
-                reference_path = _resolve_reference_audio(definition["reference_preset_id"])
-                wav, _ = await gateway.synthesize_native(
-                    request_id=request_id,
-                    model_id=resolved_model_id,
-                    text=text,
-                    control_instruction="",
-                    reference_path=reference_path,
-                    prompt_text=preset.get("prompt_text", ""),
-                    cfg_value=params["cfg_value"],
-                    normalize=params["normalize"],
-                    denoise=params["denoise"],
-                    inference_timesteps=_VOXCPM2_DEFAULT_TIMESTEPS,
-                    speed=params["speed"],
-                    seed=seed,
-                )
-            else:
-                speaker_id = definition["speaker_id"]
-                if model_id:
-                    resolved_model_id = await _resolve_barbet_model_override(
-                        model_id, speaker_id
-                    )
-                else:
-                    resolved_model_id = await asyncio.to_thread(
-                        gateway.find_barbet_model_for_speaker, speaker_id
-                    )
-                    if resolved_model_id is None:
-                        raise _CastVoiceError(
-                            503, "voice_unavailable", f"語音 {voice_id} 目前無法使用"
-                        )
-                wav, _ = await gateway.synthesize_barbet(
-                    request_id=request_id,
-                    model_id=resolved_model_id,
-                    text=text,
-                    reference_path=None,
-                    prompt_text="",
-                    speaker_id=speaker_id,
-                    cfg_value=params["cfg_value"],
-                    inference_timesteps=_CASTVOICE_DEFAULT_TIMESTEPS,
-                    seed=seed,
-                    speed=params["speed"],
-                )
+            resolved_model_id = (
+                await _resolve_native_model_override(model_id)
+                if model_id
+                else PUBLIC_BASE_MODEL_ID
+            )
+            reference_path = _resolve_reference_audio(definition["reference_preset_id"])
+            wav, _ = await gateway.synthesize_native(
+                request_id=request_id,
+                model_id=resolved_model_id,
+                text=text,
+                control_instruction="",
+                reference_path=reference_path,
+                prompt_text=preset.get("prompt_text", ""),
+                cfg_value=params["cfg_value"],
+                normalize=params["normalize"],
+                denoise=params["denoise"],
+                inference_timesteps=_VOXCPM2_DEFAULT_TIMESTEPS,
+                speed=params["speed"],
+                seed=seed,
+            )
         except HTTPException as exc:
             raise _castvoice_error_from_http(exc) from exc
         except _CastVoiceError:
@@ -423,15 +380,8 @@ def register_castvoice_routes(app, gateway, demo, helpers):
         }
         voices: list[dict[str, str]] = []
         for definition in _CASTVOICE_DEFINITIONS:
-            if definition["engine_id"] == "voxcpm2":
-                if definition["reference_preset_id"] not in available_preset_ids:
-                    continue
-            elif definition["engine_id"] == "barbet":
-                model_id = await asyncio.to_thread(
-                    gateway.find_barbet_model_for_speaker, definition["speaker_id"]
-                )
-                if model_id is None:
-                    continue
+            if definition["reference_preset_id"] not in available_preset_ids:
+                continue
             voice: dict[str, str] = {
                 "voice_id": definition["voice_id"],
                 "label": definition["label"],
