@@ -28,14 +28,14 @@ dependencies = [
     "torch>=2.5.0",
     "torchaudio>=2.5.0",
     "torchcodec",
-    "transformers>=4.45,<5",
+    "transformers>=4.45,<6",
     "einops",
     "gradio>=6,<7",
     "inflect",
     "addict",
     "wetext",
     "modelscope>=1.22.0",
-    "datasets>=3,<4",
+    "datasets>=3,<6",
     "huggingface-hub",
     "pydantic",
     "tqdm",
@@ -56,7 +56,7 @@ dependencies = [
     "certifi>=2026.10.23",
     "brotli>=1.2.1",
     # setuptools 82 起移除 pkg_resources，執行期仍有套件需要它
-    "setuptools>=78.1.1,<82",
+    "setuptools>=78.1.1,<85",
 ]
 
 [project.optional-dependencies]
