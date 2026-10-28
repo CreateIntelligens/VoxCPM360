@@ -428,15 +428,6 @@ from gateway.presets import _LANG_NAN_TW, _LANG_ZH_TW, _DEFAULT_REFERENCE_PRESET
 # 品質確認過的聲音出來，voice_id 是外部合約的一部分、不可隨便改名。
 _CASTVOICE_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
-        "voice_id": "barbet-hung-yi-lee",
-        "label": "李宏毅老師（華語・男）",
-        "gender": "male",
-        "language": _LANG_ZH_TW,
-        "desc": "Barbet TSLM 固定語者音色",
-        "engine_id": "barbet",
-        "speaker_id": "hung_yi_lee",
-    },
-    {
         "voice_id": "voxcpm2-cosy-child-female-01",
         "label": "孩童女聲 01（臺灣台語）",
         "gender": "female",
@@ -630,7 +621,8 @@ _CASTVOICE_DEFINITIONS_BY_ID = {
     definition["voice_id"]: definition for definition in _CASTVOICE_DEFINITIONS
 }
 # castvoice 端點未指定合成參數時沿用的預設值（單一真相來源）。
-# native 沿用部署步數，Barbet 沿用 30；未指定時維持既有實際行為。
+# native 沿用部署步數。_CASTVOICE_DEFAULT_TIMESTEPS 是 Barbet 聲音移除前的值，
+# 沒有引擎再用，留著是為了不讓 model_version 變動、害 CastAgent 快取失效。
 # 這些值改變會讓相同輸入產生不同輸出，故納入 model_version 指紋。
 _CASTVOICE_DEFAULT_CFG_VALUE = 2.0
 _CASTVOICE_DEFAULT_TIMESTEPS = 30
