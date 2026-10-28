@@ -198,10 +198,6 @@ class VoxCPMDemo:
             self.max_audio_text_ratio,
         )
 
-        self.asr_model_id = "iic/SenseVoiceSmall"
-        self.asr_device = "cuda:0" if self.device.startswith("cuda") else "cpu"
-        self.asr_model: Optional[Any] = None
-
         roots_setting = os.environ.get(
             "VOXCPM_LORA_ROOTS",
             "/app/models/native:/app/checkpoints",
@@ -428,36 +424,6 @@ class VoxCPMDemo:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         logger.info("nano-vllm model stopped.")
-
-    def get_or_load_asr_model(self) -> Any:
-        if self.asr_model is not None:
-            return self.asr_model
-        # funasr 的 import 要 17 秒，佔 app 匯入成本的六成，而 ASR 只有
-        # Gradio 介面上那個 toggle 會用到（生產日誌顯示從未載入過）。
-        # 延後到真正要建構模型時才付這筆錢。
-        from funasr import AutoModel
-
-        logger.info(
-            f"Loading ASR model: {self.asr_model_id} on device: {self.asr_device}"
-        )
-        self.asr_model = AutoModel(
-            model=self.asr_model_id,
-            disable_update=True,
-            log_level="DEBUG",
-            device=self.asr_device,
-        )
-        logger.info("ASR model loaded successfully.")
-        return self.asr_model
-
-    def prompt_wav_recognition(self, prompt_wav: Optional[str]) -> str:
-        if prompt_wav is None:
-            return ""
-        res = self.get_or_load_asr_model().generate(
-            input=prompt_wav,
-            language="auto",
-            use_itn=True,
-        )
-        return res[0]["text"].split("|>")[-1]
 
     def _prepare_tts_generation(
         self,

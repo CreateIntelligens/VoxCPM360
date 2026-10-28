@@ -242,7 +242,6 @@ docker compose up -d --build
 ```
 
 - Studio: `http://localhost:8800/`
-- Original Gradio UI: no longer served; run `python legacy/gradio_ui.py` locally after `pip install "gradio>=6,<7"`
 - Model catalog API: `http://localhost:8800/api/v1/catalog`
 
 The selector is directory-driven. Put native VoxCPM2 LoRA or full checkpoints
@@ -546,8 +545,6 @@ python scripts/train_voxcpm_finetune.py \
 python scripts/train_voxcpm_finetune.py \
     --config_path conf/voxcpm_v2/voxcpm_finetune_all.yaml
 
-# WebUI for training & inference
-python lora_ft_webui.py   # then open http://localhost:7860
 ```
 
 > **Full guide →** [Fine-tuning Guide](https://voxcpm.readthedocs.io/en/latest/finetuning/finetune.html) (data preparation, configuration, training, LoRA hot-swapping, FAQ)

@@ -48,15 +48,15 @@ dependencies = [
     "soxr",
     "librosa",
     "matplotlib",
-    "funasr",
     "argbind",
     "safetensors",
     "speechbrain",
+    # scripts/train_voxcpm_finetune.py 用；以前由 funasr 間接帶進來
+    "tensorboardX",
     # 2026-10 安全下限：Docker 以 `uv pip install -r pyproject.toml` 重新解析、不讀 uv.lock，
     # 傳遞依賴要在這裡設下限才會裝到修正版。
     "certifi>=2026.10.23",
     "brotli>=1.2.1",
-    # gradio 6 擋 Pillow 13，所以 gradio 不列為依賴；舊版 Gradio 介面要用時另外 pip install "gradio>=6,<7"
     "pillow>=13.0.0",
     "filelock>=4.2.4",
     "setuptools>=78.1.1",

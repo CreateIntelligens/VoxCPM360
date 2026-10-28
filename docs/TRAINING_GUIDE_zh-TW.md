@@ -330,16 +330,6 @@ uv run python scripts/train_voxcpm_finetune.py \
 
 全參數微調需要更多顯存與儲存空間。自訂說話者或少量資料通常先使用 LoRA。
 
-### WebUI
-
-也可以使用專案提供的 WebUI 設定及啟動訓練：
-
-```bash
-uv run python lora_ft_webui.py
-```
-
-啟動後開啟 `http://localhost:7860`。
-
 ## 8. Checkpoint 與續訓
 
 假設 `save_path` 是 `checkpoints/my_lora`，輸出大致如下：

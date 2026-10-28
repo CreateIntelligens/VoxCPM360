@@ -527,9 +527,6 @@ function App() {
             />
             {catalogError ? "Gateway offline" : "System ready"}
           </span>
-          <a className="legacy-link" href="/legacy/" target="_blank">
-            舊版 Gradio
-          </a>
         </div>
       </header>
 

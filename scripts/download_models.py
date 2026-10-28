@@ -37,22 +37,6 @@ def download_models(model_id: str):
         print(f"Warning: TTS model pre-download encountered an issue: {e}")
         print("The app will still attempt to load/download it during inference.")
 
-    print("\n==================================================")
-    print("Pre-downloading/Checking ASR Model: iic/SenseVoiceSmall...")
-    print("==================================================")
-    try:
-        from funasr import AutoModel
-        # Pre-download ASR model to cache
-        AutoModel(
-            model="iic/SenseVoiceSmall",
-            disable_update=True,
-            log_level="ERROR",
-            device="cpu"
-        )
-        print("ASR model weights verified/downloaded successfully.")
-    except Exception as e:
-        print(f"Warning: ASR model pre-download encountered an issue: {e}")
-        print("The app will still attempt to load/download it when ASR is triggered.")
 
 def verify_flash_attn() -> None:
     """在載入模型前確認 flash-attn 可用。

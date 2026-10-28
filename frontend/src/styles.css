@@ -144,18 +144,6 @@ select:focus-visible {
   box-shadow: 0 0 0 4px rgba(255, 107, 114, 0.09);
 }
 
-.legacy-link {
-  color: var(--muted-bright);
-  text-decoration: none;
-  font-size: 12px;
-  border-left: 1px solid var(--line);
-  padding-left: 16px;
-}
-
-.legacy-link:hover {
-  color: var(--text);
-}
-
 .workspace {
   width: min(1540px, calc(100% - 48px));
   margin: 0 auto;
