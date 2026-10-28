@@ -70,7 +70,7 @@ services:
       # 用 ${VAR:-} 會讓沒設的機器拿到空字串＝無效設定）。
       # 用途：強制 cuBLAS 確定性演算法（GB10 seed 決定性調查）。
       - CUBLAS_WORKSPACE_CONFIG
-    # Pre-download models first, then start the unified API plus legacy Gradio.
+    # Pre-download models first, then start the unified API.
     command: bash -c "python scripts/download_models.py --model-id ${MODEL_ID:-/app/checkpoints/ft-mixed-lr2e5-avgE-e12run-0820} && python api.py --port 8000"
     volumes:
       # Persistent cache for downloaded model weights (highly recommended to save GBs of downloading)

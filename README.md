@@ -242,7 +242,7 @@ docker compose up -d --build
 ```
 
 - Studio: `http://localhost:8800/`
-- Original Gradio UI: `http://localhost:8800/legacy/`
+- Original Gradio UI: no longer served; run `python legacy/gradio_ui.py` locally after `pip install "gradio>=6,<7"`
 - Model catalog API: `http://localhost:8800/api/v1/catalog`
 
 The selector is directory-driven. Put native VoxCPM2 LoRA or full checkpoints
