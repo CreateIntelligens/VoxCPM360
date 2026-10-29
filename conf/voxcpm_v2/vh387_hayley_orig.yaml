@@ -1,0 +1,36 @@
+# VH-387：AWS 虛擬人醫院 40 題 Hayley 台語定版音檔（CosyVoice 合成，5.3 分鐘）。
+# 目標是這 40 題的發音與用字，不追求泛化，所以 40 句全進訓練，val 只取其中
+# 4 句看 loss 走勢。文本用 csv 的「送進TTS的文字」（華語原文，與 0820 底模
+# 的華語漢字→台語發音訓練方式一致）；V6 轉換後文本另開一個 config 對照。
+# val loss 在台語上不可信（見 model_registry.json），checkpoint 靠實聽挑。
+pretrained_path: /app/checkpoints/ft-mixed-lr2e5-avgE-e12run-0820
+train_manifest: /app/dataset/vh387/manifests/train_orig.jsonl
+val_manifest: /app/dataset/vh387/manifests/val_orig.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+batch_size: 1
+grad_accum_steps: 2
+num_workers: 2
+# 40 句 / grad_accum 2 = 每 epoch 20 step，20 epoch 約 400 step。
+num_epochs: 20
+valid_per_epoch: 1
+save_per_epoch: 1
+log_interval: 10
+learning_rate: 0.00005
+weight_decay: 0.01
+warmup_steps: 20
+max_batch_tokens: 4096
+max_grad_norm: 1.0
+save_path: /app/checkpoints/vh387-hayley-orig
+tensorboard: /app/checkpoints/vh387-hayley-orig/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+# 資料只有 5 分鐘，r 從 lora_novel 的 32 降到 16。
+lora:
+  enable_lm: true
+  enable_dit: true
+  enable_proj: false
+  r: 16
+  alpha: 16
+  dropout: 0.05
