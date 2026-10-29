@@ -95,6 +95,20 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                 400, "model_not_found", f"找不到模型 {model_id}"
             ) from exc
 
+    async def _castvoice_model_version(model_id: str | None) -> str:
+        """實際使用的模型（正式 namespaced id），給 X-Model-Version。
+
+        CastVoice 未指定模型時固定送 PUBLIC_BASE_MODEL_ID，不像互動端點會
+        沿用當前模型，所以照 _synthesize_castvoice 的同一套解析就能得到
+        gateway 實際載入的那顆（例如 MODEL_ID 指向 0820 時是 full::…）。
+        """
+        requested = (
+            await _resolve_native_model_override(model_id)
+            if model_id
+            else PUBLIC_BASE_MODEL_ID
+        )
+        return await asyncio.to_thread(gateway.resolve_native_model_id, requested)
+
     def _castvoice_synthesis_params(
         *,
         speed: float,
@@ -402,6 +416,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
             )
 
         try:
+            model_version = await _castvoice_model_version(body.model_id)
             mp3_bytes, request_id = await _synthesize_castvoice(
                 body.text,
                 body.voice_id,
@@ -418,7 +433,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
         return Response(
             content=mp3_bytes,
             media_type="audio/mpeg",
-            headers={"X-Request-ID": request_id},
+            headers={"X-Request-ID": request_id, "X-Model-Version": model_version},
         )
 
     @app.post("/api/v1/tts/synthesize/batch")
