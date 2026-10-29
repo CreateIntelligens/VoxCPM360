@@ -2346,6 +2346,44 @@ def test_castvoice_synthesize_accepts_valid_voxcpm2_model_override(monkeypatch):
     assert demo.calls[0]["model_selection"] == "__base__"
 
 
+def test_castvoice_synthesize_reports_model_actually_used(monkeypatch, tmp_path):
+    """呼叫端（Vman 試聽台）只能靠 X-Model-Version 知道這句是哪顆模型念的。"""
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    full = tmp_path / "ft-0820"
+    full.mkdir()
+    for filename in ("config.json", "tokenizer.json"):
+        (full / filename).write_text("{}", encoding="utf-8")
+    (full / "model.safetensors").write_bytes(b"weights")
+    (full / "audiovae.pth").write_bytes(b"vae")
+    monkeypatch.setenv("VOXCPM_FULL_MODEL_ROOTS", str(tmp_path))
+    monkeypatch.setenv("MODEL_ID", str(full))
+    demo = FakeDemo(model_id=str(full))
+    demo.lora_registry = FakeRegistry((FakeLoraCheckpoint(),))
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
+    voice = "voxcpm2-cosy-young-female-01"
+
+    with TestClient(app) as client:
+        default = client.post(
+            "/api/v1/tts/synthesize", json={"text": "hi", "voice_id": voice}
+        )
+        lora = client.post(
+            "/api/v1/tts/synthesize",
+            json={"text": "hi", "voice_id": voice, "model_id": "lora::lora-test"},
+        )
+        after_lora = client.post(
+            "/api/v1/tts/synthesize", json={"text": "hi", "voice_id": voice}
+        )
+
+    assert default.headers["x-model-version"] == "full::ft-0820"
+    assert lora.headers["x-model-version"] == "lora::lora-test"
+    assert after_lora.headers["x-model-version"] == "full::ft-0820"
+    assert [call["model_selection"] for call in demo.calls] == [
+        "__base__",
+        "lora-test",
+        "__base__",
+    ]
+
+
 def test_castvoice_synthesize_rejects_unknown_voxcpm2_model_override(monkeypatch):
     monkeypatch.setenv("VOXCPM_PRELOAD", "false")
     app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
