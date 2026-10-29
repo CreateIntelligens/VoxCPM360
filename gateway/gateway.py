@@ -523,8 +523,13 @@ class TTSGateway:
         # 未指定模型 → 沿用當前已載入的模型，絕不觸發引擎切換（full↔base
         # 切換實測 ~80 秒，期間所有請求陪等）。尚未載入任何模型時落到
         # base。實際使用的模型由回應的 X-Model-Version 回報。
+        # 但 LoRA 不沿用：它掛在同一個 runtime 上、不需重載，沿用的話試聽台
+        # 上試過一次 LoRA，之後所有未指定模型的正式流量都會跑在那顆 LoRA 上。
         if not requested_id:
-            return self._active_native_selection or PUBLIC_BASE_MODEL_ID
+            active = self._active_native_selection or PUBLIC_BASE_MODEL_ID
+            if active.startswith(LORA_MODEL_PREFIX):
+                return self.resolve_native_model_id(BASE_MODEL_KEY)
+            return active
         self.demo.lora_registry.refresh()
         self.full_model_registry.refresh()
 
@@ -590,12 +595,21 @@ class TTSGateway:
             if is_lora
             else BASE_MODEL_KEY
         )
-        if desired_runtime_id == self._native_runtime_id:
-            return self._native_demo, runtime_selection, canonical_id
-
         checkpoint = (
             self.full_model_registry.get(canonical_id) if is_full_model else None
         )
+        if is_lora:
+            # LoRA 一律掛在 MODEL_ID 的 base 權重上。MODEL_ID 指向已註冊的
+            # full checkpoint 時，那個 runtime 就是 LoRA 的 base，直接沿用；
+            # 否則每次選 LoRA 都會以 __base__ 名義重載同一份權重（實測 30–40
+            # 秒，期間所有請求陪等）。
+            base_runtime_id = self.resolve_native_model_id(BASE_MODEL_KEY)
+            if base_runtime_id.startswith(FULL_MODEL_PREFIX):
+                desired_runtime_id = base_runtime_id
+                checkpoint = self.full_model_registry.get(base_runtime_id)
+        if desired_runtime_id == self._native_runtime_id:
+            return self._native_demo, runtime_selection, canonical_id
+
         previous_demo = self._native_demo
         previous_runtime_id = self._native_runtime_id
         previous_demo.stop_voxcpm()

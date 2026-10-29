@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from types import SimpleNamespace
 from typing import Any, Optional, Tuple
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -446,7 +447,15 @@ class VoxCPMDemo:
         if not text:
             raise ValueError("Please input text to synthesize.")
 
-        lora_name = self.lora_registry.ensure_registered(server, model_selection)
+        # 不能把 server 直接交給 registry：它的同步 register_lora 內部是
+        # run_until_complete，撞上專屬 loop 執行緒會拋 "event loop is already
+        # running"。改走 _call_engine_sync，跟 encode_latents 同一條路。
+        engine = SimpleNamespace(
+            register_lora=lambda name, path: self._call_engine_sync(
+                server, "register_lora", name, path
+            )
+        )
+        lora_name = self.lora_registry.ensure_registered(engine, model_selection)
 
         prompt_text_clean = (prompt_text or "").strip() or None
         control = (control_instruction or "").strip()
