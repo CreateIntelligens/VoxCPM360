@@ -1866,6 +1866,44 @@ def test_full_native_checkpoint_switches_runtime(monkeypatch, tmp_path):
         assert full_demo.calls[0]["model_selection"] == "__base__"
 
 
+def test_lora_reuses_full_runtime_when_model_id_is_its_base(monkeypatch, tmp_path):
+    """MODEL_ID 指向已註冊的 full checkpoint 時，它就是 LoRA 的 base；選 LoRA
+    或切回不指定都不能重載引擎（實測每次 30–40 秒，期間請求全部陪等）。"""
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    full = tmp_path / "ft-0820"
+    full.mkdir()
+    for filename in ("config.json", "tokenizer.json"):
+        (full / filename).write_text("{}", encoding="utf-8")
+    (full / "model.safetensors").write_bytes(b"weights")
+    (full / "audiovae.pth").write_bytes(b"vae")
+    monkeypatch.setenv("VOXCPM_FULL_MODEL_ROOTS", str(tmp_path))
+    monkeypatch.setenv("MODEL_ID", str(full))
+
+    demo = FakeDemo(model_id=str(full))
+    demo.lora_registry = FakeRegistry((FakeLoraCheckpoint(),))
+    import gateway.gateway as _gw_mod
+
+    def unexpected_reload(**kwargs):
+        raise AssertionError("LoRA 不應觸發引擎重載")
+
+    monkeypatch.setattr(_gw_mod, "VoxCPMDemo", unexpected_reload)
+    gateway = api.TTSGateway(demo, barbet_runtime=FakeBarbetRuntime())
+
+    for model_id in ("", "lora::lora-test", "", "full::ft-0820"):
+        selected, selection, canonical_id = gateway._switch_native_runtime(model_id)
+        # 呼叫端成功後會記下 active selection；照實模擬，才測得到「未指定
+        # 模型不可沿用上一個 LoRA」。
+        gateway._active_native_selection = canonical_id
+        assert selected is demo
+        if model_id.startswith("lora::"):
+            assert selection == "lora-test"
+        else:
+            assert selection == "__base__"
+            assert canonical_id == "full::ft-0820"
+
+    assert demo.stops == 0
+
+
 def test_demo_rejects_non_cuda_device(monkeypatch, tmp_path):
     """nano-vLLM 沒有 CPU 路徑，放行只會讓服務誤報 device 卻仍佔 GPU 0。"""
     import app as app_module

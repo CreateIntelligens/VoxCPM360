@@ -68,6 +68,41 @@ def test_generate_passes_selected_lora_to_nano_server():
     assert server.max_generate_lengths == [22]
 
 
+def test_lora_registration_goes_through_engine_loop():
+    """引擎的同步 register_lora 內部是 run_until_complete，在專屬 loop 執行緒
+    運轉時會拋 "event loop is already running"；必須改走 _call_engine_sync。"""
+
+    class RegisteringRegistry:
+        def ensure_registered(self, engine, selection):
+            return engine.register_lora("adapter-x", "/ckpt/x")["name"]
+
+    server = FakeServer()
+    demo = VoxCPMDemo.__new__(VoxCPMDemo)
+    demo.voxcpm_server = server
+    demo.lora_registry = RegisteringRegistry()
+    demo.text_normalizer = None
+    demo.denoiser = None
+    engine_calls = []
+
+    def fake_call_engine_sync(target, method_name, *args):
+        if method_name != "register_lora":
+            return getattr(target, method_name)(*args)
+        engine_calls.append((target, method_name, args))
+        return {"name": "adapter-x"}
+
+    demo._call_engine_sync = fake_call_engine_sync
+
+    demo.generate_tts_audio(
+        text_input="測試",
+        do_normalize=False,
+        denoise=False,
+        model_selection="trial",
+    )
+
+    assert engine_calls == [(server, "register_lora", ("adapter-x", "/ckpt/x"))]
+    assert server.lora_names == ["adapter-x"]
+
+
 def test_generate_length_guard_is_configurable():
     server = FakeServer()
     demo = VoxCPMDemo.__new__(VoxCPMDemo)
