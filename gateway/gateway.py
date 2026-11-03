@@ -102,6 +102,8 @@ class TTSGateway:
             default=4,
             minimum=1,
         )
+        self.worker_watchdog = None
+        self._runtime_lock = threading.RLock()
         self._session_gate = _GPUSessionGate(
             concurrency=self._engine_concurrency,
         )
@@ -610,6 +612,22 @@ class TTSGateway:
         if desired_runtime_id == self._native_runtime_id:
             return self._native_demo, runtime_selection, canonical_id
 
+        # 跟 watchdog 重載排隊：切換中舊 demo 已卸載，watchdog 若同時把它載回來，
+        # 就會跟新模型各佔一份引擎。
+        with self._runtime_lock:
+            if desired_runtime_id == self._native_runtime_id:
+                return self._native_demo, runtime_selection, canonical_id
+            return self._switch_runtime_locked(
+                checkpoint, desired_runtime_id, runtime_selection, canonical_id
+            )
+
+    def _switch_runtime_locked(
+        self,
+        checkpoint: Any,
+        desired_runtime_id: str,
+        runtime_selection: str,
+        canonical_id: str,
+    ) -> tuple[VoxCPMDemo, str, str]:
         previous_demo = self._native_demo
         previous_runtime_id = self._native_runtime_id
         previous_demo.stop_voxcpm()
@@ -653,9 +671,13 @@ class TTSGateway:
         demo = self._native_demo
         probe = getattr(demo, "worker_alive", None)
         alive = probe() if callable(probe) else None
+        watchdog = self.worker_watchdog
+        reloading = watchdog is not None and watchdog.reloading
         return {
             "loaded": getattr(demo, "voxcpm_server", None) is not None,
-            "alive": alive,
+            # 重載與熱機做完才算活著，呼叫端才不會太早回來、撞上最慢的第一筆。
+            "alive": False if reloading else alive,
+            "reloading": reloading,
             "model": self._native_runtime_id,
         }
 

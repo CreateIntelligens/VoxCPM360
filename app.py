@@ -22,6 +22,8 @@ from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig
 from runtime_config import (
     read_default_inference_timesteps,
     require_per_request_timesteps,
+    read_mem_available_gib,
+    read_reload_min_available_gib,
 )
 
 import voxcpm
@@ -173,6 +175,9 @@ def engine_alive(server: Any) -> Optional[bool]:
 
 
 class VoxCPMDemo:
+    # 同一張 GPU 上一次只載入一個引擎，模型切換產生的多個 demo 也共用。
+    _load_lock = threading.RLock()
+
     def __init__(self, model_id: str = "openbmb/VoxCPM2", device: str = "auto") -> None:
         read_default_inference_timesteps()
         require_per_request_timesteps()
@@ -305,17 +310,9 @@ class VoxCPMDemo:
         return engine_alive(server)
 
     def get_or_load_voxcpm(self):
-        if self.voxcpm_server is not None:
-            if self.worker_alive() is False:
-                # 子程序死了但父行程還在：清掉殘骸重載，讓下一個請求自己復原，
-                # 而不是對著死 queue 等 300 秒。
-                logger.error(
-                    "nano-vllm worker for %s is gone; reloading", self._model_id
-                )
-                self.stop_voxcpm()
-            else:
-                self._ensure_server_loop_running()
-                return self.voxcpm_server
+        if self.voxcpm_server is not None and self.worker_alive() is not False:
+            self._ensure_server_loop_running()
+            return self.voxcpm_server
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -341,6 +338,28 @@ class VoxCPMDemo:
             if isinstance(outcome, BaseException):
                 raise outcome
             return outcome
+        # watchdog 和請求可能同時發現 worker 死了；沒有這把鎖會各載一份引擎。
+        with self._load_lock:
+            if self.voxcpm_server is not None:
+                if self.worker_alive() is not False:
+                    self._ensure_server_loop_running()
+                    return self.voxcpm_server
+                available = read_mem_available_gib()
+                required = read_reload_min_available_gib()
+                if available is not None and available < required:
+                    raise EngineWorkerDied(
+                        f"nano-vllm worker is gone; not reloading with "
+                        f"{available:.1f} GiB available (need {required:.1f} GiB)"
+                    )
+                # 子程序死了但父行程還在：清掉殘骸重載，讓下一個請求自己復原，
+                # 而不是對著死 queue 等 300 秒。
+                logger.error(
+                    "nano-vllm worker for %s is gone; reloading", self._model_id
+                )
+                self.stop_voxcpm()
+            return self._load_voxcpm()
+
+    def _load_voxcpm(self):
         # nano-vLLM 只接受 GPU 編號，沒有 device type 的概念，且硬依賴
         # flash-attn。放行 cpu/mps 只會讓服務宣稱跑在該裝置上卻仍佔用 GPU 0。
         if not self.device.startswith("cuda"):

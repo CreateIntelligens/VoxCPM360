@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_DEFAULT_TIMESTEPS, _by_id, _find_reference_preset
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
+from gateway.watchdog import WorkerWatchdog
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
 from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
@@ -79,26 +81,41 @@ def create_app(
     )
     gateway = TTSGateway(demo, barbet_runtime=barbet_runtime)
 
+    def _warmup_runtime(runtime: Any) -> None:
+        warmup = getattr(runtime, "warmup_voxcpm", None)
+        if not callable(warmup):
+            return
+        reference_path, prompt_text = _default_warmup_reference()
+        warmup(reference_path=reference_path, prompt_text=prompt_text)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         if os.environ.get("VOXCPM_PRELOAD", "true").lower() == "true":
             logger.info("Preloading VoxCPM2 runtime")
             await asyncio.to_thread(demo.get_or_load_voxcpm)
-            reference_path, prompt_text = _default_warmup_reference()
             try:
-                await asyncio.to_thread(
-                    demo.warmup_voxcpm,
-                    reference_path=reference_path,
-                    prompt_text=prompt_text,
-                )
+                await asyncio.to_thread(_warmup_runtime, demo)
             except Exception:
                 logger.exception(
                     "VoxCPM2 inference warmup failed; continuing startup"
                 )
         app.state.castvoice_batch_manager.start()
+        watchdog_task = None
+        if os.environ.get("VOXCPM_WATCHDOG_ENABLED", "true").lower() == "true":
+            watchdog = WorkerWatchdog(
+                lambda: gateway._native_demo,
+                _warmup_runtime,
+                reload_guard=gateway._runtime_lock,
+            )
+            gateway.worker_watchdog = watchdog
+            watchdog_task = asyncio.create_task(watchdog.run())
         try:
             yield
         finally:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog_task
             await app.state.castvoice_batch_manager.stop()
             await gateway.close_coalescer()
             await asyncio.to_thread(gateway.close)
