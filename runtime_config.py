@@ -56,3 +56,26 @@ def require_per_request_timesteps(server: Any = None) -> None:
                 "nano-vLLM lacks per-request timesteps; rebuild the app image "
                 "with scripts/patch_nanovllm_timesteps.py"
             )
+
+
+def read_mem_available_gib() -> float | None:
+    """系統可用記憶體；讀不到（非 Linux）回 None，由呼叫端視為不設限。"""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def read_reload_min_available_gib() -> float:
+    """worker 死後重載所需的最低可用記憶體。
+
+    GB10 實測 worker 佔 GPU 9.7 GiB、系統約 4 GiB，共約 14 GiB；統一記憶體下
+    這些都從同一池拿。再留 10 GiB 給同機服務（Breeze 等），避免重載把它們擠掉。
+    worker 通常是被全機 OOM 殺的，這時硬重載只會再殺一輪。
+    """
+    return float(os.environ.get("VOXCPM_WATCHDOG_MIN_AVAILABLE_GIB", "24"))
+

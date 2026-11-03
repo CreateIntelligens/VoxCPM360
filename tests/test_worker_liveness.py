@@ -122,6 +122,7 @@ def test_get_or_load_reloads_when_worker_is_dead(monkeypatch):
         monkeypatch.setattr(app_module, "read_default_inference_timesteps", lambda: 10)
         monkeypatch.setattr(app_module.VoxCPM, "from_pretrained", lambda *a, **k: fresh)
         monkeypatch.setattr(demo, "_ensure_server_loop_running", lambda: None)
+        monkeypatch.setattr(app_module, "read_mem_available_gib", lambda: 1000.0)
 
         assert demo.worker_alive() is False
         assert demo.get_or_load_voxcpm() is fresh
@@ -164,3 +165,115 @@ def test_health_stays_ok_without_liveness_information():
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["worker"]["alive"] is None
+
+
+def test_request_does_not_reload_dead_worker_when_memory_is_low(monkeypatch):
+    """請求路徑也要守記憶體門檻，否則 watchdog 忍住了，第一筆請求還是會硬重載。"""
+    import app as app_module
+
+    class DeadServer:
+        stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    dead = DeadServer()
+    demo = app_module.VoxCPMDemo.__new__(app_module.VoxCPMDemo)
+    demo.voxcpm_server = dead
+    monkeypatch.setattr(demo, "worker_alive", lambda: False)
+    monkeypatch.setattr(app_module, "read_mem_available_gib", lambda: 5.0)
+    monkeypatch.setenv("VOXCPM_WATCHDOG_MIN_AVAILABLE_GIB", "24")
+
+    with pytest.raises(app_module.EngineWorkerDied, match="not reloading"):
+        demo.get_or_load_voxcpm()
+
+    assert dead.stopped is False
+    assert demo.voxcpm_server is dead
+
+
+def test_tts_health_reports_dead_worker():
+    app = api.create_app(DeadWorkerDemo(), barbet_runtime=FakeBarbetRuntime())
+    with TestClient(app) as client:
+        response = client.get("/api/v1/tts/health")
+    assert response.status_code == 503
+    assert response.json() == {"status": "worker_dead"}
+
+
+def test_tts_health_stays_ok_without_liveness_information():
+    app = api.create_app(FakeDemo(), barbet_runtime=FakeBarbetRuntime())
+    with TestClient(app) as client:
+        response = client.get("/api/v1/tts/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_health_stays_503_until_watchdog_finishes_warmup():
+    class AliveDemo(FakeDemo):
+        def worker_alive(self):
+            return True
+
+    app = api.create_app(AliveDemo(), barbet_runtime=FakeBarbetRuntime())
+    with TestClient(app) as client:
+        watchdog = app.state.tts_gateway.worker_watchdog
+        watchdog.reloading = True
+        reloading = client.get("/api/v1/health")
+        tts_reloading = client.get("/api/v1/tts/health")
+        watchdog.reloading = False
+        done = client.get("/api/v1/health")
+    assert reloading.status_code == 503
+    assert reloading.json()["status"] == "worker_dead"
+    assert reloading.json()["worker"]["reloading"] is True
+    assert tts_reloading.status_code == 503
+    assert done.status_code == 200
+    assert done.json()["worker"]["reloading"] is False
+
+
+def test_model_switch_keeps_health_ok_and_holds_runtime_lock(monkeypatch, tmp_path):
+    """切換模型不是 worker 死掉：/api/v1/health 要維持 200，否則呼叫端會在切換期間跳過這台。"""
+    full = tmp_path / "other-full"
+    full.mkdir()
+    for filename in ("config.json", "tokenizer.json"):
+        (full / filename).write_text("{}", encoding="utf-8")
+    (full / "model.safetensors").write_bytes(b"weights")
+    (full / "audiovae.pth").write_bytes(b"vae")
+    monkeypatch.setenv("VOXCPM_FULL_MODEL_ROOTS", str(tmp_path))
+
+    observed = {}
+    app_holder = {}
+
+    class SwitchingDemo(FakeDemo):
+        def worker_alive(self):
+            return None if self.model_id == "next" else True
+
+        def get_or_load_voxcpm(self):
+            gateway = app_holder["app"].state.tts_gateway
+            observed["status"] = gateway.worker_status()
+            result = []
+
+            def probe():
+                got = gateway._runtime_lock.acquire(blocking=False)
+                result.append(not got)
+                if got:
+                    gateway._runtime_lock.release()
+
+            thread = threading.Thread(target=probe)
+            thread.start()
+            thread.join()
+            observed["lock_held"] = result[0]
+            return super().get_or_load_voxcpm()
+
+    import gateway.gateway as gw_module
+
+    monkeypatch.setattr(
+        gw_module, "VoxCPMDemo", lambda **_kw: SwitchingDemo(model_id="next")
+    )
+    app = api.create_app(SwitchingDemo(), barbet_runtime=FakeBarbetRuntime())
+    app_holder["app"] = app
+    with TestClient(app):
+        gateway = app.state.tts_gateway
+        gateway._switch_native_runtime("full::other-full")
+
+    assert observed["lock_held"] is True
+    assert observed["status"]["alive"] is not False
+    assert observed["status"]["reloading"] is False
+

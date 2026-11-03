@@ -384,7 +384,11 @@ def register_castvoice_routes(app, gateway, demo, helpers):
     app.state.castvoice_batch_manager = batch_manager
 
     @app.get("/api/v1/tts/health")
-    async def castvoice_health() -> dict[str, str]:
+    async def castvoice_health() -> Any:
+        # 語意與 /api/v1/health 相同：worker 死掉時 API 雖然活著也不能合成。
+        worker = await asyncio.to_thread(gateway.worker_status)
+        if worker.get("alive") is False:
+            return JSONResponse(status_code=503, content={"status": "worker_dead"})
         return {"status": "ok"}
 
     @app.get("/api/v1/tts/voices")
