@@ -156,7 +156,12 @@ class WorkerWatchdog:
     async def run(self) -> None:
         while True:
             await asyncio.sleep(self.interval_seconds)
+            check = asyncio.ensure_future(asyncio.to_thread(self.tick))
             try:
-                await asyncio.to_thread(self.tick)
+                await asyncio.shield(check)
+            except asyncio.CancelledError:
+                # 取消攔不住執行緒裡的重載；等它做完，關機才不會跟載入撞在一起。
+                await asyncio.gather(check, return_exceptions=True)
+                raise
             except Exception:
                 logger.exception("worker watchdog: check failed")

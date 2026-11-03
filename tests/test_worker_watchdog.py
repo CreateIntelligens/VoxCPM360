@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import threading
+import time
 
 from gateway.watchdog import WorkerWatchdog
 
@@ -236,4 +238,39 @@ def test_does_not_reload_old_runtime_after_switch_finished_while_waiting():
     assert old.loads == 0
     assert new.loads == 0
     assert watchdog.reloading is False
+
+
+def test_cancelling_run_waits_for_the_reload_in_progress():
+    """關機時取消 asyncio 工作攔不住執行緒；要等重載做完才能關 gateway。"""
+    started = threading.Event()
+    finished = []
+
+    class SlowDemo(FakeDemo):
+        def get_or_load_voxcpm(self):
+            started.set()
+            time.sleep(0.2)
+            finished.append(True)
+            self.alive = True
+
+    watchdog = WorkerWatchdog(
+        lambda: demo,
+        lambda _demo: None,
+        interval_seconds=0,
+        min_available_gib=24,
+        read_available=lambda: 100.0,
+    )
+    demo = SlowDemo(alive=False)
+
+    async def scenario():
+        task = asyncio.create_task(watchdog.run())
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return list(finished)
+
+    assert asyncio.run(scenario()) == [True]
 
