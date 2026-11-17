@@ -3468,3 +3468,359 @@ def test_native_streaming_rejects_unsupported_sample_rate(monkeypatch):
         )
     assert response.status_code == 422
     assert "sample_rate" in response.json()["detail"]
+
+
+# --- queue=reject：每筆請求自選不排隊 -------------------------------------
+
+
+def _stream_kwargs(request_id: str, text: str, **overrides):
+    return {
+        "request_id": request_id,
+        "model_id": "__base__",
+        "text": text,
+        "control_instruction": "",
+        "reference_path": None,
+        "prompt_text": "",
+        "cfg_value": 2.0,
+        "normalize": False,
+        "denoise": False,
+        "inference_timesteps": 10,
+        **overrides,
+    }
+
+
+def _blocking_streaming_demo(worker_blocked, release_worker):
+    class BlockingStreamingDemo(FakeStreamingDemo):
+        def generate_tts_audio_stream(self, request):
+            self.stream_calls.append(request)
+            yield np.array([0.1], dtype=np.float32)
+            worker_blocked.set()
+            assert release_worker.wait(timeout=5)
+            yield np.array([0.2], dtype=np.float32)
+
+    return BlockingStreamingDemo()
+
+
+def _queue_policy_env(monkeypatch):
+    # 單一 GPU slot、pending 名額充足：被拒只可能來自 busy_no_queue，
+    # 不會走到既有的 queue_full（Retry-After 30）。逾時拉長，若 reject
+    # 誤進排隊，測試會卡在 wait_for 而不是巧合地等到 503。
+    monkeypatch.setenv("VOXCPM_PRELOAD", "false")
+    monkeypatch.setenv("VOXCPM_DEFAULT_REFERENCE", "")
+    monkeypatch.setenv("VOXCPM_ENGINE_CONCURRENCY", "1")
+    monkeypatch.setenv("VOXCPM_MAX_PENDING_SYNTHESIS", "5")
+    monkeypatch.setenv("VOXCPM_QUEUE_TIMEOUT_SECONDS", "30")
+
+
+def test_session_gate_try_acquire_never_waits_or_enqueues():
+    async def run_scenario():
+        gate = api._GPUSessionGate(concurrency=1)
+        assert gate.try_acquire(engine_id="voxcpm2", model_id="m") == 1
+        assert gate.try_acquire(engine_id="voxcpm2", model_id="m") is None
+        assert gate.active_units == 1
+        assert not gate._waiters
+
+        waiter = asyncio.create_task(gate.acquire(engine_id="voxcpm2", model_id="m"))
+        await asyncio.sleep(0)
+        gate.release()
+        assert await waiter == 1
+        # 有人排隊時 reject 不可插隊，即使容量足夠。
+        gate.concurrency = 2
+        queued = asyncio.create_task(gate.acquire(engine_id="voxcpm2", model_id="other"))
+        await asyncio.sleep(0)
+        assert len(gate._waiters) == 1
+        assert gate.try_acquire(engine_id="voxcpm2", model_id="m") is None
+        assert gate.active_units == 1
+        gate.release()
+        assert await queued == 1
+        gate.release()
+        assert gate.active_units == 0
+
+    asyncio.run(run_scenario())
+
+
+def test_streaming_default_queue_policy_still_waits_for_slot(monkeypatch):
+    _queue_policy_env(monkeypatch)
+    worker_blocked = threading.Event()
+    release_worker = threading.Event()
+    gateway = api.TTSGateway(
+        _blocking_streaming_demo(worker_blocked, release_worker),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    async def run_scenario():
+        first = await gateway.synthesize_native_stream(**_stream_kwargs("first", "一"))
+        assert await asyncio.to_thread(worker_blocked.wait, 2)
+        waiting = asyncio.create_task(
+            gateway.synthesize_native_stream(**_stream_kwargs("second", "二"))
+        )
+        await asyncio.sleep(0.05)
+        assert not waiting.done()
+        assert gateway._inflight_jobs == 2
+        assert len(gateway._session_gate._waiters) == 1
+
+        release_worker.set()
+        assert [chunk async for chunk in first]
+        await first.aclose()
+        second = await asyncio.wait_for(waiting, timeout=2)
+        assert [chunk async for chunk in second]
+        await second.aclose()
+
+    asyncio.run(run_scenario())
+    assert gateway._inflight_jobs == 0
+    assert gateway._session_gate.active_units == 0
+
+
+def test_streaming_queue_reject_returns_429_immediately_when_gate_full(monkeypatch):
+    _queue_policy_env(monkeypatch)
+    worker_blocked = threading.Event()
+    release_worker = threading.Event()
+    demo = _blocking_streaming_demo(worker_blocked, release_worker)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
+    gateway = app.state.tts_gateway
+
+    with TestClient(app) as client:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(
+                client.post,
+                "/api/v1/synthesize/stream",
+                data={"engine_id": "voxcpm2", "model_id": "__base__", "text": "第一筆"},
+            )
+            assert worker_blocked.wait(timeout=2)
+            assert gateway._inflight_jobs == 1
+            started = time.perf_counter()
+            rejected = client.post(
+                "/api/v1/synthesize/stream",
+                data={
+                    "engine_id": "voxcpm2",
+                    "model_id": "__base__",
+                    "text": "第二筆",
+                    "queue": "reject",
+                },
+            )
+            elapsed = time.perf_counter() - started
+            # 被拒的請求沒有占 pending 名額，也沒有進 gate 的等待佇列。
+            assert gateway._inflight_jobs == 1
+            assert gateway._session_gate.active_units == 1
+            assert not gateway._session_gate._waiters
+            release_worker.set()
+            first_response = first.result(timeout=5)
+
+    assert rejected.status_code == 429
+    assert rejected.headers["retry-after"] == "1"
+    assert rejected.headers["x-request-id"]
+    assert "queue=reject" in rejected.json()["detail"]
+    assert elapsed < 1.0
+    assert first_response.status_code == 200
+    assert len(demo.stream_calls) == 1
+    assert gateway._inflight_jobs == 0
+    assert gateway._session_gate.active_units == 0
+
+
+def test_streaming_queue_reject_proceeds_when_slot_free(monkeypatch):
+    _queue_policy_env(monkeypatch)
+    demo = FakeStreamingDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/synthesize/stream",
+            data={
+                "engine_id": "voxcpm2",
+                "model_id": "__base__",
+                "text": "有空位",
+                "queue": "reject",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.content[:4] == b"RIFF"
+    assert len(demo.stream_calls) == 1
+    assert app.state.tts_gateway._inflight_jobs == 0
+    assert app.state.tts_gateway._session_gate.active_units == 0
+
+
+def test_concurrent_queue_reject_requests_cannot_share_one_free_slot(monkeypatch):
+    _queue_policy_env(monkeypatch)
+    worker_blocked = threading.Event()
+    release_worker = threading.Event()
+    gateway = api.TTSGateway(
+        _blocking_streaming_demo(worker_blocked, release_worker),
+        barbet_runtime=FakeBarbetRuntime(),
+    )
+
+    async def run_scenario():
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    gateway.synthesize_native_stream(
+                        **_stream_kwargs(f"r{i}", str(i), queue_policy="reject")
+                    )
+                    for i in range(5)
+                ),
+                return_exceptions=True,
+            ),
+            timeout=5,
+        )
+        streams = [r for r in results if not isinstance(r, BaseException)]
+        rejected = [r for r in results if isinstance(r, api.HTTPException)]
+        assert len(streams) == 1
+        assert len(rejected) == 4
+        assert {exc.status_code for exc in rejected} == {429}
+        assert {exc.headers["Retry-After"] for exc in rejected} == {"1"}
+        assert gateway._inflight_jobs == 1
+        assert not gateway._session_gate._waiters
+
+        release_worker.set()
+        assert [chunk async for chunk in streams[0]]
+        await streams[0].aclose()
+
+    asyncio.run(run_scenario())
+    assert gateway._inflight_jobs == 0
+    assert gateway._session_gate.active_units == 0
+
+
+def test_castvoice_queue_reject_returns_rate_limited_when_gate_full(monkeypatch):
+    _queue_policy_env(monkeypatch)
+    native_started = threading.Event()
+    release_native = threading.Event()
+
+    class BlockingDemo(FakeDemo):
+        def generate_tts_audio(self, **kwargs):
+            self.calls.append(kwargs)
+            native_started.set()
+            assert release_native.wait(timeout=5)
+            return 16_000, np.zeros(320, dtype=np.float32)
+
+    demo = BlockingDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
+    gateway = app.state.tts_gateway
+    voice = "voxcpm2-cosy-young-female-01"
+
+    with TestClient(app) as client:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(
+                client.post,
+                "/api/v1/tts/synthesize",
+                json={"text": "第一筆", "voice_id": voice},
+            )
+            assert native_started.wait(timeout=2)
+            rejected = client.post(
+                "/api/v1/tts/synthesize",
+                json={"text": "第二筆", "voice_id": voice, "queue": "reject"},
+            )
+            assert gateway._inflight_jobs == 1
+            assert not gateway._session_gate._waiters
+            release_native.set()
+            first_response = first.result(timeout=5)
+
+    assert rejected.status_code == 429
+    assert rejected.json()["error"] == "rate_limited"
+    assert "queue=reject" in rejected.json()["message"]
+    assert rejected.headers["retry-after"] == "1"
+    assert rejected.headers["x-request-id"]
+    assert first_response.status_code == 200
+    assert len(demo.calls) == 1
+
+
+def test_castvoice_queue_reject_proceeds_when_slot_free(monkeypatch):
+    _queue_policy_env(monkeypatch)
+    demo = FakeDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            json={
+                "text": "有空位",
+                "voice_id": "voxcpm2-cosy-young-female-01",
+                "queue": "reject",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert len(demo.calls) == 1
+
+
+def test_interactive_synthesize_queue_reject_when_gate_full(monkeypatch):
+    _queue_policy_env(monkeypatch)
+    worker_blocked = threading.Event()
+    release_worker = threading.Event()
+    demo = _blocking_streaming_demo(worker_blocked, release_worker)
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
+    gateway = app.state.tts_gateway
+
+    with TestClient(app) as client:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(
+                client.post,
+                "/api/v1/synthesize/stream",
+                data={"engine_id": "voxcpm2", "model_id": "__base__", "text": "占住"},
+            )
+            assert worker_blocked.wait(timeout=2)
+            rejected = client.post(
+                "/api/v1/synthesize",
+                data={
+                    "engine_id": "voxcpm2",
+                    "model_id": "__base__",
+                    "text": "不排隊",
+                    "queue": "reject",
+                },
+            )
+            assert gateway._inflight_jobs == 1
+            assert not gateway._session_gate._waiters
+            release_worker.set()
+            assert first.result(timeout=5).status_code == 200
+        accepted = client.post(
+            "/api/v1/synthesize",
+            data={
+                "engine_id": "voxcpm2",
+                "model_id": "__base__",
+                "text": "有空位",
+                "queue": "reject",
+                "seed": "7",
+            },
+        )
+        history = client.get("/api/v1/history?limit=1").json()["items"]
+
+    assert rejected.status_code == 429
+    assert rejected.headers["retry-after"] == "1"
+    assert accepted.status_code == 200
+    assert accepted.content.startswith(b"RIFF")
+    assert accepted.headers["x-random-seed"] == "7"
+    assert accepted.headers["x-history-id"] == history[0]["id"]
+    assert history[0]["seed"] == 7
+    assert demo.calls[-1]["seed"] == 7
+    assert gateway._inflight_jobs == 0
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["/api/v1/synthesize", "/api/v1/synthesize/stream", "/api/v1/tts/synthesize"],
+)
+def test_queue_policy_rejects_unknown_value(monkeypatch, endpoint):
+    _queue_policy_env(monkeypatch)
+    demo = FakeStreamingDemo()
+    app = api.create_app(demo, barbet_runtime=FakeBarbetRuntime())
+
+    with TestClient(app) as client:
+        if endpoint == "/api/v1/tts/synthesize":
+            response = client.post(
+                endpoint,
+                json={
+                    "text": "測試",
+                    "voice_id": "voxcpm2-cosy-young-female-01",
+                    "queue": "never",
+                },
+            )
+        else:
+            response = client.post(
+                endpoint,
+                data={"engine_id": "voxcpm2", "text": "測試", "queue": "never"},
+            )
+
+    assert response.status_code == 422
+    assert not demo.calls
+    assert not demo.stream_calls
+    assert app.state.tts_gateway._inflight_jobs == 0

@@ -244,6 +244,23 @@ docker compose up -d --build
 - Studio: `http://localhost:8800/`
 - Model catalog API: `http://localhost:8800/api/v1/catalog`
 
+All synthesis requests share one GPU gate (`VOXCPM_ENGINE_CONCURRENCY` running,
+`VOXCPM_MAX_PENDING_SYNTHESIS` waiting, `VOXCPM_QUEUE_TIMEOUT_SECONDS` before a
+503). A caller that would rather fall back than wait can send the optional
+`queue` parameter, a form field on `POST /api/v1/synthesize` and
+`POST /api/v1/synthesize/stream` and a JSON field on `POST /api/v1/tts/synthesize`:
+
+| `queue` | Behaviour |
+|---|---|
+| `wait` (default) | Queue for a GPU slot as before. |
+| `reject` | Run only if a slot is free right now; otherwise return `429` immediately with `Retry-After: 1` and `X-Request-ID`, without taking a queue slot. |
+
+The rejection body follows each endpoint's existing error format:
+`{"detail": "..."}` on `/api/v1/synthesize*` and
+`{"error": "rate_limited", "message": "..."}` on `/api/v1/tts/synthesize`.
+Any other value returns `422`. When the pending queue itself is full, both
+policies get the existing `429` with `Retry-After: 30`.
+
 The selector is directory-driven. Put native VoxCPM2 LoRA or full checkpoints
 under `models/native/<version>/` and complete Barbet TTS checkpoints
 under `models/barbet/<version>/`, then press **重新掃描**. Existing training

@@ -102,6 +102,31 @@ class _GPUSessionGate:
             and self._active_units + units <= self._effective_capacity(engine_id)
         )
 
+    def try_acquire(
+        self,
+        *,
+        engine_id: str = "__exclusive__",
+        model_id: str = "__exclusive__",
+        units: int = 1,
+    ) -> int | None:
+        """不等待地取得 slot；需要排隊時回 None，gate 狀態不變。
+
+        同步函式、中間沒有 await，在 event loop 上檢查與占用是原子的，
+        queue=reject 的請求靠這點保證「看到空位就一定拿得到」。
+        """
+        units = max(1, units)
+        if self._waiters:
+            return None
+        if self._active_units == 0:
+            self._active_engine = engine_id
+            self._active_model_id = model_id
+            self._active_units = units
+            return self._active_units
+        if self._can_join_active_session(engine_id, model_id, units):
+            self._active_units += units
+            return self._active_units
+        return None
+
     async def acquire(
         self,
         *,
@@ -111,15 +136,13 @@ class _GPUSessionGate:
         timeout: float | None = None,
     ) -> int:
         units = max(1, units)
-        if not self._waiters:
-            if self._active_units == 0:
-                self._active_engine = engine_id
-                self._active_model_id = model_id
-                self._active_units = units
-                return self._active_units
-            if self._can_join_active_session(engine_id, model_id, units):
-                self._active_units += units
-                return self._active_units
+        refcount = self.try_acquire(
+            engine_id=engine_id,
+            model_id=model_id,
+            units=units,
+        )
+        if refcount is not None:
+            return refcount
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[int] = loop.create_future()
@@ -274,6 +297,10 @@ class _NativeCoalescer:
                         exc,
                     )
             raise
+
+    def has_pending(self) -> bool:
+        """是否有已收件、尚未進 GPU 的互動請求（它們算排隊中）。"""
+        return bool(self._queue)
 
     async def _remove_if_pending(self, item: _NativeCoalescedItem) -> bool:
         async with self._queue_lock:

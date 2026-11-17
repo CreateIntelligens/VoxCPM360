@@ -43,6 +43,7 @@ from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DE
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
+from gateway.constants import QUEUE_POLICIES, QUEUE_POLICY_REJECT, QUEUE_POLICY_WAIT
 from gateway.streaming import _STREAMING_END, _STREAM_OUTPUT_SAMPLE_RATES, _ChunkResampler, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
 from gateway.gateway import TTSGateway
@@ -178,6 +179,17 @@ def register_interactive_routes(app, gateway, history_lock):
             if path.is_file():
                 return str(path)
         return None
+
+    def _parse_queue_policy(queue: Any) -> str:
+        # 測試直接呼叫路由函式時拿到的是 Form 預設物件而非字串
+        if not isinstance(queue, str):
+            return QUEUE_POLICY_WAIT
+        if queue not in QUEUE_POLICIES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"queue 只接受 {' 或 '.join(QUEUE_POLICIES)}",
+            )
+        return queue
 
     def _remove_temp_file(temp_path: str | None) -> None:
         if not temp_path:
@@ -364,18 +376,22 @@ def register_interactive_routes(app, gateway, history_lock):
         # 超出後相位聲碼器的金屬感開始明顯，故上下限收在 0.5/2.0。
         speed: float = Form(1.0),
         seed: int | None = Form(None),
+        # wait＝滿載時排隊（預設）；reject＝沒有空的 GPU slot 就立刻 429。
+        queue: str = Form(QUEUE_POLICY_WAIT),
         reference_audio: UploadFile | None = File(None),
     ) -> Response:
         request_id = uuid.uuid4().hex
         request_started_at = time.perf_counter()
+        queue_policy = _parse_queue_policy(queue)
         logger.info(
             "synthesis.request request_id=%s stage=received engine=%s model=%s "
-            "content_type=%s text_chars=%d",
+            "content_type=%s text_chars=%d queue_policy=%s",
             request_id,
             engine_id,
             model_id,
             request.headers.get("content-type", ""),
             len(text),
+            queue_policy,
         )
         prepared = await _prepare_synthesis_request(
             engine_id=engine_id,
@@ -394,7 +410,28 @@ def register_interactive_routes(app, gateway, history_lock):
             reference_audio=reference_audio,
         )
         try:
-            if prepared.engine_id == "voxcpm2":
+            if prepared.engine_id == "voxcpm2" and queue_policy == QUEUE_POLICY_REJECT:
+                # 合流器只合併「已經在等」的請求；reject 不會等，直接單筆
+                # 走同一個 gate，才能在占位的同一步判斷有沒有空位。
+                wav, extra_headers = await gateway.synthesize_native(
+                    request_id=request_id,
+                    model_id=prepared.model_id,
+                    text=prepared.text,
+                    control_instruction=prepared.control_instruction,
+                    reference_path=prepared.active_reference,
+                    prompt_text=prepared.prompt_text,
+                    cfg_value=prepared.cfg_value,
+                    normalize=prepared.normalize,
+                    denoise=prepared.denoise,
+                    inference_timesteps=prepared.inference_timesteps,
+                    speed=prepared.speed,
+                    seed=prepared.seed,
+                    queue_policy=queue_policy,
+                )
+                extra_headers = {**extra_headers, "X-Batch-Size": "1"}
+                if prepared.seed is not None:
+                    extra_headers["X-Random-Seed"] = str(prepared.seed)
+            elif prepared.engine_id == "voxcpm2":
                 wav, extra_headers = await gateway.synthesize_native_coalesced(
                     request_id=request_id,
                     model_id=prepared.model_id,
@@ -421,6 +458,7 @@ def register_interactive_routes(app, gateway, history_lock):
                     inference_timesteps=prepared.inference_timesteps,
                     seed=prepared.seed,
                     speed=prepared.speed,
+                    queue_policy=queue_policy,
                 )
 
             headers = {
@@ -465,9 +503,12 @@ def register_interactive_routes(app, gateway, history_lock):
         seed: int | None = Form(None),
         # 選填：輸出取樣率。不帶＝模型原生（48 kHz）；目前只接受 16000。
         sample_rate: int | None = Form(None),
+        # wait＝滿載時排隊（預設）；reject＝沒有空的 GPU slot 就立刻 429。
+        queue: str = Form(QUEUE_POLICY_WAIT),
         reference_audio: UploadFile | None = File(None),
     ) -> Response:
         request_id = uuid.uuid4().hex
+        queue_policy = _parse_queue_policy(queue)
         # 測試直接呼叫路由函式時拿到的是 Form 預設物件而非 None
         if not isinstance(sample_rate, int):
             sample_rate = None
@@ -478,12 +519,13 @@ def register_interactive_routes(app, gateway, history_lock):
             )
         logger.info(
             "synthesis.request request_id=%s stage=received engine=%s model=%s "
-            "content_type=%s text_chars=%d streaming=true",
+            "content_type=%s text_chars=%d streaming=true queue_policy=%s",
             request_id,
             engine_id,
             model_id,
             request.headers.get("content-type", ""),
             len(text),
+            queue_policy,
         )
         prepared = await _prepare_synthesis_request(
             engine_id=engine_id,
@@ -514,6 +556,7 @@ def register_interactive_routes(app, gateway, history_lock):
                 normalize=prepared.normalize,
                 denoise=prepared.denoise,
                 inference_timesteps=prepared.inference_timesteps,
+                queue_policy=queue_policy,
             )
         except BaseException:
             _remove_temp_file(prepared.temp_path)

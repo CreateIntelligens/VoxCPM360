@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from anyio import CancelScope
 import librosa
@@ -61,6 +61,9 @@ class CastVoiceSynthesizeRequest(BaseModel):
     cfg_value: float | None = None
     normalize: bool | None = None
     denoise: bool | None = None
+    # 選填：wait＝滿載時排隊（預設，舊行為）；reject＝沒有空的 GPU slot
+    # 就立刻回 429 + Retry-After，讓呼叫端改走備援而不是白等。
+    queue: Literal["wait", "reject"] = "wait"
 
 
 class CastVoiceBatchItemRequest(BaseModel):

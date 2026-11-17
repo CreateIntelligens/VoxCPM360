@@ -43,6 +43,7 @@ from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DE
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_DEFAULT_TIMESTEPS, _CASTVOICE_DEFAULT_CFG_VALUE, _CASTVOICE_DEFAULT_DENOISE, _CASTVOICE_DEFAULT_NORMALIZE, _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
+from gateway.constants import QUEUE_POLICY_WAIT
 from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
 from gateway.gateway import TTSGateway
@@ -148,6 +149,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
         cfg_value: float | None = None,
         normalize: bool | None = None,
         denoise: bool | None = None,
+        queue_policy: str = QUEUE_POLICY_WAIT,
     ) -> tuple[bytes, str]:
         """單句 CastAgent 語音合成的共用邏輯。單筆 /synthesize 與 batch worker
         都走這裡，失敗一律拋 _CastVoiceError，呼叫端自行決定怎麼回應
@@ -199,6 +201,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                 inference_timesteps=_VOXCPM2_DEFAULT_TIMESTEPS,
                 speed=params["speed"],
                 seed=seed,
+                queue_policy=queue_policy,
             )
         except HTTPException as exc:
             raise _castvoice_error_from_http(exc) from exc
@@ -430,6 +433,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                 cfg_value=body.cfg_value,
                 normalize=body.normalize,
                 denoise=body.denoise,
+                queue_policy=body.queue,
             )
         except _CastVoiceError as exc:
             return _castvoice_error(exc.status_code, exc.error, exc.message, **exc.headers)

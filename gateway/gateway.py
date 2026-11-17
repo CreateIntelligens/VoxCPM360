@@ -40,6 +40,7 @@ from voxcpm.lora_registry import BASE_MODEL_KEY
 logger = logging.getLogger(__name__)
 
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
+from gateway.constants import QUEUE_POLICY_REJECT, QUEUE_POLICY_WAIT, QUEUE_REJECT_RETRY_AFTER_SECONDS
 from gateway.presets import _VOXCPM2_DEFAULT_TIMESTEPS
 from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
 from gateway.concurrency import _SessionWaiter, _GPUSessionGate, _NativeCoalescedItem, _NativeCoalescer
@@ -164,22 +165,11 @@ class TTSGateway:
     ) -> float:
         queued_at = time.perf_counter()
         async with self._admission_lock:
-            capacity = self._max_pending_jobs + 1
-            if self._inflight_jobs >= capacity:
-                logger.warning(
-                    "synthesis.request request_id=%s stage=rejected reason=queue_full "
-                    "engine=%s model=%s inflight=%d capacity=%d",
-                    request_id,
-                    engine_id,
-                    model_id,
-                    self._inflight_jobs,
-                    capacity,
-                )
-                raise HTTPException(
-                    status_code=429,
-                    detail="語音生成佇列已滿，請稍後再試",
-                    headers={"Retry-After": "30", "X-Request-ID": request_id},
-                )
+            self._reject_if_admission_full(
+                request_id=request_id,
+                engine_id=engine_id,
+                model_id=model_id,
+            )
             self._inflight_jobs += 1
             queue_position = self._inflight_jobs - 1
 
@@ -193,6 +183,93 @@ class TTSGateway:
         )
         return queued_at
 
+    def _reject_if_admission_full(
+        self,
+        *,
+        request_id: str,
+        engine_id: str,
+        model_id: str,
+    ) -> None:
+        """呼叫端須持有 _admission_lock。"""
+        capacity = self._max_pending_jobs + 1
+        if self._inflight_jobs >= capacity:
+            logger.warning(
+                "synthesis.request request_id=%s stage=rejected reason=queue_full "
+                "engine=%s model=%s inflight=%d capacity=%d",
+                request_id,
+                engine_id,
+                model_id,
+                self._inflight_jobs,
+                capacity,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="語音生成佇列已滿，請稍後再試",
+                headers={"Retry-After": "30", "X-Request-ID": request_id},
+            )
+
+    async def _admit_gpu_job_without_queue(
+        self,
+        *,
+        request_id: str,
+        engine_id: str,
+        model_id: str,
+        gate_model_id: str,
+        units: int,
+    ) -> tuple[float, int]:
+        """queue=reject：GPU slot 現在就有空才收件，並在同一步占住 slot。
+
+        回傳 (queued_at, session_concurrency)，呼叫端已持有 gate、不可再
+        acquire。需要排隊時直接 429，不占 pending 名額，也不進 gate 的
+        waiter 佇列。整段在 _admission_lock 內且 try_acquire 之後沒有
+        await，兩筆 reject 不可能同時看到同一個空位。
+        """
+        queued_at = time.perf_counter()
+        async with self._admission_lock:
+            self._reject_if_admission_full(
+                request_id=request_id,
+                engine_id=engine_id,
+                model_id=model_id,
+            )
+            session_concurrency: int | None = None
+            # 互動合成已收件、還沒進 gate 的請求也算排隊者，不可插隊。
+            if not self._native_coalescer.has_pending():
+                session_concurrency = self._session_gate.try_acquire(
+                    engine_id=engine_id,
+                    model_id=gate_model_id,
+                    units=units,
+                )
+            if session_concurrency is None:
+                logger.warning(
+                    "synthesis.request request_id=%s stage=rejected reason=busy_no_queue "
+                    "engine=%s model=%s active_units=%d capacity=%d waiters=%d",
+                    request_id,
+                    engine_id,
+                    model_id,
+                    self._session_gate.active_units,
+                    self._session_gate._effective_capacity(engine_id),
+                    len(self._session_gate._waiters),
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail="語音生成資源忙碌中，此請求選擇不排隊（queue=reject），請稍後再試",
+                    headers={
+                        "Retry-After": str(QUEUE_REJECT_RETRY_AFTER_SECONDS),
+                        "X-Request-ID": request_id,
+                    },
+                )
+            self._inflight_jobs += 1
+
+        logger.info(
+            "synthesis.request request_id=%s stage=queued engine=%s model=%s "
+            "queue_position=0 inflight=%d queue_policy=reject",
+            request_id,
+            engine_id,
+            model_id,
+            self._inflight_jobs,
+        )
+        return queued_at, session_concurrency
+
     async def _finish_gpu_jobs(self, count: int = 1) -> None:
         async with self._admission_lock:
             self._inflight_jobs -= count
@@ -205,6 +282,7 @@ class TTSGateway:
         model_id: str,
         units: int = 1,
         work: Callable[[], Any],
+        queue_policy: str = QUEUE_POLICY_WAIT,
     ) -> tuple[Any, float, float, int]:
         """Run one non-cancellable CUDA job behind the shared bounded gate.
 
@@ -213,30 +291,48 @@ class TTSGateway:
         until the worker thread exits so another model is never started on top
         of the abandoned job.
         """
-        queued_at = await self._admit_gpu_job(
-            request_id=request_id,
-            engine_id=engine_id,
-            model_id=model_id,
-        )
-
-        canonical_id = (
-            self.resolve_native_model_id(model_id)
-            if engine_id == "voxcpm2"
-            else model_id
-        )
-
         acquired = False
         started_at: float | None = None
         session_concurrency = 1
+        if queue_policy == QUEUE_POLICY_REJECT:
+            # gate 以正式 id 判斷能否同 session 並發，所以要在占位前解析。
+            canonical_id = (
+                self.resolve_native_model_id(model_id)
+                if engine_id == "voxcpm2"
+                else model_id
+            )
+            # 必須在 try 之外：被拒時沒有占 pending 名額，finally 不可扣回。
+            queued_at, session_concurrency = await self._admit_gpu_job_without_queue(
+                request_id=request_id,
+                engine_id=engine_id,
+                model_id=model_id,
+                gate_model_id=canonical_id,
+                units=units,
+            )
+            acquired = True
+        else:
+            queued_at = await self._admit_gpu_job(
+                request_id=request_id,
+                engine_id=engine_id,
+                model_id=model_id,
+            )
+
+            canonical_id = (
+                self.resolve_native_model_id(model_id)
+                if engine_id == "voxcpm2"
+                else model_id
+            )
+
         try:
             try:
-                session_concurrency = await self._session_gate.acquire(
-                    engine_id=engine_id,
-                    model_id=canonical_id,
-                    units=units,
-                    timeout=self._queue_timeout_seconds,
-                )
-                acquired = True
+                if not acquired:
+                    session_concurrency = await self._session_gate.acquire(
+                        engine_id=engine_id,
+                        model_id=canonical_id,
+                        units=units,
+                        timeout=self._queue_timeout_seconds,
+                    )
+                    acquired = True
             except asyncio.TimeoutError as exc:
                 queue_wait = time.perf_counter() - queued_at
                 logger.warning(
@@ -344,6 +440,7 @@ class TTSGateway:
             [asyncio.Queue[Any], threading.Event, asyncio.AbstractEventLoop],
             None,
         ],
+        queue_policy: str = QUEUE_POLICY_WAIT,
     ) -> _NativeSynthesisStream:
         """建立已取得 GPU gate 的 streaming session。
 
@@ -351,25 +448,37 @@ class TTSGateway:
         與首段生成前的錯誤仍能成為正式 HTTP status，而非已送出 200 後才截斷。
         """
         engine_id = "voxcpm2"
-        queued_at = await self._admit_gpu_job(
-            request_id=request_id,
-            engine_id=engine_id,
-            model_id=model_id,
-        )
-
-        canonical_id = self.resolve_native_model_id(model_id)
         acquired = False
         cleanup_owns_resources = False
         session_concurrency = 1
+        if queue_policy == QUEUE_POLICY_REJECT:
+            canonical_id = self.resolve_native_model_id(model_id)
+            # 必須在 try 之外：被拒時沒有占 pending 名額，except 不可扣回。
+            queued_at, session_concurrency = await self._admit_gpu_job_without_queue(
+                request_id=request_id,
+                engine_id=engine_id,
+                model_id=model_id,
+                gate_model_id=canonical_id,
+                units=1,
+            )
+            acquired = True
+        else:
+            queued_at = await self._admit_gpu_job(
+                request_id=request_id,
+                engine_id=engine_id,
+                model_id=model_id,
+            )
+            canonical_id = self.resolve_native_model_id(model_id)
         try:
             try:
-                session_concurrency = await self._session_gate.acquire(
-                    engine_id=engine_id,
-                    model_id=canonical_id,
-                    units=1,
-                    timeout=self._queue_timeout_seconds,
-                )
-                acquired = True
+                if not acquired:
+                    session_concurrency = await self._session_gate.acquire(
+                        engine_id=engine_id,
+                        model_id=canonical_id,
+                        units=1,
+                        timeout=self._queue_timeout_seconds,
+                    )
+                    acquired = True
             except asyncio.TimeoutError as exc:
                 queue_wait = time.perf_counter() - queued_at
                 logger.warning(
@@ -911,10 +1020,12 @@ class TTSGateway:
         inference_timesteps: int,
         speed: float = 1.0,
         seed: int | None = None,
+        queue_policy: str = QUEUE_POLICY_WAIT,
     ) -> tuple[bytes, dict[str, str]]:
         wavs, headers = await self.synthesize_native_batch(
             request_id=request_id,
             model_id=model_id,
+            queue_policy=queue_policy,
             requests=[
                 {
                     "text": text,
@@ -978,6 +1089,7 @@ class TTSGateway:
         normalize: bool,
         denoise: bool,
         inference_timesteps: int,
+        queue_policy: str = QUEUE_POLICY_WAIT,
     ) -> _NativeSynthesisStream:
         generation_request = {
             "text_input": text,
@@ -1045,6 +1157,7 @@ class TTSGateway:
             request_id=request_id,
             model_id=model_id,
             work=work,
+            queue_policy=queue_policy,
         )
 
     async def synthesize_native_batch(
@@ -1053,6 +1166,7 @@ class TTSGateway:
         request_id: str,
         model_id: str,
         requests: list[dict[str, Any]],
+        queue_policy: str = QUEUE_POLICY_WAIT,
     ) -> tuple[list[bytes], dict[str, str]]:
         """Generate a same-model chunk within one GPU admission slot.
 
@@ -1081,6 +1195,7 @@ class TTSGateway:
             model_id=model_id,
             units=len(requests),
             work=generate,
+            queue_policy=queue_policy,
         )
         wavs = [
             self._wav_response(
@@ -1178,6 +1293,7 @@ class TTSGateway:
         inference_timesteps: int,
         seed: int | None,
         speed: float = 1.0,
+        queue_policy: str = QUEUE_POLICY_WAIT,
     ) -> tuple[bytes, dict[str, str]]:
         try:
             self.barbet_runtime.registry.get(model_id)
@@ -1204,6 +1320,7 @@ class TTSGateway:
             model_id=model_id,
             units=1,
             work=generate,
+            queue_policy=queue_policy,
         )
         sample_rate, audio, elapsed = result
         headers = {

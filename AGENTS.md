@@ -457,6 +457,16 @@ VoxCPM2 與部署步數相同時可使用 CUDA graph，其他步數走 eager，�
 log 以 `received → queued → started → completed/rejected` 追蹤。相關環境變數：
 `VOXCPM_MAX_PENDING_SYNTHESIS`、`VOXCPM_QUEUE_TIMEOUT_SECONDS`。
 
+**逐請求不排隊（`queue=reject`）**：`POST /api/v1/synthesize`、
+`/api/v1/synthesize/stream`（form 欄位）與 `POST /api/v1/tts/synthesize`
+（JSON 欄位）接受選填 `queue`，值為 `wait`（預設，照上面排隊）或 `reject`。
+`reject` 只在 GPU gate 現在就有空位（沒人排隊、容量未滿、不必切模型）時執行，
+否則立刻回 429、`Retry-After: 1`，不占 pending 名額也不進等待佇列；log 為
+`stage=rejected reason=busy_no_queue`。給「等不到就改走備援」的呼叫端用
+（openVman Backend 10 秒放棄）。檢查與占位在同一個 event-loop 步驟內完成，
+兩筆 reject 不會搶到同一個空位。pending 名額本身已滿時仍回原本的
+`reason=queue_full`（`Retry-After: 30`）。CastVoice batch 不支援此欄位。
+
 VoxCPM2 的 nano-vLLM 原本只設固定 `max_generate_length=2000`，missed EOS 時實測會
 占 GPU 9~11 分鐘；現已比照上游 runtime，把實際上限設為
 `min(VOXCPM_MAX_GENERATE_LENGTH, 文字長度 × VOXCPM_MAX_AUDIO_TEXT_RATIO + 10)`，
