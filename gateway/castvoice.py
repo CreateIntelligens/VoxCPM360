@@ -372,6 +372,10 @@ class CastVoiceBatchManager:
     def get(self, batch_id: str) -> _CastVoiceBatch | None:
         return self._batches.get(batch_id)
 
+    @property
+    def storage_dir(self) -> Path:
+        return self._storage_dir
+
     def audio_path(self, batch_id: str, index: int) -> Path:
         return self._storage_dir / batch_id / f"{index}.mp3"
 

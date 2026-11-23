@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_DEFAULT_TIMESTEPS, _by_id, _find_reference_preset
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
+from gateway.log_safe import log_value
+from gateway.safe_path import child_path
 from gateway.service_lang import check_body_lang
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
 from gateway.constants import QUEUE_POLICIES, QUEUE_POLICY_REJECT, QUEUE_POLICY_WAIT
@@ -138,8 +140,8 @@ def register_interactive_routes(app, gateway, history_lock):
                 raise ValueError
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="找不到生成紀錄") from exc
-        audio_path = gw_history._HISTORY_DIR / f"{history_id}.wav"
-        if not audio_path.is_file():
+        audio_path = child_path(gw_history._HISTORY_DIR, f"{history_id}.wav")
+        if audio_path is None or not audio_path.is_file():
             raise HTTPException(status_code=404, detail="找不到生成音檔")
         return FileResponse(
             audio_path,
@@ -393,11 +395,11 @@ def register_interactive_routes(app, gateway, history_lock):
             "synthesis.request request_id=%s stage=received engine=%s model=%s "
             "content_type=%s text_chars=%d queue_policy=%s",
             request_id,
-            engine_id,
-            model_id,
-            request.headers.get("content-type", ""),
+            log_value(engine_id),
+            log_value(model_id),
+            log_value(request.headers.get("content-type", "")),
             len(text),
-            queue_policy,
+            log_value(queue_policy),
         )
         prepared = await _prepare_synthesis_request(
             engine_id=engine_id,
@@ -530,11 +532,11 @@ def register_interactive_routes(app, gateway, history_lock):
             "synthesis.request request_id=%s stage=received engine=%s model=%s "
             "content_type=%s text_chars=%d streaming=true queue_policy=%s",
             request_id,
-            engine_id,
-            model_id,
-            request.headers.get("content-type", ""),
+            log_value(engine_id),
+            log_value(model_id),
+            log_value(request.headers.get("content-type", "")),
             len(text),
-            queue_policy,
+            log_value(queue_policy),
         )
         prepared = await _prepare_synthesis_request(
             engine_id=engine_id,
