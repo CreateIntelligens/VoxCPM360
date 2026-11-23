@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_DEFAULT_TIMESTEPS, _by_id, _find_reference_preset
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_DEFAULT_TIMESTEPS, _CASTVOICE_DEFAULT_CFG_VALUE, _CASTVOICE_DEFAULT_DENOISE, _CASTVOICE_DEFAULT_NORMALIZE, _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
+from gateway.log_safe import log_value
+from gateway.safe_path import child_path
 from gateway.service_lang import check_body_lang, voice_label, voice_language, with_service_lang
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
 from gateway.constants import QUEUE_POLICY_WAIT
@@ -212,7 +214,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
             logger.exception(
                 "castvoice.synthesize request_id=%s stage=failed voice_id=%s",
                 request_id,
-                voice_id,
+                log_value(voice_id),
             )
             raise _CastVoiceError(500, "internal_error", "語音合成失敗") from exc
 
@@ -516,8 +518,8 @@ def register_castvoice_routes(app, gateway, demo, helpers):
         item = batch.items[index]
         if item.status != "done":
             return _castvoice_error(404, "item_not_ready", "該筆尚未完成或已失敗")
-        audio_path = batch_manager.audio_path(batch_id, index)
-        if not audio_path.is_file():
+        audio_path = child_path(batch_manager.storage_dir, batch_id, f"{index}.mp3")
+        if audio_path is None or not audio_path.is_file():
             return _castvoice_error(404, "item_not_found", "音檔不存在")
         return FileResponse(audio_path, media_type="audio/mpeg")
 

@@ -4,9 +4,15 @@ on:
   release:
     types: [created]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build distribution 📦
+    # 上游 OpenBMB 的發布流程。這個 fork 建 release 只為了放 flash-attn wheel，
+    # 不發 PyPI，所以只在上游 repo 執行。
+    if: github.repository == 'OpenBMB/VoxCPM'
     runs-on: ubuntu-latest
 
     steps:
@@ -51,4 +57,4 @@ jobs:
         name: python-package-distributions
         path: dist/
     - name: Publish distribution 📦 to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
+      uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
