@@ -261,6 +261,39 @@ The rejection body follows each endpoint's existing error format:
 Any other value returns `422`. When the pending queue itself is full, both
 policies get the existing `429` with `Retry-After: 30`.
 
+##### Taiwanese and Mandarin services
+
+The default service (`app`) reads Taiwanese with the fine-tuned checkpoint. An
+optional second service (`app-zh`) runs the original `openbmb/VoxCPM2` for
+Mandarin. It uses the same image and settings, with the Taiwanese-only defaults
+switched off: no 「用台語說」 control instruction, no default Taiwanese reference
+audio, and no fine-tuned checkpoints or LoRAs to choose from. Turn it on in
+`.env`:
+
+```bash
+COMPOSE_PROFILES=zh   # also start the Mandarin service; app always runs
+docker compose up -d
+```
+
+Both share the one public endpoint. Nginx picks the service from the URL query
+parameter `lang`:
+
+| `lang` | Service |
+|---|---|
+| absent, empty, or `tw` | Taiwanese (`app`) |
+| `zh` | Mandarin (`app-zh`); `503` with `{"detail": "..."}` when it is not running |
+| anything else | `400` |
+
+Every request for the Mandarin service needs `?lang=zh`, including polling and
+downloads such as `GET /api/v1/tts/synthesize/batch/{id}`. URLs the Mandarin
+service returns (`status_url`, batch `audio_url`, history `audio_url`) already
+carry it. Nginx cannot read form or JSON bodies, so a `lang` sent only in the
+body would land on the Taiwanese service; the service rejects a body `lang`
+that does not match it with `400` instead of reading the wrong language. Every
+response carries `X-TTS-Lang: tw|zh`. The two services each have their own GPU
+gate, so concurrent Taiwanese and Mandarin requests run on the GPU at the same
+time and slow each other down.
+
 The selector is directory-driven. Put native VoxCPM2 LoRA or full checkpoints
 under `models/native/<version>/` and complete Barbet TTS checkpoints
 under `models/barbet/<version>/`, then press **重新掃描**. Existing training

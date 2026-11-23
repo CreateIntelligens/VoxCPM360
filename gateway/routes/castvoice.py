@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_DEFAULT_TIMESTEPS, _by_id, _find_reference_preset
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_DEFAULT_TIMESTEPS, _CASTVOICE_DEFAULT_CFG_VALUE, _CASTVOICE_DEFAULT_DENOISE, _CASTVOICE_DEFAULT_NORMALIZE, _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
+from gateway.service_lang import check_body_lang, voice_label, voice_language, with_service_lang
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
 from gateway.constants import QUEUE_POLICY_WAIT
 from gateway.streaming import _STREAMING_END, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
@@ -405,9 +406,9 @@ def register_castvoice_routes(app, gateway, demo, helpers):
                 continue
             voice: dict[str, str] = {
                 "voice_id": definition["voice_id"],
-                "label": definition["label"],
+                "label": voice_label(definition["label"]),
                 "gender": definition["gender"],
-                "language": definition["language"],
+                "language": voice_language(definition["language"]),
                 "desc": definition["desc"],
             }
             voices.append(voice)
@@ -416,6 +417,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
     @app.post("/api/v1/tts/synthesize")
     async def castvoice_synthesize(request: Request, body: CastVoiceSynthesizeRequest) -> Response:
         _require_castvoice_auth(request)
+        check_body_lang(body.lang)
 
         if body.format != "mp3":
             return _castvoice_error(
@@ -449,6 +451,9 @@ def register_castvoice_routes(app, gateway, demo, helpers):
         request: Request, body: CastVoiceBatchRequest
     ) -> Response:
         _require_castvoice_auth(request)
+        check_body_lang(body.lang)
+        for item in body.items:
+            check_body_lang(item.lang)
 
         if not body.items:
             return _castvoice_error(400, "invalid_batch", "items 不可為空")
@@ -465,7 +470,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
             content={
                 "batch_id": batch_id,
                 "total": len(body.items),
-                "status_url": f"/api/v1/tts/synthesize/batch/{batch_id}",
+                "status_url": with_service_lang(f"/api/v1/tts/synthesize/batch/{batch_id}"),
             },
         )
 
@@ -482,7 +487,7 @@ def register_castvoice_routes(app, gateway, demo, helpers):
             counts[item.status] += 1
             entry: dict[str, Any] = {"index": item.index, "status": item.status}
             if item.status == "done":
-                entry["audio_url"] = (
+                entry["audio_url"] = with_service_lang(
                     f"/api/v1/tts/synthesize/batch/{batch_id}/{item.index}/audio"
                 )
             elif item.status == "failed":

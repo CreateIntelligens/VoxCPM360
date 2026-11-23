@@ -599,6 +599,19 @@ class TTSGateway:
         # 重新載入與 torch 重編譯（實測 120s vs 7s），且切換時舊 worker
         # 不會被回收，GPU 記憶體只進不出。這裡只提供自訓的模型。
         models: list[dict[str, Any]] = []
+        # 華語服務跑的就是官方原版、沒有自訓模型可選，不列出來前端就沒有
+        # 模型可用；那裡也不會有「切過去要重載」的問題。
+        if os.environ.get("VOXCPM_LIST_BASE_MODEL", "").lower() == "true":
+            models.append(
+                {
+                    "id": PUBLIC_BASE_MODEL_ID,
+                    "label": "VoxCPM2 官方原版",
+                    "kind": "base",
+                    "description": "openbmb/VoxCPM2，未經台語微調。",
+                    "online": True,
+                    "loaded": self._active_native_selection == PUBLIC_BASE_MODEL_ID,
+                }
+            )
         for checkpoint in self.full_model_registry.checkpoints:
             models.append(
                 {
