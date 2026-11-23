@@ -144,13 +144,34 @@ RUN . /opt/venv/bin/activate && \
     fi
 
 
-# 應用層依賴（含測試依賴，讓容器內可直接跑 pytest）。位於編譯層之後，
-# 改 pyproject.toml 只會重跑這一層（約一分鐘），不會重編 flash-attn。
+# 應用層依賴（含 serve 與測試依賴，讓容器內可直接跑 pytest）：版本只由 uv.lock 決定。
+# 位於編譯層之後，改 pyproject.toml／uv.lock 只會重跑這一層（約一分鐘），不會重編 flash-attn。
+#
+# 不用 `uv pip install -r pyproject.toml`（每次重新解析、完全不讀 lock，重建會偷升版），
+# 也不用 `uv sync`／`uv pip sync`（會把 lock 以外的東西——編譯層的 torch、flash-attn——刪掉）。
+# 改成 `uv export --locked` 匯出 requirements，再 `--no-deps` 只照單安裝：
+# - --locked：lock 跟 pyproject.toml 不一致時 export 直接失敗，建置中止，不會靜默重解。
+# - torch 這一串刻意不從 lock 裝：torch／torchaudio／flash-attn 由編譯層依 build args 裝
+#   （PyTorch CUDA index 或預編 wheel），lock 解出的是 PyPI 的版本；triton、nvidia-*、
+#   cuda-* 是 torch 的 CUDA 相依，必須跟編譯層裝的那一套同進退，否則會出現 13.0／13.4 混版。
+#   --no-emit-package 只排除指定的套件本身，所以排除清單由 lock 的內容算出，不手寫。
+# - 排除的版本在安裝前後比對，不同就讓建置失敗。
 COPY pyproject.toml uv.lock ./
 RUN . /opt/venv/bin/activate && \
-    uv pip install --no-cache-dir -r pyproject.toml && \
-    uv pip install --no-cache-dir nano-vllm-voxcpm==2.0.4 && \
-    uv pip install --no-cache-dir -r pyproject.toml --extra test
+    uv export --locked --no-emit-project --no-hashes --extra serve --extra test -o /tmp/all.txt && \
+    excluded="$(sed -n -E 's/^((nvidia|cuda)-[a-z0-9-]+|torch|torchaudio|flash-attn|triton)==.*/\1/p' /tmp/all.txt)" && \
+    echo "excluded from lock install: $(echo $excluded)" && \
+    for n in torch torchaudio flash-attn triton nvidia-cublas; do \
+        echo "$excluded" | grep -qx "$n" || { echo "exclude list missing $n, lock layout changed"; exit 1; }; \
+    done && \
+    uv export --locked --no-emit-project --extra serve --extra test \
+        $(for n in $excluded; do printf -- '--no-emit-package %s ' "$n"; done) -o /tmp/req.txt && \
+    guard='^(torch|torchaudio|flash[-_]attn|triton|nvidia-.*|cuda-.*)[ =@]' && \
+    uv pip freeze | grep -iE "$guard" | sort > /tmp/torch-before.txt && \
+    uv pip install --no-cache-dir --no-deps -r /tmp/req.txt && \
+    uv pip freeze | grep -iE "$guard" | sort > /tmp/torch-after.txt && \
+    diff /tmp/torch-before.txt /tmp/torch-after.txt && \
+    rm -f /tmp/all.txt /tmp/req.txt /tmp/torch-before.txt /tmp/torch-after.txt
 
 # 編譯後把 wheel 導出保存（每個 CPU 架構跑一次即可，之後所有機器免編譯）：
 #   docker buildx build --target flash-wheel -o type=local,dest=wheels .

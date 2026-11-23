@@ -1,0 +1,32 @@
+name: uv.lock in sync
+
+# 映像依 uv.lock 安裝：pyproject.toml 改了卻沒重跑 `uv lock`，建置才會在
+# `uv export --locked` 失敗。這裡把同樣的檢查提前到 PR。
+on:
+  pull_request:
+    paths:
+      - pyproject.toml
+      - uv.lock
+      - Dockerfile
+      - .github/workflows/uv-lock-check.yml
+  push:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - uv.lock
+
+permissions:
+  contents: read
+
+jobs:
+  lock-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.7"
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --check
