@@ -40,6 +40,7 @@ from voxcpm.lora_registry import BASE_MODEL_KEY
 logger = logging.getLogger(__name__)
 
 # 相容層：保留舊的 import 路徑，避免既有呼叫端隨模組拆分而改寫。
+from gateway.service_lang import ServiceLangMiddleware, service_lang
 from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_DEFAULT_TIMESTEPS, _by_id, _find_reference_preset
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
@@ -126,6 +127,9 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.tts_gateway = gateway
+    # middleware 要到第一個請求才建立；先讀一次，VOXCPM_LANG 設錯就在啟動時失敗。
+    service_lang()
+    app.add_middleware(ServiceLangMiddleware)
     history_lock = asyncio.Lock()
 
     # 缺檔的 preset 會被 _available_reference_presets 靜默濾掉，

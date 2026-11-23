@@ -30,6 +30,23 @@ interface GenerationHistoryRecord {
 
 const WAV_HEADER_BYTES = 44;
 
+export type ApiLang = "tw" | "zh";
+
+let apiLang: ApiLang = "tw";
+
+export function setApiLang(lang: ApiLang): void {
+  apiLang = lang;
+}
+
+// nginx 依網址的 ?lang= 把請求送到台語或華語服務；台語是預設，
+// 不帶參數就跟加語言之前完全一樣。歷史音檔的網址由後端帶好 lang。
+export function apiUrl(path: string): string {
+  if (apiLang === "tw") {
+    return path;
+  }
+  return `${path}${path.includes("?") ? "&" : "?"}lang=${apiLang}`;
+}
+
 export interface StreamingAudioChunk {
   samples: Float32Array<ArrayBuffer>;
   sampleRate: number;
@@ -57,7 +74,7 @@ async function errorMessage(response: Response): Promise<string> {
 }
 
 export async function fetchCatalog(signal?: AbortSignal): Promise<Catalog> {
-  const response = await fetch("/api/v1/catalog", { signal });
+  const response = await fetch(apiUrl("/api/v1/catalog"), { signal });
   if (!response.ok) {
     throw new Error(await errorMessage(response));
   }
@@ -67,7 +84,7 @@ export async function fetchCatalog(signal?: AbortSignal): Promise<Catalog> {
 export async function fetchModelRegistry(
   signal?: AbortSignal,
 ): Promise<ModelRegistry> {
-  const response = await fetch("/api/v1/models/registry", { signal });
+  const response = await fetch(apiUrl("/api/v1/models/registry"), { signal });
   if (!response.ok) {
     throw new Error(await errorMessage(response));
   }
@@ -75,7 +92,7 @@ export async function fetchModelRegistry(
 }
 
 export async function fetchGenerationHistory(limit = 5): Promise<HistoryItem[]> {
-  const response = await fetch(`/api/v1/history?limit=${limit}`);
+  const response = await fetch(apiUrl(`/api/v1/history?limit=${limit}`));
   if (!response.ok) {
     throw new Error(await errorMessage(response));
   }
@@ -195,7 +212,7 @@ function isStreamingWavHeader(header: Uint8Array): boolean {
 export async function synthesize(
   request: SynthesisRequest,
 ): Promise<SynthesisResult> {
-  const response = await fetch("/api/v1/synthesize", {
+  const response = await fetch(apiUrl("/api/v1/synthesize"), {
     method: "POST",
     body: synthesisBody(request),
   });
@@ -210,7 +227,7 @@ export async function synthesizeStream(
   request: SynthesisRequest,
   onAudioChunk: (chunk: StreamingAudioChunk) => void,
 ): Promise<SynthesisResult> {
-  const response = await fetch("/api/v1/synthesize/stream", {
+  const response = await fetch(apiUrl("/api/v1/synthesize/stream"), {
     method: "POST",
     body: synthesisBody(request),
   });

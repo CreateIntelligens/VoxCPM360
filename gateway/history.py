@@ -38,6 +38,7 @@ from voxcpm.lora_registry import BASE_MODEL_KEY
 
 logger = logging.getLogger(__name__)
 
+from gateway.service_lang import with_service_lang
 from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_DEFAULT_TIMESTEPS, _by_id, _find_reference_preset
 
 def _save_generation_history(record: dict[str, Any], wav: bytes) -> None:
@@ -140,7 +141,7 @@ def _load_generation_history(limit: int) -> list[dict[str, Any]]:
             continue
         if not (_HISTORY_DIR / f"{history_id}.wav").is_file():
             continue
-        record["audio_url"] = f"/api/v1/history/{history_id}/audio"
+        record["audio_url"] = with_service_lang(f"/api/v1/history/{history_id}/audio")
         records.append(record)
     records.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return records

@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 from gateway.presets import _COSY_PROMPT_TEXT, _DEFAULT_CONTROL_INSTRUCTION, _DEFAULT_REFERENCE_PRESET_ID, _HISTORY_DIR, _LANG_NAN_TW, _LANG_ZH_TW, _MODEL_REGISTRY_PATH, _REFERENCE_AUDIO_DIR, _REFERENCE_AUDIO_PRESETS, _VOXCPM2_DEFAULT_TIMESTEPS, _by_id, _find_reference_preset
 from gateway.history import _delete_generation_history, _load_generation_history, _save_generation_history, _wav_to_mp3
 from gateway.castvoice import _CASTVOICE_BATCH_DIR, _CASTVOICE_BATCH_MAX_ITEMS, _CASTVOICE_DEFINITIONS, _CASTVOICE_DEFINITIONS_BY_ID, _CASTVOICE_MODEL_VERSION, _TTS_API_KEY
+from gateway.service_lang import check_body_lang
 from gateway.constants import BASE_MODEL_PREFIX, LORA_MODEL_PREFIX, PUBLIC_BASE_MODEL_ID
 from gateway.constants import QUEUE_POLICIES, QUEUE_POLICY_REJECT, QUEUE_POLICY_WAIT
 from gateway.streaming import _STREAMING_END, _STREAM_OUTPUT_SAMPLE_RATES, _ChunkResampler, _StreamingReady, _PreparedSynthesisRequest, _NativeSynthesisStream, _ManagedStreamingResponse
@@ -262,7 +263,9 @@ def register_interactive_routes(app, gateway, history_lock):
             else:
                 active_reference = _resolve_reference_audio(reference_preset_id)
                 selected_preset = _find_reference_preset(reference_preset_id)
-                if selected_preset is not None:
+                # 沒指定 preset 又關掉預設參考音（VOXCPM_DEFAULT_REFERENCE=）時，
+                # 這裡仍會找到預設 preset；只帶它的逐字稿不帶音檔，引擎會拒絕。
+                if selected_preset is not None and active_reference is not None:
                     # preset 的逐字稿屬於 cloning 條件，不是可省略的顯示文案。
                     if not prompt_text.strip():
                         prompt_text = selected_preset.get("prompt_text", "")
@@ -378,8 +381,11 @@ def register_interactive_routes(app, gateway, history_lock):
         seed: int | None = Form(None),
         # wait＝滿載時排隊（預設）；reject＝沒有空的 GPU slot 就立刻 429。
         queue: str = Form(QUEUE_POLICY_WAIT),
+        # 選語言要放網址 ?lang=；這裡只檢查跟本服務一致，見 service_lang。
+        lang: str = Form(""),
         reference_audio: UploadFile | None = File(None),
     ) -> Response:
+        check_body_lang(lang)
         request_id = uuid.uuid4().hex
         request_started_at = time.perf_counter()
         queue_policy = _parse_queue_policy(queue)
@@ -505,8 +511,11 @@ def register_interactive_routes(app, gateway, history_lock):
         sample_rate: int | None = Form(None),
         # wait＝滿載時排隊（預設）；reject＝沒有空的 GPU slot 就立刻 429。
         queue: str = Form(QUEUE_POLICY_WAIT),
+        # 選語言要放網址 ?lang=；這裡只檢查跟本服務一致，見 service_lang。
+        lang: str = Form(""),
         reference_audio: UploadFile | None = File(None),
     ) -> Response:
+        check_body_lang(lang)
         request_id = uuid.uuid4().hex
         queue_policy = _parse_queue_policy(queue)
         # 測試直接呼叫路由函式時拿到的是 Form 預設物件而非 None

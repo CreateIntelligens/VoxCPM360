@@ -31,6 +31,8 @@ import {
 } from "react";
 import {
   fetchCatalog,
+  setApiLang,
+  type ApiLang,
   fetchGenerationHistory,
   synthesize,
   synthesizeStream,
@@ -163,6 +165,12 @@ function App() {
     "studio",
   );
   const [comparisonReloadKey, setComparisonReloadKey] = useState(0);
+  const [apiLang, setApiLangState] = usePersistentState<ApiLang>(
+    "api-lang",
+    "tw",
+  );
+  // 在 render 期間同步設定，掛載時的第一批請求就會帶上正確的 lang。
+  setApiLang(apiLang === "zh" ? "zh" : "tw");
   const [catalog, setCatalog] = useState<Catalog>({
     engines: [],
     reference_presets: [],
@@ -207,6 +215,8 @@ function App() {
   const [autoPlayHistoryId, setAutoPlayHistoryId] = useState("");
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const audioUrlsRef = useRef(new Set<string>());
+  const catalogRequestRef = useRef(0);
+  const historyRequestRef = useRef(0);
   const streamingPlayerRef = useRef<StreamingAudioPlayer | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -273,8 +283,12 @@ function App() {
   ]);
 
   const loadGlobalHistory = useCallback(async () => {
+    const requestId = ++historyRequestRef.current;
     try {
       const records = await fetchGenerationHistory(HISTORY_LIMIT);
+      if (requestId !== historyRequestRef.current) {
+        return;
+      }
       setHistory((current) => {
         const localAudioUrls = new Map(
           current
@@ -314,10 +328,15 @@ function App() {
   }
 
   const loadCatalog = async () => {
+    // 快速切換語言時，晚回來的舊語言清單不可蓋掉新語言的。
+    const requestId = ++catalogRequestRef.current;
     setCatalogLoading(true);
     setCatalogError("");
     try {
       const next = await fetchCatalog();
+      if (requestId !== catalogRequestRef.current) {
+        return;
+      }
       setCatalog(next);
       const nextEngine =
         next.engines.find((engine) => engine.id === engineId) ||
@@ -347,11 +366,16 @@ function App() {
         return nextPreset?.id || "";
       });
     } catch (error) {
+      if (requestId !== catalogRequestRef.current) {
+        return;
+      }
       setCatalogError(
         error instanceof Error ? error.message : "無法取得模型清單",
       );
     } finally {
-      setCatalogLoading(false);
+      if (requestId === catalogRequestRef.current) {
+        setCatalogLoading(false);
+      }
     }
   };
 
@@ -359,6 +383,20 @@ function App() {
     void loadCatalog();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 換語言等於換一個後端服務：模型清單、參考聲音、歷史紀錄都要重抓。
+  const langChangedRef = useRef(false);
+  useEffect(() => {
+    if (!langChangedRef.current) {
+      langChangedRef.current = true;
+      return;
+    }
+    streamingPlayerRef.current?.stop();
+    void loadCatalog();
+    void loadGlobalHistory();
+    setComparisonReloadKey((current) => current + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiLang]);
 
   // 只在整個 App 卸載時回收 blob URL。不可與輪詢的 effect 合併 —— 那個
   // effect 依賴 activeView，切換分頁時會連帶把播放中的音訊 URL 撤銷掉。
@@ -574,6 +612,24 @@ function App() {
                 模型比較
               </button>
             </nav>
+            <div className="view-switcher" role="group" aria-label="語言">
+              {(
+                [
+                  ["tw", "台語"],
+                  ["zh", "華語"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  type="button"
+                  key={value}
+                  className={apiLang === value ? "active" : ""}
+                  onClick={() => setApiLangState(value)}
+                  aria-pressed={apiLang === value}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
             {activeView === "studio" ? (
               <button
                 className="icon-button refresh-button"

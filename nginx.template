@@ -1,3 +1,12 @@
+# 依網址的 ?lang= 選後端：沒帶或 tw 走台語（app），zh 走華語原版（app-zh）。
+# 只看 query：nginx 讀不到表單與 JSON 內容，body 裡的 lang 由 gateway 檢查。
+map $arg_lang $voxcpm_upstream {
+    ""      app:8000;
+    tw      app:8000;
+    zh      app-zh:8000;
+    default "";
+}
+
 server {
     listen ${PORT};
 
@@ -6,8 +15,17 @@ server {
 
     client_max_body_size 50M;
 
+    # proxy_pass 用變數時改由 resolver 在請求當下查名稱，app-zh 沒啟動
+    # 也不會讓 nginx 起不來，只有 lang=zh 的請求會拿到 503。
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
     location /api/ {
-        proxy_pass http://app:8000;
+        # if 裡不能設 default_type，改回內部用的 418，再由 error_page 轉成 JSON 400。
+        if ($voxcpm_upstream = "") {
+            return 418;
+        }
+        error_page 418 = @voxcpm_bad_lang;
+        proxy_pass http://$voxcpm_upstream;
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -17,8 +35,20 @@ server {
         proxy_set_header Connection "upgrade";
         proxy_read_timeout 900s;
         proxy_send_timeout 900s;
+        # 只攔 nginx 自己產生的 502（後端沒啟動、重啟中、名稱查不到）；後端回的
+        # 502 照原樣轉出，因為沒有開 proxy_intercept_errors。
+        error_page 502 = @voxcpm_unavailable;
     }
 
+    location @voxcpm_bad_lang {
+        default_type application/json;
+        return 400 '{"detail":"lang 只接受 tw 或 zh"}';
+    }
+
+    location @voxcpm_unavailable {
+        default_type application/json;
+        return 503 '{"detail":"這個語言的語音服務目前連不上（沒有啟動或正在重啟）"}';
+    }
 
     location / {
         try_files $uri $uri/ /index.html;

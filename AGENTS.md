@@ -467,6 +467,16 @@ log 以 `received → queued → started → completed/rejected` 追蹤。相關
 兩筆 reject 不會搶到同一個空位。pending 名額本身已滿時仍回原本的
 `reason=queue_full`（`Retry-After: 30`）。CastVoice batch 不支援此欄位。
 
+**台語／華語兩個服務（2026-11-23）**：`app`（台語，一律啟動）之外可多開
+`app-zh`（官方 `openbmb/VoxCPM2` 念華語），`.env` 設 `COMPOSE_PROFILES=zh` 才會起來。
+同一個 `/api/`，nginx 只看網址的 `?lang=`：沒帶／`tw` → 台語，`zh` → 華語，
+沒啟動回 503，其他值 400。**nginx 讀不到 body**，`lang` 只寫在表單或 JSON 會被送去
+台語服務，所以 gateway 收到跟自己不一致的 body `lang` 回 400（`gateway/service_lang.py`），
+不可改成靜默接受。華語服務回傳的 `status_url`、批次與歷史的 `audio_url` 已帶 `?lang=zh`。
+華語服務關掉「用台語說」與台語預設參考音，也不列自訓 checkpoint／LoRA；歷史與批次檔另存 `data/*_zh`。
+⚠️ 兩個容器各有一把 GPU gate，同時有台語與華語請求時會一起上 GPU、互相拖慢；
+每個容器的 watchdog 都要 24 GiB 可用記憶體，兩個都開時記憶體較緊。
+
 VoxCPM2 的 nano-vLLM 原本只設固定 `max_generate_length=2000`，missed EOS 時實測會
 占 GPU 9~11 分鐘；現已比照上游 runtime，把實際上限設為
 `min(VOXCPM_MAX_GENERATE_LENGTH, 文字長度 × VOXCPM_MAX_AUDIO_TEXT_RATIO + 10)`，

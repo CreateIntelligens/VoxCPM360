@@ -101,6 +101,35 @@ services:
               device_ids:
                 - ${GPU_DEVICE_ID:-nvidia.com/gpu=all}
 
+  # 華語原版（官方 openbmb/VoxCPM2），請求帶 ?lang=zh 時由 nginx 轉來。
+  # 預設不啟動：.env 設 COMPOSE_PROFILES=zh 才會起來；台語的 app 一律啟動。
+  # 其餘設定沿用 app（同一顆映像、GPU、記憶體上限），這裡只蓋掉語言相關的值。
+  app-zh:
+    extends: app
+    profiles: [zh]
+    # 跟 app 同一顆映像，不另外建置。
+    build: !reset null
+    container_name: voxcpm_app_zh
+    command: bash -c "python scripts/download_models.py --model-id ${ZH_MODEL_ID:-openbmb/VoxCPM2} && python api.py --port 8000"
+    environment:
+      - VOXCPM_LANG=zh
+      - MODEL_ID=${ZH_MODEL_ID:-openbmb/VoxCPM2}
+      - VOXCPM_BASE_MODEL_PATH=${ZH_MODEL_ID:-openbmb/VoxCPM2}
+      # 台語專用的預設值：控制指令「用台語說」與台語預設參考音都要關掉，
+      # 否則原版模型會被要求念台語。
+      - VOXCPM_DEFAULT_CONTROL_INSTRUCTION=
+      - VOXCPM_DEFAULT_REFERENCE=
+      # 自訓的 checkpoint 與 LoRA 都是台語，不給華語服務選。LoRA 的空字串
+      # 會退回預設目錄，三個一律指到不存在的目錄。
+      - VOXCPM_LORA_ROOTS=/app/models/zh-none
+      - VOXCPM_FULL_MODEL_ROOTS=/app/models/zh-none
+      - VOXCPM_BARBET_MODEL_ROOTS=/app/models/zh-none
+      # 台語服務刻意不列官方原版；這裡它是唯一的模型，要列出來給前端選。
+      - VOXCPM_LIST_BASE_MODEL=true
+      # 兩個服務共用 .:/app 掛載；歷史與批次檔分開放，前端切語言才不會看到另一邊的紀錄。
+      - VOXCPM_HISTORY_DIR=/app/data/generation_history_zh
+      - VOXCPM_CASTVOICE_BATCH_DIR=/app/data/castvoice_batches_zh
+
   train:
     <<: *memory-guardrails
     image: voxcpm360-app

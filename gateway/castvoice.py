@@ -64,6 +64,8 @@ class CastVoiceSynthesizeRequest(BaseModel):
     # 選填：wait＝滿載時排隊（預設，舊行為）；reject＝沒有空的 GPU slot
     # 就立刻回 429 + Retry-After，讓呼叫端改走備援而不是白等。
     queue: Literal["wait", "reject"] = "wait"
+    # 選語言要放網址 ?lang=；這裡只檢查跟本服務一致，見 gateway.service_lang。
+    lang: str | None = None
 
 
 class CastVoiceBatchItemRequest(BaseModel):
@@ -75,10 +77,12 @@ class CastVoiceBatchItemRequest(BaseModel):
     cfg_value: float | None = None
     normalize: bool | None = None
     denoise: bool | None = None
+    lang: str | None = None
 
 
 class CastVoiceBatchRequest(BaseModel):
     items: list[CastVoiceBatchItemRequest]
+    lang: str | None = None
 
 
 class _CastVoiceError(Exception):
