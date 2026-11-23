@@ -53,8 +53,8 @@ dependencies = [
     "speechbrain",
     # scripts/train_voxcpm_finetune.py 用；以前由 funasr 間接帶進來
     "tensorboardX",
-    # 2026-10 安全下限：Docker 以 `uv pip install -r pyproject.toml` 重新解析、不讀 uv.lock，
-    # 傳遞依賴要在這裡設下限才會裝到修正版。
+    # 安全下限：傳遞依賴的修正版靠這裡設下限，再 `uv lock` 進 uv.lock。
+    # 映像依 uv.lock 安裝（見 Dockerfile 應用層），只改 uv.lock 的 PR 也會生效。
     "certifi>=2026.10.23",
     "brotli>=1.2.1",
     "pillow>=13.0.0",
@@ -65,6 +65,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 推論服務專用：只在 Linux + CUDA 可用，且 pyproject 其餘部分是上游 OpenBMB 的
+# 套件定義，不該把它放進一般依賴。獨立成 extra 才會連同依賴一起進 uv.lock。
+serve = [
+    "nano-vllm-voxcpm==2.0.4; sys_platform == 'linux'",
+]
 test = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
@@ -84,6 +89,19 @@ Homepage = "https://github.com/OpenBMB/VoxCPM"
 Repository = "https://github.com/OpenBMB/VoxCPM.git"
 Documentation = "https://github.com/OpenBMB/VoxCPM#readme"
 "Bug Tracker" = "https://github.com/OpenBMB/VoxCPM/issues"
+
+[tool.uv]
+# lock 要對著映像實際的 torch 版本解（Dockerfile 的 TORCH_VERSION／TORCHAUDIO_VERSION），
+# 否則 torchcodec 這類和 torch 有 ABI 相依的套件會挑到對不上的版本。
+# torchcodec 另行釘住：它的 wheel 只在 .so 裡綁 torch ABI、metadata 沒宣告，uv 看不出
+# 來，而 lock 預設保留舊版（0.10.0 沒有 aarch64 wheel）。0.17.0 是映像實測可用的版本。
+# 用 constraint 而非 override：只收窄解析範圍，不改寫套件自己宣告的需求。
+# 映像不從 lock 安裝 torch 這一串（Dockerfile 排除），改 build args 時這裡要同步。
+constraint-dependencies = [
+    "torch==2.13.0",
+    "torchaudio==2.11.0",
+    "torchcodec==0.17.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -486,3 +486,15 @@ ratio 預設 6.0。`application/x-www-form-urlencoded` 與 `multipart/form-data`
 **重建**：`docker compose up -d --build web`（前端）／
 `docker compose restart app`（只改 Python）／若改 compose 環境變數則用
 `docker compose up -d --no-deps --force-recreate app`。
+
+**改依賴的流程（2026-11-23 起，映像依 `uv.lock` 安裝）**：應用層依賴的版本
+只由 `uv.lock` 決定，Dockerfile 用 `uv export --locked` 匯出後照單安裝，不再重新解析。
+- 改依賴：改 `pyproject.toml`（只升版本、不改需求就不用改）→ `uv lock`
+  （只升單一套件用 `uv lock --upgrade-package <名稱>`）→ **兩個檔案一起 commit**。
+  忘了 `uv lock` 時 CI（`uv-lock-check.yml`）與 `docker build` 都會失敗。
+- Dependabot 改 `uv.lock` 的 PR 合併後，重建映像就會生效。
+- `torch`／`torchaudio`／`flash-attn` 與 `triton`、`nvidia-*`、`cuda-*` 不從 lock 裝，
+  由 Dockerfile 編譯層依 build args 決定；安裝前後會比對，被動到就建置失敗。
+  換 `TORCH_VERSION`／`TORCHAUDIO_VERSION` 時，`pyproject.toml` 的
+  `[tool.uv] constraint-dependencies` 要同步（`torchcodec` 也要挑對應版本）後重跑 `uv lock`。
+- `nano-vllm-voxcpm` 在 `serve` extra，版本在 `pyproject.toml` 改。
