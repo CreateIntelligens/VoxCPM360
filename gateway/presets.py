@@ -37,9 +37,11 @@ from voxcpm.barbet_runtime import BarbetRuntime
 from voxcpm.full_model_registry import FULL_MODEL_PREFIX, FullModelRegistry
 from voxcpm.lora_registry import BASE_MODEL_KEY
 
+from gateway.service_lang import service_lang
+
 logger = logging.getLogger(__name__)
 
-_REFERENCE_AUDIO_DIR = Path(__file__).resolve().parent.parent / "assets" / "default_reference"
+_TW_REFERENCE_AUDIO_DIR = Path(__file__).resolve().parent.parent / "assets" / "default_reference"
 _MODEL_REGISTRY_PATH = Path(__file__).resolve().parent.parent / "docs" / "model_registry.json"
 _HISTORY_DIR = Path(
     os.environ.get(
@@ -59,7 +61,7 @@ _COSY_PROMPT_TEXT = (
 # gemini-* 這批 6 個是 Gemini TTS 預建聲線唸同一句台語（assets/default_reference/gemini/）。逐字稿以
 # Breeze-ASR-26 與 SenseVoice 兩套 ASR 交叉核對（2026-10-13），尚未人耳逐字驗證。
 _GEMINI_PROMPT_TEXT = "創作智能真歡喜，會使參加高雄的智慧時代。"
-_REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
+_TW_REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
     {
         "id": "cosy-child-female-01",
         "label": "孩童女聲 01（臺灣台語）",
@@ -252,6 +254,47 @@ _REFERENCE_AUDIO_PRESETS: tuple[dict[str, str], ...] = (
         "language": _LANG_NAN_TW,
     },
 )
+# 華語服務（VOXCPM_LANG=zh）改用同一批音色的華語原始錄音（assets/default_reference_zh/），
+# 取自 taigi-cosyvoice 的 models/prompts/：台語那組正是 CosyVoice 用這些錄音轉念台語做的。
+# 不可沿用台語參考音：實測華語服務拿台語錄音＋逐字稿接續克隆，會整句念成台語；
+# 只用音色也會帶台語腔（2026-11-24）。Gemini 那 6 個沒有華語錄音，華語服務不提供。
+# 逐字稿以 SenseVoice（判定 zh）與 Breeze-ASR 交叉核對，「嗨，」開頭兩支是兩套都聽到的。
+_ZH_REFERENCE_AUDIO_DIR = _TW_REFERENCE_AUDIO_DIR.parent / "default_reference_zh"
+_COSY_ZH_PROMPT_TEXT = (
+    "我是創造智能的AI代言人艾卡，想知道你的MBTI是哪一型嗎？"
+    "還是對我們的AI服務好奇，我都可以告訴你，快來跟我聊聊吧。"
+)
+_ZH_PROMPT_TEXT_OVERRIDES = {
+    "cosy-young-female-02": "嗨，" + _COSY_ZH_PROMPT_TEXT,
+    "cosy-child-female-01": "嗨，" + _COSY_ZH_PROMPT_TEXT,
+}
+
+
+def reference_presets_for(lang: str) -> tuple[dict[str, str], ...]:
+    """依服務語言回傳內建參考音清單；華語版 id 與檔名不變，前端與 CastVoice 不必跟著改。"""
+    if lang != "zh":
+        return _TW_REFERENCE_AUDIO_PRESETS
+    return tuple(
+        {
+            **preset,
+            "label": preset["label"].replace("臺灣台語", "華語"),
+            "prompt_text": _ZH_PROMPT_TEXT_OVERRIDES.get(preset["id"], _COSY_ZH_PROMPT_TEXT),
+            "language": _LANG_ZH_TW,
+        }
+        for preset in _TW_REFERENCE_AUDIO_PRESETS
+        if preset["id"].startswith("cosy-")
+    )
+
+
+def reference_audio_dir_for(lang: str) -> Path:
+    return _ZH_REFERENCE_AUDIO_DIR if lang == "zh" else _TW_REFERENCE_AUDIO_DIR
+
+
+# 啟動時依 VOXCPM_LANG 定案；其他模組 import 這兩個名字，必須在這裡就換好。
+_SERVICE_LANG = service_lang()
+_REFERENCE_AUDIO_PRESETS = reference_presets_for(_SERVICE_LANG)
+_REFERENCE_AUDIO_DIR = reference_audio_dir_for(_SERVICE_LANG)
+
 _DEFAULT_REFERENCE_PRESET_ID = "cosy-young-female-01"
 # 未指定步數時沿用部署設定；相同設定也用於引擎啟動時的 CUDA graph。
 _VOXCPM2_DEFAULT_TIMESTEPS = read_default_inference_timesteps()

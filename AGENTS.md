@@ -473,7 +473,7 @@ log 以 `received → queued → started → completed/rejected` 追蹤。相關
 沒啟動回 503，其他值 400。**nginx 讀不到 body**，`lang` 只寫在表單或 JSON 會被送去
 台語服務，所以 gateway 收到跟自己不一致的 body `lang` 回 400（`gateway/service_lang.py`），
 不可改成靜默接受。華語服務回傳的 `status_url`、批次與歷史的 `audio_url` 已帶 `?lang=zh`。
-華語服務關掉「用台語說」與台語預設參考音，也不列自訓 checkpoint／LoRA；歷史與批次檔另存 `data/*_zh`。
+華語服務關掉「用台語說」，也不列自訓 checkpoint／LoRA；歷史與批次檔另存 `data/*_zh`。**內建聲音在華語服務改用 `assets/default_reference_zh/` 的華語錄音**（id 不變，同一批音色）：沿用台語參考音時，原版模型會順著台語錄音＋逐字稿整句念成台語，只用音色也帶台語腔（2026-11-24 實聽）。Gemini 6 個沒有華語錄音，華語服務不提供。
 ⚠️ 兩個容器各有一把 GPU gate，同時有台語與華語請求時會一起上 GPU、互相拖慢；
 每個容器的 watchdog 都要 24 GiB 可用記憶體，兩個都開時記憶體較緊。
 
