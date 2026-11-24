@@ -115,10 +115,9 @@ services:
       - VOXCPM_LANG=zh
       - MODEL_ID=${ZH_MODEL_ID:-openbmb/VoxCPM2}
       - VOXCPM_BASE_MODEL_PATH=${ZH_MODEL_ID:-openbmb/VoxCPM2}
-      # 台語專用的預設值：控制指令「用台語說」與台語預設參考音都要關掉，
-      # 否則原版模型會被要求念台語。
+      # 台語專用的控制指令「用台語說」要關掉，否則原版模型會被要求念台語。
+      # 參考音不用關：VOXCPM_LANG=zh 時內建聲音整組換成華語錄音（gateway/presets.py）。
       - VOXCPM_DEFAULT_CONTROL_INSTRUCTION=
-      - VOXCPM_DEFAULT_REFERENCE=
       # 自訓的 checkpoint 與 LoRA 都是台語，不給華語服務選。LoRA 的空字串
       # 會退回預設目錄，三個一律指到不存在的目錄。
       - VOXCPM_LORA_ROOTS=/app/models/zh-none

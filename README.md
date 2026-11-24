@@ -266,8 +266,11 @@ policies get the existing `429` with `Retry-After: 30`.
 The default service (`app`) reads Taiwanese with the fine-tuned checkpoint. An
 optional second service (`app-zh`) runs the original `openbmb/VoxCPM2` for
 Mandarin. It uses the same image and settings, with the Taiwanese-only defaults
-switched off: no 「用台語說」 control instruction, no default Taiwanese reference
-audio, and no fine-tuned checkpoints or LoRAs to choose from. Turn it on in
+switched off: no 「用台語說」 control instruction and no fine-tuned checkpoints or
+LoRAs to choose from. Its built-in voices keep the same ids but use Mandarin
+recordings of the same speakers (`assets/default_reference_zh/`); cloning from
+the Taiwanese recordings made the original model read Taiwanese. The six Gemini
+voices have no Mandarin recording and are not offered there. Turn it on in
 `.env`:
 
 ```bash
